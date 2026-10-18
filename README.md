@@ -22,7 +22,7 @@
 **Требования:** чистый VPS на Debian/Ubuntu, домен с A-записью на IP сервера и доступные порты TCP 80/443.
 
 ```bash
-sudo bash 3x-ui_reverse_v5.sh
+bash <(curl -fsSL https://raw.githubusercontent.com/dohuyanevezuch/3x-ui_reverse/main/3x-ui_reverse.sh)
 ```
 
 При запуске выберите Caddy или Nginx и укажите домен. После установки параметры доступа сохраняются в `/opt/3x-ui_reverse/panel.txt` (содержит секреты).
@@ -61,7 +61,7 @@ sudo 3x-ui_reverse --remove-command # Удаление только команд
 **Requirements:** a clean Debian/Ubuntu VPS, a domain A record pointing to the server, and accessible TCP ports 80/443.
 
 ```bash
-sudo bash 3x-ui_reverse_v5.sh
+bash <(curl -fsSL https://raw.githubusercontent.com/dohuyanevezuch/3x-ui_reverse/main/3x-ui_reverse.sh)
 ```
 
 Choose Caddy or Nginx and enter your domain. Connection details are saved to `/opt/3x-ui_reverse/panel.txt` (contains secrets).
