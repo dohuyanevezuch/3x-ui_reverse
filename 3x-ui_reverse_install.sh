@@ -6,7 +6,7 @@ set -Eeuo pipefail
 umask 077
 
 # Release version = the git tag of the commit this file comes from.
-VERSION=v2.1.1
+VERSION=v2.2.1
 # GitHub repository (owner/name) that publishes tagged releases of this script.
 # Can also be set from the "Версия" screen or with XR_REPO=owner/name.
 DEFAULT_REPO='dohuyanevezuch/3x-ui_reverse'
@@ -24,6 +24,8 @@ XUI_INSTALL_URL=https://raw.githubusercontent.com/MHSanaei/3x-ui/main/install.sh
 # API helper, its token and the short-lived Xray access log used for "last inbound".
 HELPER=$BASE/xr_helper.py
 HELPER_STATE=''   # overrides XR_STATE_DIR before $BASE exists
+NODE_TOKEN=$BASE/node.token     # node-sync API token handed to a master panel
+PAIR_ACTIVE=$BASE/pair.active   # pairing files currently published on the stub site
 HELPER_ENV=$BASE/helper.env
 API_TOKEN=$BASE/api.token
 ACCESS_LOG=/var/log/x-ui/3xr-access.log
@@ -258,10 +260,28 @@ _tui_list(){
 }
 tui_checklist(){ _tui_list check "$@"; }
 tui_radiolist(){ _tui_list radio "$@"; }
+# Values registered with copy_item LABEL VALUE are copied to the clipboard by
+# a click (or Tab + Enter) in the next text view. TUI_WATCH=FILE TUI_EXPIRES=TS
+# keep the view open until the file is read by the web server (UI_RC=3) or
+# removed/expired (UI_RC=4); closing it by hand gives UI_RC=0.
+TUI_COPY=()
+copy_item(){ [[ -n "$2" ]] && TUI_COPY+=("$1" "$2"); return 0; }
 tui_textfile(){
-  local jt jf
+  local jt jf extra='' i
   _jesc "$1"; jt=$JESC; _jesc "$2"; jf=$JESC
-  ui_call "{\"cmd\":\"text\",\"title\":\"$jt\",\"file\":\"$jf\",\"ctx\":\"$(_ctx)\"}"
+  if ((${#TUI_COPY[@]})); then
+    extra=',"copy":['
+    for ((i=0; i+1<${#TUI_COPY[@]}; i+=2)); do
+      _jarr "${TUI_COPY[i]}" "${TUI_COPY[i+1]}"
+      extra+="${JARR}"; ((i+2 < ${#TUI_COPY[@]})) && extra+=','
+    done
+    extra+=']'
+  fi
+  if [[ -n "${TUI_WATCH:-}" ]]; then
+    _jesc "$TUI_WATCH"; extra+=",\"watch\":\"$JESC\",\"expires\":${TUI_EXPIRES:-0}"
+  fi
+  TUI_COPY=()
+  ui_call "{\"cmd\":\"text\",\"title\":\"$jt\",\"file\":\"$jf\",\"ctx\":\"$(_ctx)\"$extra$(_logo)}"
   return 0
 }
 # tui_show TITLE CMD… — run a command and show its output in a scrollable view.
@@ -351,9 +371,10 @@ ui_stop(){
   UI_ACTIVE=0
   UI_PHASE_INDEX=-1
 }
-trap ui_shutdown EXIT
+trap 'declare -F pair_revoke >/dev/null && pair_revoke; ui_shutdown' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+trap 'exit 129' HUP
 
 unexpected_failure(){
   local code=$1 line=$2
@@ -1239,18 +1260,15 @@ color_value(){
   printf '  %s%s%s%*s%s%s%s\n' "$C_DIM" "$name" "$C_RESET" "$pad" '' "$color" "$value" "$C_RESET"
 }
 show_info_color(){
-  local panel_url sub_base certpath
+  local panel_url certpath ntoken
   if [[ "${PROXY_INSTALLED:-1}" == 1 ]]; then
     panel_url="https://$DOMAIN/$PANEL_PATH/"
-    sub_base="https://$DOMAIN"
     certpath=$(certdir)
   elif [[ "${TLS_MODE:-none}" == direct && "${PANEL_INSTALLED:-1}" == 1 ]]; then
     panel_url="https://$DOMAIN/$PANEL_PATH/"
-    sub_base="https://$DOMAIN:$SUB_PORT"
     certpath="/root/cert/$DOMAIN"
   else
     panel_url='Недоступна'
-    sub_base='Недоступны'
     certpath='Нет'
   fi
   printf '\n%s%s  ◆ 3x-ui_reverse — параметры%s\n' "$C_BOLD" "$C_BLUE" "$C_RESET"
@@ -1268,20 +1286,42 @@ show_info_color(){
     color_value 'Логин' "$PANEL_USER" "$C_YELLOW"
     color_value 'Пароль' "$PANEL_PASS" "$C_YELLOW"
     color_value 'Порт' "$PANEL_PORT" "$C_DIM"
-    printf '\n%s  ● ПОДПИСКИ%s\n' "$C_BLUE" "$C_RESET"
-    color_value 'Обычная / VLESS' "$sub_base/$SUB_PATH/CLIENT_SUB_ID" "$C_GREEN"
-    color_value 'JSON' "$sub_base/$JSON_PATH/CLIENT_SUB_ID" "$C_GREEN"
-    color_value 'Mihomo / Clash' "$sub_base/$CLASH_PATH/CLIENT_SUB_ID" "$C_GREEN"
-    color_value 'Порт подписок' "$SUB_PORT" "$C_DIM"
-    printf '\n%s  ● INBOUND-Ы%s\n' "$C_BLUE" "$C_RESET"
-    if ! { ensure_api_token 1 && helper inbounds; } 2>>"$LOG"; then
-      printf '  %sНедоступно (служба x-ui остановлена?)%s\n' "$C_DIM" "$C_RESET"
+    if ntoken=$(node_api_token 2>>"$LOG"); then
+      if (( 30 + ${#ntoken} > $(ui_width) )); then      # narrow terminal: own line
+        color_value 'API-токен узла' ''
+        printf '    %s%s%s\n' "$C_YELLOW" "$ntoken" "$C_RESET"
+      else
+        color_value 'API-токен узла' "$ntoken" "$C_YELLOW"
+      fi
+      color_value '' 'для подключения этой панели к мастеру как узла' "$C_DIM"
+    else
+      color_value 'API-токен узла' 'недоступен (служба x-ui остановлена?)' "$C_DIM"
     fi
+    copy_item 'адрес панели' "$panel_url"
+    copy_item 'логин' "$PANEL_USER"
+    copy_item 'пароль' "$PANEL_PASS"
+    copy_item 'API-токен узла' "${ntoken:-}"
+    printf '\n%s  ● ПОДПИСКИ%s\n' "$C_BLUE" "$C_RESET"
+    color_value 'Обычная / VLESS' "/$SUB_PATH/" "$C_YELLOW"
+    color_value 'JSON' "/$JSON_PATH/" "$C_YELLOW"
+    color_value 'Mihomo / Clash' "/$CLASH_PATH/" "$C_YELLOW"
+    if [[ "${PROXY_INSTALLED:-1}" == 1 ]]; then
+      color_value 'Порт подписок' "$SUB_PORT (только 127.0.0.1, снаружи — 443)" "$C_DIM"
+    else
+      color_value 'Порт подписок' "$SUB_PORT" "$C_DIM"
+    fi
+    copy_item 'путь подписки' "/$SUB_PATH/"
+    copy_item 'путь JSON' "/$JSON_PATH/"
+    copy_item 'путь Clash' "/$CLASH_PATH/"
   fi
   printf '\n%s  ● ФАЙЛЫ%s\n' "$C_BLUE" "$C_RESET"
   color_value 'Параметры (chmod 600)' "$INFO" "$C_DIM"
   color_value 'Лог' "$LOG" "$C_DIM"
-  printf '\n%s  ⚠ Учётные данные не передавай посторонним.%s\n\n' "$C_YELLOW" "$C_RESET"
+  printf '\n%s  ⚠ Учётные данные не передавай посторонним.%s\n' "$C_YELLOW" "$C_RESET"
+  if [[ $UI_MODE == tui ]]; then
+    printf '%s  Клик по значению (или Tab → Enter) копирует его в буфер обмена.\n  Если не вставилось — выдели текст мышью с зажатым Shift.%s\n' "$C_DIM" "$C_RESET"
+  fi
+  printf '\n'
 }
 
 status_line(){
@@ -1672,7 +1712,7 @@ remove_panel_components(){
   rm -f /etc/fail2ban/filter.d/3x-ipl.conf /etc/fail2ban/action.d/3x-ipl.conf
   rm -f /etc/fail2ban/jail.d/3x-ipl.conf /etc/fail2ban/jail.d/3x-ipl-backend.conf
   # The token belonged to the removed database; the backup keeps its hash.
-  rm -f -- "$API_TOKEN" "$BASE/activity.json"
+  rm -f -- "$API_TOKEN" "$NODE_TOKEN" "$BASE/activity.json"
   run systemctl daemon-reload || :
   run systemctl try-restart fail2ban || :
 }
@@ -2810,6 +2850,291 @@ menu_remove(){
       4) if remove_manager_command; then exit 0; fi ;;
     esac
     flush_notes 'Удаление'
+  done
+}
+
+# ---- Nodes: this panel as a master, or this server as a node of another one.
+# The master reaches a node's panel through the node's own HTTPS proxy:
+# https://DOMAIN/PANEL_PATH/panel/api/… with a node-sync API token.
+PAIR_DIR=''        # pairing file published by this session (removed on exit)
+
+# The node-sync token for a master panel. 3x-ui stores only a hash, so the
+# plaintext is kept in $NODE_TOKEN (0600) and created on first use.
+node_api_token(){
+  [[ "${PANEL_INSTALLED:-1}" == 1 ]] || return 1
+  if [[ -s "$NODE_TOKEN" ]]; then
+    # Shown as stored unless the panel says it is gone (e.g. 3x-ui reinstalled).
+    if ! ensure_api_token 1 >/dev/null 2>&1 || helper node-token-check >/dev/null 2>&1; then
+      cat -- "$NODE_TOKEN"; return 0
+    fi
+  fi
+  ensure_api_token 3 || return 1
+  local t
+  t=$(helper node-token-create) || return 1
+  [[ -n "$t" ]] || return 1
+  ( umask 077; printf '%s\n' "$t" > "$NODE_TOKEN" )
+  printf '%s\n' "$t"
+}
+node_token_rotate(){
+  ensure_api_token 3 || return 1
+  local t
+  t=$(helper node-token-create) || return 1
+  ( umask 077; printf '%s\n' "$t" > "$NODE_TOKEN" )
+}
+
+# Removes the pairing file of this session and any expired leftovers.
+pair_revoke(){
+  local d exp now keep=''
+  if [[ -n "${PAIR_DIR:-}" ]]; then rm -rf -- "$PAIR_DIR" 2>/dev/null || :; fi
+  if [[ -f "$PAIR_ACTIVE" ]]; then
+    now=$(date +%s)
+    while read -r d exp; do
+      [[ -n "$d" ]] || continue
+      if [[ "$d" == "${PAIR_DIR:-//}" || ! "${exp:-0}" =~ ^[0-9]+$ ]] || ((exp < now)); then
+        [[ "$d" == "$SITE"/* && "$d" != *..* ]] && rm -rf -- "$d" 2>/dev/null
+      else
+        keep+="$d $exp"$'\n'
+      fi
+    done < "$PAIR_ACTIVE" || :
+    if [[ -n "$keep" ]]; then printf '%s' "$keep" > "$PAIR_ACTIVE" 2>/dev/null || :
+    else rm -f -- "$PAIR_ACTIVE" 2>/dev/null || :; fi
+  fi
+  PAIR_DIR=''
+  return 0
+}
+
+# Node side: show a one-time token; the master downloads the encrypted
+# connection details from the stub site while this screen is open.
+node_pair_screen(){
+  if [[ "${PANEL_INSTALLED:-1}" != 1 ]]; then
+    tui_msg 'Токен подключения' 'Панель 3x-ui на этом сервере удалена — подключать нечего.'
+    return 0
+  fi
+  if [[ "${PROXY_INSTALLED:-1}" != 1 || ! -d "$SITE" ]]; then
+    tui_msg 'Токен подключения' "Автоматическое подключение идёт через сайт-заглушку, а веб-сервер на этом VPS удалён.
+
+Подключи узел вручную: адрес панели и API-токен узла есть в «Параметры и ссылки»."
+    return 0
+  fi
+  if ! node_api_token >/dev/null 2>>"$LOG"; then
+    tui_msg 'Токен подключения' '{red}Не удалось получить API-токен узла.{/} Проверь, что служба x-ui запущена («Состояние служб»).'
+    return 0
+  fi
+  pair_revoke
+  local out token dir file exp tmp rc
+  if ! out=$(helper pair-publish "$SITE" "$DOMAIN" 443 "/$PANEL_PATH/" "$NODE_TOKEN" 2>>"$LOG"); then
+    tui_msg 'Токен подключения' '{red}Не удалось выпустить токен.{/} Подробности в журнале.'
+    return 0
+  fi
+  read -r token dir file exp <<< "$out"
+  PAIR_DIR=$dir
+  ( umask 077; printf '%s %s\n' "$dir" "$exp" >> "$PAIR_ACTIVE" )
+  # Safety net if this session is killed without running its exit trap.
+  if command -v systemd-run >/dev/null 2>&1; then
+    systemd-run --quiet --collect --on-active=$(( exp - $(date +%s) + 30 )) \
+      /bin/rm -rf -- "$dir" >/dev/null 2>&1 || :
+  fi
+  tmp=$(mktemp "${UI_DIR:-${TMPDIR:-/tmp}}/pair.XXXXXXXX")
+  cat > "$tmp" <<EOF
+{bold}Подключение этого сервера к мастер-панели{/}
+
+  Домен узла    {green}$DOMAIN{/}
+  Токен         {yellow}$token{/}
+
+На мастере открой {accent}3x-ui_reverse → Подключить узел → Автоматически{/}
+и введи домен и токен.
+
+{dim}Токен одноразовый и действует, пока открыт этот экран (не дольше 30 минут).
+Он не связан с 3x-ui: по нему мастер один раз получит адрес и путь панели
+и API-токен узла. После закрытия экрана токен не сработает.{/}
+EOF
+  copy_item 'домен' "$DOMAIN"
+  copy_item 'токен' "$token"
+  TUI_WATCH=$file TUI_EXPIRES=$exp tui_textfile 'Токен подключения узла' "$tmp"
+  rc=$UI_RC
+  rm -f -- "$tmp"
+  pair_revoke
+  case "$rc" in
+    3) tui_msg 'Токен использован' "{green}✓ Мастер-панель получила данные подключения.{/}
+
+Токен удалён и повторно не сработает. Проверь узел на мастере: «Подключить узел» → «Подключённые узлы»." ;;
+    4) tui_msg 'Токен недействителен' '{yellow}⚠ Срок действия токена истёк.{/} Выдай новый, когда будешь готов подключать узел.' ;;
+    *) note '○ Токен подключения отозван.' ;;
+  esac
+}
+
+node_addr_text(){   # scheme address port path -> URL
+  local port_part=''
+  [[ "$3" == 443 ]] || port_part=":$3"
+  printf '%s://%s%s%s' "$1" "$2" "$port_part" "$4"
+}
+
+# Master side, automatic: domain + one-time token issued on the node.
+node_add_auto(){
+  need_panel_api || return 0
+  local domain token out bundle name address port path country nname
+  domain=$(tui_input 'Подключить узел' 'Домен узла — показан на узле рядом с токеном:' '') || return 0
+  domain=${domain,,}; domain=${domain#http://}; domain=${domain#https://}; domain=${domain%%/*}; domain=${domain%.}
+  if ! valid_domain "$domain"; then
+    tui_msg 'Неверный домен' "«$domain» — не доменное имя. Введи домен узла, например node.example.com."
+    return 0
+  fi
+  token=$(tui_input 'Подключить узел' "Токен подключения узла $domain.
+
+{dim}На узле: 3x-ui_reverse → Подключить узел → Выдать токен подключения.
+Регистр и дефисы не важны.{/}" '') || return 0
+  bundle=$(mktemp "${UI_DIR:-${TMPDIR:-/tmp}}/node.XXXXXXXX")
+  chmod 600 "$bundle"
+  if ! out=$(helper pair-fetch "$domain" "$token" "$bundle" 2>&1); then
+    rm -f -- "$bundle"
+    tui_msg 'Узел не ответил' "{red}✗ ${out#Ошибка: }{/}"
+    return 0
+  fi
+  address=$(sed -n 's/^address=//p' <<< "$out"); port=$(sed -n 's/^port=//p' <<< "$out")
+  path=$(sed -n 's/^basePath=//p' <<< "$out"); nname=$(sed -n 's/^name=//p' <<< "$out")
+  country=$(sed -n 's/^country=//p' <<< "$out")
+  name=$(helper node-name "${nname:-$address}" 2>>"$LOG") || name=${nname:-$address}
+  name=$(tui_input 'Имя узла' "{green}✓ Данные узла получены, токен на узле погашен.{/}
+
+  Панель узла   {accent}$(node_addr_text https "$address" "$port" "$path"){/}
+  Страна        ${country:-—}
+
+Имя узла в этой панели:" "$name") || { rm -f -- "$bundle"; return 0; }
+  node_add_finish --from "$bundle" --name "$name"
+  rm -f -- "$bundle"
+}
+
+# Master side, manual: panel URL + API token of the node.
+node_add_manual(){
+  need_panel_api || return 0
+  local url out address token name
+  url=$(tui_input 'Подключить узел вручную' "Адрес панели узла, например {accent}https://node.example.com/AbCd1234/{/}
+
+{dim}На узле с 3x-ui_reverse он в «Параметры и ссылки» → «Адрес панели».{/}" '') || return 0
+  if ! out=$(helper parse-url "$url" 2>&1); then
+    tui_msg 'Неверный адрес' "{red}✗ ${out#Ошибка: }{/}"
+    return 0
+  fi
+  address=$(sed -n 's/^address=//p' <<< "$out")
+  token=$(tui_input 'API-токен узла' "API-токен панели узла.
+
+{dim}На узле с 3x-ui_reverse: «Параметры и ссылки» → «API-токен узла».
+В обычной 3x-ui: Настройки → Безопасность → API-токены (область node-sync).{/}" '') || return 0
+  token=${token//[[:space:]]/}
+  [[ -n "$token" ]] || { tui_msg 'API-токен узла' 'Токен не введён — узел не подключён.'; return 0; }
+  name=$(helper node-name "$address" 2>>"$LOG") || name=$address
+  name=$(tui_input 'Имя узла' 'Имя узла в этой панели:' "$name") || return 0
+  XR_NODE_API_TOKEN=$token node_add_finish --url "$url" --name "$name"
+}
+
+node_add_finish(){
+  local out ch
+  while :; do
+    if out=$(helper node-add "$@" 2>&1); then
+      local id nm st ver lat
+      id=$(sed -n 's/^id=//p' <<< "$out"); nm=$(sed -n 's/^name=//p' <<< "$out")
+      st=$(sed -n 's/^status=//p' <<< "$out"); ver=$(sed -n 's/^version=//p' <<< "$out")
+      lat=$(sed -n 's/^latency=//p' <<< "$out")
+      tui_msg 'Узел подключён' "{green}✓ Узел «$nm» подключён{/} (id $id).
+
+  Состояние    $(if [[ $st == online ]]; then echo "{green}● в сети{/}${lat:+ · $lat мс}"; else echo '{yellow}◌ проверяется{/} — обнови список через несколько секунд'; fi)
+  3x-ui        ${ver:-—}
+
+Inbound-ы узла появятся в этой панели после первой синхронизации."
+      return 0
+    fi
+    ch=$(tui_menu 'Узел не подключён' "{red}✗ ${out#Ошибка: }{/}" \
+         retry 'Повторить' \
+         cancel 'Отмена') || return 0
+    [[ "$ch" == retry ]] || return 0
+  done
+}
+
+nodes_header(){
+  local total=0 online=0
+  read -r total online < <(helper nodes-count 2>>"$LOG" || echo '0 0')
+  printf 'Узлы — другие серверы с 3x-ui, которыми управляет эта панель.\n'
+  if ((total > 0)); then
+    printf 'Подключено: {bold}%s{/}, в сети: {green}%s{/}\n' "$total" "$online"
+  else
+    printf '{dim}Подключённых узлов пока нет.{/}\n'
+  fi
+}
+
+node_screen(){
+  local id=$1 card ch name enable
+  while :; do
+    card=$(helper node-card "$id" 2>>"$LOG") || { tui_msg 'Узел' 'Узел не найден — возможно, он уже удалён.'; return 0; }
+    name=$(sed -n 's/^#name=//p' <<< "$card"); enable=$(sed -n 's/^#enable=//p' <<< "$card")
+    card=$(grep -v '^#' <<< "$card")
+    local -a toggle=(on $'Включить\t{dim}возобновить синхронизацию{/}')
+    [[ "$enable" == 1 ]] && toggle=(off $'Выключить\t{dim}приостановить синхронизацию{/}')
+    ch=$(tui_menu "Узел: $name" "$card" \
+         probe $'Проверить связь\t{dim}запрос к панели узла{/}' \
+         "${toggle[@]}" \
+         del $'{red}Удалить узел{/}\t{dim}из этой панели; сам узел не меняется{/}') || return 0
+    case "$ch" in
+      probe)
+        local out st err
+        out=$(helper node-probe "$id" 2>&1) || { tui_msg 'Проверка' "{red}✗ ${out#Ошибка: }{/}"; continue; }
+        st=$(sed -n 's/^status=//p' <<< "$out"); err=$(sed -n 's/^error=//p' <<< "$out")
+        if [[ "$st" == online ]]; then tui_msg 'Проверка' "{green}✓ Узел отвечает{/} ($(sed -n 's/^latency=//p' <<< "$out") мс)."
+        else tui_msg 'Проверка' "{red}✗ Узел недоступен{/}${err:+: $err}"; fi ;;
+      on|off)
+        helper node-enable "$id" "$([[ $ch == on ]] && echo 1 || echo 0)" 2>>"$LOG" \
+          || tui_msg 'Ошибка' 'Не удалось изменить состояние узла.' ;;
+      del)
+        if tui_yesno 'Удалить узел' "Удалить узел «$name» из этой панели?
+
+Сам сервер узла и его inbound-ы не изменятся; inbound-ы, привязанные к узлу в этой панели, не переносятся." 'Удалить' 'Отмена' no; then
+          helper node-del "$id" 2>>"$LOG" && { note "✓ Узел «$name» удалён."; return 0; }
+          tui_msg 'Ошибка' 'Не удалось удалить узел.'
+        fi ;;
+    esac
+  done
+}
+
+menu_nodes_list(){
+  local id first=1
+  while :; do
+    read_menu menu-nodes
+    if ((${#TSV_ITEMS[@]} == 0)); then
+      ((first)) && tui_msg 'Подключённые узлы' 'Узлов пока нет. Подключи первый: «Автоматически» или «Вручную».'
+      return 0
+    fi
+    first=0
+    id=$(tui_menu 'Подключённые узлы' 'Выбери узел:' "${TSV_ITEMS[@]}") || return 0
+    node_screen "$id"
+    flush_notes
+  done
+}
+
+menu_nodes(){
+  local ch
+  ensure_api_token 3 >/dev/null 2>&1 || :
+  while :; do
+    ch=$(tui_menu 'Подключить узел' "$(nodes_header)" \
+         '#Подключить узел к этой панели' '' \
+         auto $'Автоматически\t{dim}домен и одноразовый токен с узла{/}' \
+         manual $'Вручную\t{dim}адрес панели и API-токен узла{/}' \
+         list $'Подключённые узлы\t{dim}состояние, проверка, удаление{/}' \
+         '#Этот сервер как узел' '' \
+         pair $'Выдать токен подключения\t{dim}действует, пока открыт экран{/}' \
+         rotate $'Перевыпустить API-токен узла\t{dim}старый перестанет работать{/}') || return 0
+    case "$ch" in
+      auto) node_add_auto ;;
+      manual) node_add_manual ;;
+      list) need_panel_api && menu_nodes_list ;;
+      pair) node_pair_screen ;;
+      rotate)
+        if tui_yesno 'API-токен узла' 'Выпустить новый API-токен узла?
+
+Мастер-панель, к которой этот сервер уже подключён, потеряет к нему доступ — подключи узел на мастере заново.' 'Перевыпустить' 'Отмена' no; then
+          if node_token_rotate 2>>"$LOG"; then note '✓ Новый API-токен узла — в «Параметры и ссылки».'
+          else warn 'Не удалось перевыпустить API-токен узла.'; fi
+        fi ;;
+    esac
+    flush_notes
   done
 }
 
@@ -4370,6 +4695,350 @@ def cmd_enable_access_log(_args):
 
 
 
+# ------------------------------------------------------------------ nodes
+# A node is another 3x-ui panel managed by this one (3x-ui "Nodes"). The node
+# side keeps a node-sync API token for the master; pairing hands the node's
+# connection details to the master through a one-time encrypted file on the
+# node's stub site, so nothing new is exposed and no port is opened.
+import base64, hashlib, hmac, ipaddress
+
+NODE_TOKEN_NAME = '3x-ui_reverse node'
+PAIR_TTL = 1800                       # a pairing token lives at most 30 minutes
+B32 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567'
+
+
+def _opt(args, name, default=''):
+    if name in args:
+        i = args.index(name)
+        if i + 1 < len(args):
+            return args[i + 1]
+    return default
+
+
+def cmd_node_token_create(args):
+    """Mint the node-sync token the master uses; any previous one is revoked."""
+    tokens = ok(call('/setting/apiTokens'), 'список API-токенов') or []
+    for t in tokens:
+        if t.get('name') == NODE_TOKEN_NAME:
+            ok(call('/setting/apiTokens/delete/%s' % t['id'], {'expectedScope': t.get('scope') or 'node-sync'}),
+               'удаление старого токена узла')
+    obj = ok(call('/setting/apiTokens/create', {'name': NODE_TOKEN_NAME, 'scope': 'node-sync', 'expiresAt': 0}),
+             'создание токена узла')
+    token = (obj or {}).get('token') or ''
+    if not token:
+        die('панель не вернула токен')
+    print(token)
+
+
+def cmd_node_token_check(args):
+    """Exit 0 if the node token is still registered in the panel."""
+    tokens = ok(call('/setting/apiTokens'), 'список API-токенов') or []
+    sys.exit(0 if any(t.get('name') == NODE_TOKEN_NAME and t.get('enabled', True) for t in tokens) else 1)
+
+
+# ---- pairing crypto: HMAC-SHA256 keystream + HMAC tag (stdlib only)
+def _kdf(secret, label):
+    return hmac.new(secret, b'3xr-pair:' + label, hashlib.sha256).digest()
+
+
+def _stream(key, nonce, n):
+    out, ctr = b'', 0
+    while len(out) < n:
+        out += hmac.new(key, nonce + ctr.to_bytes(8, 'big'), hashlib.sha256).digest()
+        ctr += 1
+    return out[:n]
+
+
+def _seal(secret, data):
+    nonce = secrets.token_bytes(16)
+    ct = bytes(a ^ b for a, b in zip(data, _stream(_kdf(secret, b'enc'), nonce, len(data))))
+    tag = hmac.new(_kdf(secret, b'mac'), nonce + ct, hashlib.sha256).digest()
+    return base64.b64encode(nonce + ct + tag)
+
+
+def _open(secret, blob):
+    try:
+        raw = base64.b64decode(blob.strip(), validate=True)
+    except (ValueError, TypeError):
+        return None
+    if len(raw) < 48:
+        return None
+    nonce, ct, tag = raw[:16], raw[16:-32], raw[-32:]
+    if not hmac.compare_digest(tag, hmac.new(_kdf(secret, b'mac'), nonce + ct, hashlib.sha256).digest()):
+        return None
+    return bytes(a ^ b for a, b in zip(ct, _stream(_kdf(secret, b'enc'), nonce, len(ct))))
+
+
+def _pair_paths(secret):
+    return _kdf(secret, b'dir').hex()[:20], _kdf(secret, b'file').hex()[:32]
+
+
+def _fmt_token(secret):
+    bits = int.from_bytes(secret, 'big')
+    chars = ''.join(B32[(bits >> (5 * i)) & 31] for i in range(len(secret) * 8 // 5))[::-1]
+    return '-'.join(chars[i:i + 4] for i in range(0, len(chars), 4))
+
+
+def _parse_token(text):
+    s = re.sub(r'[\s\-_]', '', (text or '').upper()).replace('0', 'O').replace('1', 'I').replace('8', 'B')
+    if len(s) != 24 or any(ch not in B32 for ch in s):
+        return None
+    bits = 0
+    for ch in s:
+        bits = (bits << 5) | B32.index(ch)
+    return bits.to_bytes(15, 'big')
+
+
+def cmd_pair_publish(args):
+    """pair-publish SITE DOMAIN PORT BASEPATH TOKENFILE -> TOKEN DIR FILE EXPIRES"""
+    site, domain, port, base_path, token_file = args[:5]
+    try:
+        api_token = open(token_file).read().strip()
+    except OSError:
+        die('нет API-токена узла')
+    secret = secrets.token_bytes(15)
+    d, f = _pair_paths(secret)
+    exp = int(time.time()) + PAIR_TTL
+    bundle = {'v': 1, 'scheme': 'https', 'address': domain, 'port': int(port), 'basePath': base_path,
+              'apiToken': api_token, 'country': country_name(), 'name': country_name() or domain, 'exp': exp}
+    blob = _seal(secret, json.dumps(bundle).encode())
+    path = os.path.join(site, d)
+    os.makedirs(path, mode=0o755, exist_ok=True)
+    os.chmod(path, 0o755)
+    target = os.path.join(path, f)
+    with open(target + '.tmp', 'wb') as fh:
+        fh.write(blob)
+    os.chmod(target + '.tmp', 0o644)
+    os.rename(target + '.tmp', target)
+    # A fresh file has atime == mtime: the first read by the web server moves
+    # atime forward (relatime), which is how the node sees the token was used.
+    st = os.stat(target)
+    os.utime(target, ns=(st.st_mtime_ns, st.st_mtime_ns))
+    print(_fmt_token(secret), path, target, exp)
+
+
+def cmd_pair_fetch(args):
+    """pair-fetch DOMAIN TOKEN OUTFILE: download, verify and decrypt the bundle."""
+    domain, token_text, outfile = args[:3]
+    secret = _parse_token(token_text)
+    if not secret:
+        die('токен должен состоять из 24 символов (A–Z, 2–7), например ABCD-EFGH-IJKL-MNOP-QRST-UVWX')
+    d, f = _pair_paths(secret)
+    url = 'https://%s/%s/%s' % (domain, d, f)
+    try:
+        body = _fetch(url, timeout=15)
+    except Exception as e:
+        reason = getattr(e, 'reason', None) or e
+        die('узел %s недоступен по HTTPS: %s' % (domain, reason))
+    plain = _open(secret, body)
+    if plain is None:
+        die('токен не подошёл: он введён с ошибкой, уже использован, или экран с токеном на узле закрыт')
+    try:
+        bundle = json.loads(plain)
+    except ValueError:
+        die('узел прислал повреждённые данные')
+    if int(bundle.get('exp', 0)) < time.time():
+        die('срок действия токена истёк — выдай новый на узле')
+    fd = os.open(outfile, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as fh:
+        json.dump(bundle, fh)
+    for key in ('address', 'port', 'basePath', 'name', 'country'):
+        print('%s=%s' % (key, bundle.get(key, '')))
+
+
+# ---- master side: the panel's /nodes API
+def _nodes():
+    return ok(call('/nodes/list'), 'список узлов') or []
+
+
+def _private_only(host):
+    try:
+        addrs = {ai[4][0] for ai in socket.getaddrinfo(host, None)}
+    except OSError:
+        return False
+    try:
+        return bool(addrs) and all(not ipaddress.ip_address(a.split('%')[0]).is_global for a in addrs)
+    except ValueError:
+        return False
+
+
+def _unique_node_name(base, nodes, skip_id=None):
+    names = {n.get('name') for n in nodes if n.get('id') != skip_id}
+    if base not in names:
+        return base
+    i = 2
+    while '%s %d' % (base, i) in names:
+        i += 1
+    return '%s %d' % (base, i)
+
+
+def cmd_node_name(args):
+    """node-name BASE -> a name not used by another node yet."""
+    print(_unique_node_name(args[0] if args else 'node', _nodes()))
+
+
+def parse_panel_url(text):
+    """https://host[:port]/path/ -> (scheme, host, port, path)."""
+    text = (text or '').strip()
+    if '://' not in text:
+        text = 'https://' + text
+    u = urllib.parse.urlsplit(text)
+    if u.scheme not in ('http', 'https') or not u.hostname:
+        return None
+    try:
+        port = u.port or (443 if u.scheme == 'https' else 80)
+    except ValueError:
+        return None
+    path = u.path or '/'
+    for tail in ('/panel/api', '/panel'):
+        if path.rstrip('/').endswith(tail):
+            path = path.rstrip('/')[:-len(tail)]
+    path = '/' + path.strip('/') + '/' if path.strip('/') else '/'
+    return u.scheme, u.hostname, port, path
+
+
+def cmd_parse_url(args):
+    p = parse_panel_url(args[0] if args else '')
+    if not p:
+        die('ожидается адрес панели узла вида https://node.example.com/путь/')
+    print('scheme=%s\naddress=%s\nport=%s\nbasePath=%s' % p)
+
+
+def cmd_node_add(args):
+    """node-add --from FILE | --url URL (token in $XR_NODE_API_TOKEN) [--name NAME]"""
+    src = _opt(args, '--from')
+    if src:
+        try:
+            with open(src) as fh:
+                b = json.load(fh)
+        except (OSError, ValueError):
+            die('нет данных узла — получи токен заново')
+        scheme, address, port, path = b.get('scheme', 'https'), b['address'], int(b['port']), b['basePath']
+        api_token = b.get('apiToken', '')
+        base_name = b.get('name') or address
+    else:
+        p = parse_panel_url(_opt(args, '--url'))
+        if not p:
+            die('ожидается адрес панели узла вида https://node.example.com/путь/')
+        scheme, address, port, path = p
+        api_token = os.environ.get('XR_NODE_API_TOKEN', '').strip()
+        base_name = address
+    if not api_token:
+        die('не задан API-токен узла')
+    nodes = _nodes()
+    for n in nodes:
+        if n.get('address') == address and int(n.get('port') or 0) == port and \
+                (n.get('basePath') or '/') == path:
+            die('этот узел уже подключён: «%s» (id %s)' % (n.get('name'), n.get('id')))
+    name = (_opt(args, '--name') or '').strip() or _unique_node_name(base_name, nodes)
+    if any(n.get('name') == name for n in nodes):
+        die('узел с именем «%s» уже есть' % name)
+    body = {'name': name, 'remark': 'добавлен 3x-ui_reverse', 'scheme': scheme, 'address': address,
+            'port': port, 'basePath': path, 'apiToken': api_token, 'enable': True,
+            'allowPrivateAddress': _private_only(address), 'tlsVerifyMode': 'verify',
+            'inboundSyncMode': 'all', 'inboundTags': [], 'outboundTag': ''}
+    reply = call('/nodes/add', body, timeout=40)
+    if not reply.get('success'):
+        msg = (reply.get('msg') or '').strip()
+        hint = ''
+        low = msg.lower()
+        if '404' in low or "character '<'" in low:
+            hint = ' — по этому адресу нет панели: проверь путь'
+        elif '401' in low or '403' in low or 'unauthor' in low or 'token' in low:
+            hint = ' — неверный API-токен узла'
+        elif 'x509' in low or 'certificate' in low:
+            hint = ' — сертификат узла не прошёл проверку'
+        elif 'timeout' in low or 'refused' in low or 'no such host' in low:
+            hint = ' — узел недоступен с этого сервера'
+        die('панель не подключила узел: %s%s' % (msg or 'ошибка', hint))
+    v = reply.get('obj') or {}
+    print('id=%s\nname=%s\nstatus=%s\nversion=%s\nlatency=%s' % (
+        v.get('id', ''), v.get('name', name), v.get('status', ''), v.get('panelVersion', ''), v.get('latencyMs', '')))
+
+
+def _node_state(n):
+    if not n.get('enable', True):
+        return c('dim', '○ выключен')
+    st = n.get('status') or ''
+    if st == 'online':
+        return c('green', '● в сети') + c('dim', ' %s мс' % n.get('latencyMs', '?'))
+    if st == 'offline':
+        err = (n.get('lastError') or '').strip()
+        return c('red', '✗ недоступен') + (c('dim', ' — ' + err[:60]) if err else '')
+    return c('yellow', '◌ проверяется')
+
+
+def cmd_nodes(args):
+    nodes = _nodes()
+    if not nodes:
+        out(c('dim', 'Узлов пока нет. Подключи первый: «Подключить узел» → «Автоматически» или «Вручную».'))
+        return
+    head = ['ID', 'УЗЕЛ', 'АДРЕС', 'СОСТОЯНИЕ', 'ВЕРСИЯ', 'INB', 'КЛ.']
+    rows = []
+    for n in nodes:
+        port = int(n.get('port') or 0)
+        addr = n.get('address', '') + ('' if port in (443, 0) else ':%d' % port)
+        rows.append([str(n.get('id')), n.get('name', ''), addr, _node_state(n),
+                     n.get('panelVersion') or '—', str(n.get('inboundCount', 0)), str(n.get('clientCount', 0))])
+    widths = [max(width(MARK_RE.sub('', r[i])) for r in rows + [head]) for i in range(len(head))]
+    out(c('dim', '  '.join(pad(h, widths[i]) for i, h in enumerate(head))))
+    for r in rows:
+        cells = []
+        for i, v in enumerate(r):
+            vis = width(MARK_RE.sub('', v))
+            cells.append(v + ' ' * max(0, widths[i] - vis))
+        out('  '.join(cells).rstrip())
+
+
+def cmd_nodes_count(args):
+    nodes = _nodes()
+    print(len(nodes), sum(1 for n in nodes if n.get('status') == 'online' and n.get('enable', True)))
+
+
+def cmd_menu_nodes(args):
+    for n in _nodes():
+        port = int(n.get('port') or 0)
+        addr = n.get('address', '') + ('' if port in (443, 0) else ':%d' % port)
+        print('%s\t%s\t%s\t%s' % (n.get('id'), n.get('name', ''), _node_state(n), c('dim', addr)))
+
+
+def cmd_node_card(args):
+    nid = int(args[0])
+    for n in _nodes():
+        if n.get('id') == nid:
+            port = int(n.get('port') or 0)
+            url = '%s://%s%s%s' % (n.get('scheme', 'https'), n.get('address', ''),
+                                   '' if port in (443, 0) else ':%d' % port, n.get('basePath') or '/')
+            rows = [('Состояние', _node_state(n)), ('Адрес панели', c('green', url)),
+                    ('Версия 3x-ui', n.get('panelVersion') or '—'),
+                    ('Xray', '%s %s' % (n.get('xrayVersion') or '—', n.get('xrayState') or '')),
+                    ('Inbound-ы', str(n.get('inboundCount', 0))),
+                    ('Клиенты', '%s, в сети %s' % (n.get('clientCount', 0), n.get('onlineCount', 0))),
+                    ('CPU / память', '%s%% / %s%%' % (round(n.get('cpuPct') or 0), round(n.get('memPct') or 0))),
+                    ('Проверка TLS', n.get('tlsVerifyMode') or 'verify')]
+            if n.get('lastHeartbeat'):
+                rows.append(('Последний отклик', ago(n['lastHeartbeat'])))
+            for k, v in rows:
+                out('  ' + c('dim', pad(k, 18)) + v)
+            print('#name=%s' % n.get('name', ''))
+            print('#enable=%s' % (1 if n.get('enable', True) else 0))
+            return
+    die('узел %s не найден' % nid)
+
+
+def cmd_node_del(args):
+    ok(call('/nodes/del/%d' % int(args[0]), {}), 'удаление узла')
+
+
+def cmd_node_enable(args):
+    ok(call('/nodes/setEnable/%d' % int(args[0]), {'enable': args[1] == '1'}), 'включение узла')
+
+
+def cmd_node_probe(args):
+    v = ok(call('/nodes/probe/%d' % int(args[0]), {}, timeout=40), 'проверка узла') or {}
+    print('status=%s\nerror=%s\nlatency=%s' % (v.get('status', ''), v.get('error', ''), v.get('latencyMs', '')))
+
+
 # ------------------------------------------------------------ self-update
 REPO_RE = re.compile(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+')
 TAG_VER_RE = re.compile(r'v?\d+(\.\d+){0,3}')
@@ -4446,6 +5115,11 @@ COMMANDS = {
     'country': cmd_country, 'update-check': cmd_update_check, 'update-fetch': cmd_update_fetch,
     'dns-check': cmd_dns_check, 'public-ip': cmd_public_ip,
     'track-activity': cmd_track_activity, 'enable-access-log': cmd_enable_access_log,
+    'node-token-create': cmd_node_token_create, 'node-token-check': cmd_node_token_check,
+    'pair-publish': cmd_pair_publish, 'pair-fetch': cmd_pair_fetch, 'node-name': cmd_node_name,
+    'parse-url': cmd_parse_url, 'node-add': cmd_node_add, 'nodes': cmd_nodes, 'nodes-count': cmd_nodes_count,
+    'menu-nodes': cmd_menu_nodes, 'node-card': cmd_node_card, 'node-del': cmd_node_del,
+    'node-enable': cmd_node_enable, 'node-probe': cmd_node_probe,
 }
 
 if __name__ == '__main__':
@@ -5135,6 +5809,45 @@ class TUI:
                 value.insert(cur, k)
                 cur += 1
 
+    def copy_out(self, value):
+        """Put text on the system clipboard with OSC 52 (terminal permitting)."""
+        b64 = __import__('base64').b64encode(value.encode('utf-8')).decode()
+        seq = '\x1b]52;c;%s\x07' % b64
+        if os.environ.get('TMUX'):
+            seq = '\x1bPtmux;\x1b%s\x1b\\' % seq
+        try:
+            sys.stdout.flush()
+            os.write(sys.stdout.fileno(), seq.encode())
+        except OSError:
+            pass
+
+    @staticmethod
+    def copy_spots(tl, items):
+        """Positions of copyable values: [(line, col0, col1, item index)]."""
+        spots, found = [], set()
+        for i, segs in enumerate(tl):
+            line = ''.join(t for t, _ in segs)
+            for n, (_, value) in enumerate(items):
+                if not value or n in found:
+                    continue
+                at = line.find(value)
+                if at >= 0:                       # first occurrence only
+                    found.add(n)
+                    col = swidth(line[:at])
+                    spots.append((i, col, col + swidth(value), n))
+        return spots
+
+    @staticmethod
+    def watch_state(path, expires):
+        """Pairing file: 'used' once the web server read it, 'gone' if removed/expired."""
+        if expires and time.time() > expires:
+            return 'gone'
+        try:
+            st = os.stat(path)
+        except OSError:
+            return 'gone'
+        return 'used' if st.st_atime_ns > st.st_mtime_ns else ''
+
     def d_text(self, req):
         title = req.get('title', '')
         text = req.get('text', '')
@@ -5144,11 +5857,13 @@ class TUI:
                     text = f.read().rstrip('\n')
             except OSError as e:
                 text = '{red}Не удалось открыть файл: %s{/}' % e
-        top = 0
+        items = [tuple(x) for x in req.get('copy') or [] if len(x) == 2]
+        watch, expires = req.get('watch'), float(req.get('expires') or 0)
+        top, sel, status = 0, None, None
         self.c.flushinp()
         while True:
             if self.too_small():
-                self.key()
+                self.key(1 if watch else None)
                 continue
             H, W = self.scr.getmaxyx()
             maxw = min(W - 6, 104)
@@ -5156,24 +5871,75 @@ class TUI:
             need = max([sum(swidth(s) for s, _ in ln) for ln in probe] + [0])
             inner_w = max(44, min(maxw, need, maxw))
             tl = text_lines(text, inner_w)
+            spots = self.copy_spots(tl, items)
             view = min(len(tl), H - 6)
             scrollable = len(tl) > view
-            footer = ([('↑↓', 'прокрутка', None)] if scrollable else []) + \
-                [('Enter', req.get('ok') or 'закрыть', 'enter')]
+            footer = [('↑↓', 'прокрутка', None)] if scrollable else []
+            if spots:
+                footer.append(('Tab', 'значение', None))
+                if sel is not None:
+                    footer.append(('Enter', 'копировать', 'enter'))
+                footer.append(('Backspace', req.get('ok') or 'закрыть', 'back'))
+            else:
+                footer.append(('Enter', req.get('ok') or 'закрыть', 'enter'))
             self.chrome(footer)
             y, x, w, h = self.panel(title, inner_w, view)
             top = max(0, min(top, len(tl) - view))
             for i in range(view):
                 self.put_segs(y + i, x, tl[top + i], w)
+            if sel is not None:
+                for ln, c0, c1, n in spots:
+                    if n == sel and top <= ln < top + view:
+                        self.put(y + ln - top, x + c0, items[n][1], self.a('sel'), max(0, w - c0))
             if scrollable:
                 pct = int(100 * (top + view) / len(tl))
                 self.put(y + h, x + w - 6, ' %3d%% ' % pct, self.a('accent'))
+            if watch and expires:
+                left = max(0, int(expires - time.time()))
+                self.put(y + h, x + w - 9, ' %02d:%02d ' % (left // 60, left % 60), self.a('accent'))
+            if status:
+                self.put(y + h, x + 1, ' %s ' % status, self.a('green'), max(0, w - 12))
             self.scr.refresh()
-            act = self.norm(self.key())
+            raw = self.key(1 if watch else None)
+            if watch:
+                state = self.watch_state(watch, expires)
+                if state == 'used':
+                    return 3, ''
+                if state == 'gone':
+                    return 4, ''
+            if raw is None:
+                continue
+            if spots and raw in ('\t', self.c.KEY_BTAB):
+                order = sorted({n for *_, n in spots})
+                if sel not in order:
+                    sel = order[0 if raw == '\t' else -1]
+                else:
+                    sel = order[(order.index(sel) + (1 if raw == '\t' else -1)) % len(order)]
+                ln = next(l for l, _, _, n in spots if n == sel)
+                if not top <= ln < top + view:
+                    top = max(0, ln - view // 2)
+                status = None
+                continue
+            act = self.norm(raw)
             if isinstance(act, tuple):
                 kind_m = self.mouse_kind(act[3])
-                act = self.footer_hit(act[1], act[2]) or \
-                    {'wheelup': 'up', 'wheeldown': 'down', 'right': 'back'}.get(kind_m)
+                hit = None
+                if kind_m in ('click', 'double'):
+                    for ln, c0, c1, n in spots:
+                        if act[1] == y + ln - top and top <= ln < top + view and x + c0 <= act[2] < x + c1:
+                            hit = n
+                if hit is not None:
+                    sel = hit
+                    act = 'copy'
+                else:
+                    act = self.footer_hit(act[1], act[2]) or \
+                        {'wheelup': 'up', 'wheeldown': 'down', 'right': 'back'}.get(kind_m)
+            if act == 'enter' and spots and sel is not None:
+                act = 'copy'
+            if act == 'copy':
+                self.copy_out(items[sel][1])
+                status = '✓ Скопировано: %s' % items[sel][0]
+                continue
             if act in ('enter', 'esc', 'back', 'left', 'q'):
                 return 0, ''
             step = {'up': -1, 'down': 1, 'pgup': -view, 'pgdn': view, 'space': view}.get(act)
@@ -5453,6 +6219,19 @@ def cli(req):
                     body = f.read().rstrip('\n')
             if cmd == 'text':
                 say(body)
+            if req.get('watch'):
+                tty.write(to_ansi('{dim}Enter — отозвать токен и вернуться{/}', color))
+                tty.flush()
+                expires = float(req.get('expires') or 0)
+                while True:
+                    state = TUI.watch_state(req['watch'], expires)
+                    if state:
+                        tty.write('\n')
+                        return (3 if state == 'used' else 4), ''
+                    r, _, _ = select.select([tin], [], [], 1)
+                    if r:
+                        tin.readline()
+                        return 0, ''
             ask('{dim}Enter — продолжить{/}')
             return 0, ''
     except (EOFError, KeyboardInterrupt):
@@ -5668,6 +6447,7 @@ manager(){
   fi
   # Keep the API helper in sync with this version of the script.
   write_helper; write_helper_env
+  pair_revoke                     # pairing files left by a killed session
   update_check_background
   flush_notes 'Обновление'
   local ch
@@ -5683,6 +6463,7 @@ manager(){
          users $'Пользователи\t{dim}трафик, активность, inbound-ы{/}' \
          groups $'Группы\t{dim}массовые действия{/}' \
          inbounds $'Inbound-ы\t{dim}VLESS, Trojan, Hysteria2, AmneziaWG, MTProto{/}' \
+         nodes $'Подключить узел\t{dim}другие серверы 3x-ui под управлением этой панели{/}' \
          '#Система' '' \
          settings $'Настройки панели\t{dim}порты, пути, логин{/}' \
          service $'Обслуживание\t{dim}перезапуск, переустановка{/}' \
@@ -5695,6 +6476,7 @@ manager(){
       users) menu_users ;;
       groups) menu_groups ;;
       inbounds) menu_inbounds ;;
+      nodes) menu_nodes ;;
       settings) menu_settings ;;
       service) menu_service ;;
       version) menu_version ;;
@@ -5757,6 +6539,12 @@ usage(){
   inbounds add KIND[,KIND…] [--tls CERT:KEY:SNI] [--port N] [--sni HOST] [--name NAME]
   inbounds edit ID [--port N] [--name NAME] [--sni HOST] [--tls domain|CERT:KEY:SNI] [--enable 0|1]
   inbounds del ID
+  node [list]                           подключённые узлы (другие панели 3x-ui)
+  node add DOMAIN TOKEN [--name NAME]   подключить узел по одноразовому токену с узла
+  node add https://узел/путь/ --api-token T [--name NAME]   подключить вручную
+  node show ID | node del ID
+  node token                            (на узле) выдать токен подключения и ждать мастер
+  node api-token [--rotate]             (на узле) API-токен для мастер-панели
   version | update [--check]            версия | проверить/установить обновление
 
 Служебные: --repair  --demo  --uninstall  --remove-command  --restore-command
@@ -5768,7 +6556,7 @@ EOF
 cli_need_panel(){
   [[ $EUID -eq 0 ]] || die 'Запусти через sudo.'
   load_state
-  [[ -f "$HELPER" ]] || write_helper
+  write_helper                    # always the helper of this script version
   [[ "${PANEL_INSTALLED:-1}" == 1 ]] || die 'Панель 3x-ui удалена.'
   ensure_api_token 5 || die 'API 3x-ui недоступен (служба x-ui запущена?).'
 }
@@ -5784,8 +6572,8 @@ cli_opt(){
 cli_cmd(){
   local cmd=$1 sub=${2:-list}
   case "$cmd" in
-    info) [[ $EUID -eq 0 ]] || die 'Запусти через sudo.'; load_state; show_info_color ;;
-    status) [[ $EUID -eq 0 ]] || die 'Запусти через sudo.'; load_state; show_status_color ;;
+    info) [[ $EUID -eq 0 ]] || die 'Запусти через sudo.'; load_state; write_helper; show_info_color ;;
+    status) [[ $EUID -eq 0 ]] || die 'Запусти через sudo.'; load_state; write_helper; show_status_color ;;
     users)
       cli_need_panel
       case "$sub" in
@@ -5824,6 +6612,22 @@ cli_cmd(){
         del) [[ -n "${3:-}" ]] || die 'inbounds del ID'; helper del-inbound "$3"; printf 'Удалён inbound %s\n' "$3" ;;
         *) die "Неизвестная подкоманда inbounds $sub" ;;
       esac ;;
+    node|nodes)
+      case "$sub" in
+        list) cli_need_panel; helper nodes ;;
+        add) cli_node_add "${@:3}" ;;
+        show) cli_need_panel; [[ -n "${3:-}" ]] || die 'node show ID'; helper node-card "$3" | grep -v '^#' ;;
+        del) cli_need_panel; [[ -n "${3:-}" ]] || die 'node del ID'; helper node-del "$3"; printf 'Узел %s удалён.\n' "$3" ;;
+        token)
+          cli_need_panel
+          UI_WANT=cli; ui_init || die 'Нужен интерактивный терминал.'
+          node_pair_screen; flush_notes ;;
+        api-token)
+          cli_need_panel
+          if [[ "${3:-}" == --rotate ]]; then node_token_rotate || die 'Не удалось перевыпустить токен.'; fi
+          node_api_token || die 'Не удалось получить API-токен узла.' ;;
+        *) die "Неизвестная подкоманда node $sub" ;;
+      esac ;;
     version)
       printf '3x-ui_reverse %s\n' "$VERSION"
       [[ -r "$STATE" ]] && load_state
@@ -5849,6 +6653,30 @@ cli_cmd(){
   esac
 }
 # inbounds add KIND[,KIND…] [--tls CERT:KEY:SNI] [--port N] [--sni HOST] [--name NAME]
+# node add DOMAIN TOKEN [--name N]          — по одноразовому токену с узла
+# node add URL --api-token T [--name N]     — вручную
+cli_node_add(){
+  local target=${1:-} second=${2:-} name api out tmp
+  [[ -n "$target" ]] || die 'node add DOMAIN TOKEN [--name ИМЯ]  |  node add https://узел/путь/ --api-token T [--name ИМЯ]'
+  cli_need_panel
+  name=$(cli_opt name "$@"); api=$(cli_opt api-token "$@")
+  if [[ -n "$api" ]]; then
+    [[ -n "$name" ]] || name=$(helper node-name "$(helper parse-url "$target" | sed -n 's/^address=//p')")
+    out=$(XR_NODE_API_TOKEN=$api helper node-add --url "$target" --name "$name") || exit 1
+  else
+    [[ -n "$second" && "$second" != --* ]] || die 'node add DOMAIN TOKEN — нужен токен, выданный на узле (node token)'
+    target=${target,,}; target=${target#https://}; target=${target%%/*}
+    tmp=$(mktemp); chmod 600 "$tmp"
+    if ! out=$(helper pair-fetch "$target" "$second" "$tmp"); then rm -f -- "$tmp"; exit 1; fi
+    [[ -n "$name" ]] || name=$(helper node-name "$(sed -n 's/^name=//p' <<< "$out")")
+    out=$(helper node-add --from "$tmp" --name "$name") || { rm -f -- "$tmp"; exit 1; }
+    rm -f -- "$tmp"
+  fi
+  local st; st=$(sed -n 's/^status=//p' <<< "$out")
+  [[ "$st" == online ]] && st='в сети' || st='проверяется (см. node list через несколько секунд)'
+  printf 'Узел «%s» подключён (id %s), состояние: %s\n' "$(sed -n 's/^name=//p' <<< "$out")" \
+    "$(sed -n 's/^id=//p' <<< "$out")" "$st"
+}
 cli_inbounds_add(){
   local kinds=${1:-} k tls port sni name crt key host err
   [[ -n "$kinds" ]] || die 'inbounds add KIND[,KIND…] (список: 3x-ui_reverse inbounds kinds)'
@@ -5919,7 +6747,7 @@ if [[ "${XUI_REVERSE_LIB_ONLY:-0}" != 1 ]]; then
     --remove-command) remove_manager_command || : ;;
     --restore-command) restore_manager_command ;;
     --help|-h|help) usage ;;
-    info|status|users|groups|inbounds|version|update) cli_cmd "$@" ;;
+    info|status|users|groups|inbounds|node|nodes|version|update) cli_cmd "$@" ;;
     '') main_interactive ;;
     *) die "Неизвестный параметр: $1 (см. --help)" ;;
   esac
