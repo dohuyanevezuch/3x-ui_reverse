@@ -5,6 +5,22 @@
 ![version](https://img.shields.io/github/v/release/dohuyanevezuch/3x-ui_reverse?label=version)
 ![platform](https://img.shields.io/badge/Debian%2012%2F13%20%7C%20Ubuntu%2022.04%2F24.04-blue)
 
+![screen_1](./img/1.png)
+
+<details>
+  <summary>Больше снимков экрана / more screenshots</summary>
+
+ ![screen_2](./img/2.png)
+ ![screen_3](./img/3.png)
+ ![screen_4](./img/4.png)
+ ![screen_5](./img/5.png)
+ ![screen_6](./img/6.png)
+
+
+</details>
+
+
+
 ## Русский
 
 **3x-ui_reverse** — скрипт для установки и управления панелью **3x-ui** за обратным прокси **Caddy** или **Nginx** на VPS с Debian/Ubuntu. Снаружи сервер выглядит как обычный сайт с HTTPS. Панель и подписки спрятаны за случайными путями. Скрипт создаёт inbound-ы с учётом блокировок в России: VLESS и Trojan (Reality, XHTTP, TLS), Hysteria2, AmneziaWG и MTProto для Telegram. Несколько серверов можно объединить: один управляет остальными как узлами.
