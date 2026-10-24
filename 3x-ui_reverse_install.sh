@@ -6,7 +6,7 @@ set -Eeuo pipefail
 umask 077
 
 # Release version = the git tag of the commit this file comes from.
-VERSION=v2.0.1
+VERSION=v2.0.2
 # GitHub repository (owner/name) that publishes tagged releases of this script.
 # Can also be set from the "Версия" screen or with XR_REPO=owner/name.
 DEFAULT_REPO='dohuyanevezuch/3x-ui_reverse'
@@ -425,9 +425,13 @@ check_environment(){
   [[ $EUID -eq 0 ]] || die 'Запускать нужно от root (sudo bash ...).'
   [[ -d /run/systemd/system ]] || die 'Требуется systemd.'
   [[ -r /etc/os-release ]] || die 'ОС не определена.'
-  . /etc/os-release
-  [[ ${ID:-} == debian || ${ID:-} == ubuntu ]] || die 'Поддерживаются только Debian 12/13 и Ubuntu 22.04/24.04.'
-  case "$ID:${VERSION_ID:-}" in debian:12|debian:13|ubuntu:22.04|ubuntu:24.04) ;; *) die 'Неподдерживаемая версия Debian/Ubuntu.';; esac
+  # Read os-release in a subshell: it defines VERSION, NAME, ID… which would
+  # overwrite this script's own VERSION (and break self-install and updates).
+  local os_id os_ver
+  os_id=$(. /etc/os-release && printf '%s' "${ID:-}")
+  os_ver=$(. /etc/os-release && printf '%s' "${VERSION_ID:-}")
+  [[ $os_id == debian || $os_id == ubuntu ]] || die 'Поддерживаются только Debian 12/13 и Ubuntu 22.04/24.04.'
+  case "$os_id:$os_ver" in debian:12|debian:13|ubuntu:22.04|ubuntu:24.04) ;; *) die 'Неподдерживаемая версия Debian/Ubuntu.';; esac
   if [[ -e "$STATE" || -e "$DB" || -e /usr/local/x-ui/x-ui ]] || systemctl list-unit-files --no-legend x-ui.service 2>/dev/null | grep -q '^x-ui.service'; then
     die 'Обнаружена существующая 3x-ui / конфигурация. Установка только на чистый VPS.'
   fi
@@ -4555,9 +4559,16 @@ manager(){
   touch "$LOG"; chmod 600 "$LOG"
   # Running a newer copy of this file upgrades the installed command,
   # unless the command was removed on purpose.
-  if [[ "$0" != "$SELF" && -f "$0" && -f "$SELF" && ! -L "$SELF" ]] && ! cmp -s "$0" "$SELF"; then
-    install -m 755 -- "$0" "$SELF"
-    note "✓ Команда $SELF обновлена до версии $VERSION."
+  # Started from a file or as bash <(curl …): install that version as the command.
+  local installed_ver=''
+  [[ -f "$SELF" ]] && installed_ver=$(sed -n 's/^VERSION=//p' "$SELF" 2>/dev/null | head -n1)
+  if [[ "$0" != "$SELF" && ! -L "$SELF" && -f "$SELF" ]] &&
+     { [[ "$installed_ver" != "$VERSION" ]] || { [[ -f "$0" ]] && ! cmp -s "$0" "$SELF"; }; }; then
+    if install_self; then
+      note "✓ Команда $SELF обновлена до версии $VERSION."
+    else
+      warn "Не удалось обновить команду $SELF до $VERSION (нет доступа к GitHub?)."
+    fi
   fi
   # Keep the API helper in sync with this version of the script.
   write_helper; write_helper_env
