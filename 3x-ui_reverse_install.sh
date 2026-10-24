@@ -6,7 +6,7 @@ set -Eeuo pipefail
 umask 077
 
 # Release version = the git tag of the commit this file comes from.
-VERSION=v2.0.2
+VERSION=v2.1.1
 # GitHub repository (owner/name) that publishes tagged releases of this script.
 # Can also be set from the "Версия" screen or with XR_REPO=owner/name.
 DEFAULT_REPO='dohuyanevezuch/3x-ui_reverse'
@@ -23,6 +23,7 @@ SELF=/usr/local/sbin/3x-ui_reverse
 XUI_INSTALL_URL=https://raw.githubusercontent.com/MHSanaei/3x-ui/main/install.sh
 # API helper, its token and the short-lived Xray access log used for "last inbound".
 HELPER=$BASE/xr_helper.py
+HELPER_STATE=''   # overrides XR_STATE_DIR before $BASE exists
 HELPER_ENV=$BASE/helper.env
 API_TOKEN=$BASE/api.token
 ACCESS_LOG=/var/log/x-ui/3xr-access.log
@@ -195,6 +196,15 @@ ui_call(){
   UI_VAL=$(printf '%s' "$1" | python3 -I "$UI_PY" cli) || UI_RC=$?
 }
 _ctx(){ _jesc "${DOMAIN:-}"; printf '%s' "$JESC"; }
+# TUI_LOGO=1 before a dialog call draws the logo above it (TUI, when it fits).
+_logo(){ [[ "${TUI_LOGO:-}" == 1 && $UI_MODE == tui ]] && printf ',"logo":true'; return 0; }
+# Start screen with the logo while the next screen is being prepared.
+ui_splash(){
+  local jt js
+  _jesc "${1:-}"; jt=$JESC; _jesc "${2:-загрузка…}"; js=$JESC
+  [[ -n "$UI_MODE" ]] && ui_call "{\"cmd\":\"splash\",\"text\":\"$jt\",\"status\":\"$js\"}"
+  return 0
+}
 # Usable text width inside dialogs (tables are formatted to it).
 ui_width(){
   local cols
@@ -207,7 +217,7 @@ ui_width(){
 tui_msg(){
   local jt jx
   _jesc "$1"; jt=$JESC; _jesc "$2"; jx=$JESC
-  ui_call "{\"cmd\":\"msg\",\"title\":\"$jt\",\"text\":\"$jx\",\"ok\":\"продолжить\",\"ctx\":\"$(_ctx)\"}"
+  ui_call "{\"cmd\":\"msg\",\"title\":\"$jt\",\"text\":\"$jx\",\"ok\":\"продолжить\",\"ctx\":\"$(_ctx)\"$(_logo)}"
   return 0
 }
 # tui_yesno TITLE TEXT [YES] [NO] [yes|no — default choice, «no» by default]
@@ -215,24 +225,25 @@ tui_yesno(){
   local jt jx jy jn dn=true
   _jesc "$1"; jt=$JESC; _jesc "$2"; jx=$JESC; _jesc "${3:-Да}"; jy=$JESC; _jesc "${4:-Нет}"; jn=$JESC
   [[ "${5:-no}" == yes ]] && dn=false
-  ui_call "{\"cmd\":\"yesno\",\"title\":\"$jt\",\"text\":\"$jx\",\"yes\":\"$jy\",\"no\":\"$jn\",\"defaultno\":$dn,\"ctx\":\"$(_ctx)\"}"
+  ui_call "{\"cmd\":\"yesno\",\"title\":\"$jt\",\"text\":\"$jx\",\"yes\":\"$jy\",\"no\":\"$jn\",\"defaultno\":$dn,\"ctx\":\"$(_ctx)\"$(_logo)}"
   return "$UI_RC"
 }
 tui_input(){
   local jt jx jd
   _jesc "$1"; jt=$JESC; _jesc "$2"; jx=$JESC; _jesc "${3:-}"; jd=$JESC
-  ui_call "{\"cmd\":\"input\",\"title\":\"$jt\",\"text\":\"$jx\",\"default\":\"$jd\",\"ctx\":\"$(_ctx)\"}"
+  ui_call "{\"cmd\":\"input\",\"title\":\"$jt\",\"text\":\"$jx\",\"default\":\"$jd\",\"ctx\":\"$(_ctx)\"$(_logo)}"
   ((UI_RC == 0)) || return 1
   printf '%s' "$UI_VAL"
 }
 # tui_menu TITLE TEXT TAG LABEL [TAG LABEL…] — prints the chosen tag.
+# TUI_DEFAULT=TAG preselects an item (otherwise the last choice in this window).
 # Tags are never shown in the TUI; a tag starting with # is a section heading.
 # A tab inside LABEL splits it into aligned columns.
 tui_menu(){
   local jt jx jc
   _jesc "$1"; jt=$JESC; _jesc "$2"; jx=$JESC; shift 2
-  _jarr "$@"; _jesc "${TUI_CANCEL:-Назад}"; jc=$JESC
-  ui_call "{\"cmd\":\"menu\",\"title\":\"$jt\",\"text\":\"$jx\",\"items\":$JARR,\"cancel\":\"$jc\",\"ctx\":\"$(_ctx)\"}"
+  _jarr "$@"; _jesc "${TUI_CANCEL:-Назад}"; jc=$JESC; _jesc "${TUI_DEFAULT:-}"
+  ui_call "{\"cmd\":\"menu\",\"title\":\"$jt\",\"text\":\"$jx\",\"items\":$JARR,\"cancel\":\"$jc\",\"default\":\"$JESC\",\"ctx\":\"$(_ctx)\"$(_logo)}"
   ((UI_RC == 0)) || return 1
   printf '%s' "$UI_VAL"
 }
@@ -241,7 +252,7 @@ _tui_list(){
   local kind=$1 jt jx
   _jesc "$2"; jt=$JESC; _jesc "$3"; jx=$JESC; shift 3
   _jarr "$@"
-  ui_call "{\"cmd\":\"$kind\",\"title\":\"$jt\",\"text\":\"$jx\",\"items\":$JARR,\"ctx\":\"$(_ctx)\"}"
+  ui_call "{\"cmd\":\"$kind\",\"title\":\"$jt\",\"text\":\"$jx\",\"items\":$JARR,\"ctx\":\"$(_ctx)\"$(_logo)}"
   ((UI_RC == 0)) || return 1
   printf '%s\n' "$UI_VAL"
 }
@@ -348,6 +359,11 @@ unexpected_failure(){
   local code=$1 line=$2
   trap - ERR
   ui_stop failed
+  # A pre-install log lives in the temporary UI dir, which is removed on exit.
+  if [[ -n "$UI_DIR" && "$LOG" == "$UI_DIR"/* && -f "$LOG" ]] \
+     && cp "$LOG" /root/3x-ui_reverse-install.log 2>/dev/null; then
+    LOG=/root/3x-ui_reverse-install.log
+  fi
   if [[ $TUI_OK == 1 ]]; then
     tui_msg 'Неожиданная ошибка' "{red}Строка $line, код $code.{/}"$'\n\n'"Журнал диагностики: $LOG"
   fi
@@ -1014,32 +1030,55 @@ PYBACK
 install_fresh(){
   tui_init || die 'Установка ведётся в интерактивном терминале (нужен python3).'
   check_environment
-  local ch
-  ch=$(tui_radiolist 'Установка на чистый VPS' \
+  # $BASE must not exist until the user confirms the install, so until then the
+  # helper, its cache and the diagnostic log live in the temporary UI dir.
+  local helper_final=$HELPER log_final=$LOG
+  HELPER=$UI_DIR/xr_helper.py
+  HELPER_STATE=$UI_DIR
+  LOG=$UI_DIR/install.log
+  : >"$LOG"
+  write_helper
+  local ch want_inbounds=0 inbound_text
+  ch=$(TUI_LOGO=1 tui_radiolist 'Установка на чистый VPS' \
         'Веб-сервер обслуживает сайт-заглушку, выпускает HTTPS и скрывает за собой панель и подписки.' \
         caddy 'Caddy — автоматический HTTPS' ON \
         nginx 'Nginx + Certbot' OFF) || exit 0
   case "$ch" in caddy|nginx) PROXY=$ch;; *) exit 0;; esac
   local entered=''
   while :; do
-    entered=$(tui_input 'Домен' 'Домен, A-запись которого указывает на этот VPS (например, panel.example.com):' "$entered") || exit 0
+    entered=$(TUI_LOGO=1 tui_input 'Домен' 'Домен, A-запись которого указывает на этот VPS (например, panel.example.com):' "$entered") || exit 0
     entered=${entered,,}; entered=${entered%.}
     valid_domain "$entered" && break
     tui_msg 'Неверный домен' 'Введи корректное DNS-имя: не IP-адрес, не URL и без порта.'
   done
   DOMAIN=$entered
-  if ! getent ahostsv4 "$DOMAIN" >/dev/null; then
-    die "Для $DOMAIN не найдена A-запись. Настрой DNS заранее."
+  dns_check_screen || exit 0
+  # The certificate path is only known after the proxy has started.
+  PROXY_INSTALLED=1; TLS_MODE=proxy
+  if TUI_LOGO=1 tui_yesno 'Inbound-ы' "Создать inbound-ы для подключения клиентов сразу после установки?
+
+Список и настройки выберешь на следующем шаге. Их можно добавить и позже — в меню «Inbound-ы»." \
+       'Да, выбрать inbound-ы' 'Нет, только панель' yes; then
+    select_inbounds fresh && want_inbounds=1
   fi
-  tui_yesno 'Подтверждение' "Домен:       $DOMAIN
+  if ((want_inbounds)); then
+    inbound_text="Inbound-ы:   $(selected_labels) (+ пользователь user1)"
+  else
+    inbound_text='Inbound-ы:   не создавать (можно позже в меню «Inbound-ы»)'
+  fi
+  TUI_LOGO=1 tui_yesno 'Подтверждение' "Домен:       $DOMAIN
 Веб-сервер:  $PROXY
+$inbound_text
 
-Будут установлены веб-сервер с сайтом-заглушкой и HTTPS, панель 3x-ui (только на 127.0.0.1) и inbound-ы VLESS Reality (RAW, XHTTP) и MTProto на свободных портах с пользователем user1.
-
-Требования: A-запись домена указывает на этот VPS, TCP 80/443 доступны извне." 'Установить' 'Отмена' yes || exit 0
+Будут установлены веб-сервер с сайтом-заглушкой и HTTPS и панель 3x-ui (только на 127.0.0.1).
+Требования: TCP 80/443 доступны извне." 'Установить' 'Отмена' yes || exit 0
   install -d -m 755 "$BASE"
-  touch "$LOG"; chmod 600 "$LOG"
-  local proxy_install_stage proxy_https_stage inbounds_ok=0
+  install -m 600 /dev/null "$log_final"
+  cat "$LOG" >>"$log_final" 2>/dev/null || :
+  [[ -s "$UI_DIR/country.txt" ]] && install -m 600 "$UI_DIR/country.txt" "$BASE/country.txt"
+  LOG=$log_final; HELPER=$helper_final; HELPER_STATE=''
+  local proxy_install_stage proxy_https_stage inbounds_ok=0 inbound_stage='Inbound-ы не создаются'
+  ((want_inbounds)) && inbound_stage="Создаём inbound-ы: $(selected_labels)"
   if [[ $PROXY == caddy ]]; then
     proxy_install_stage='Устанавливаем Caddy'
     proxy_https_stage='Настраиваем Caddy и HTTPS'
@@ -1055,7 +1094,7 @@ install_fresh(){
     "$proxy_https_stage" \
     'Устанавливаем 3x-ui' \
     'Привязываем веб-панель и подписки к 127.0.0.1' \
-    'Создаём inbound-ы Reality RAW / XHTTP / MTProto' \
+    "$inbound_stage" \
     'Записываем параметры входа' \
     'Проверяем доступность HTTPS'
   msg 'Проверяем окружение'
@@ -1142,14 +1181,23 @@ install_fresh(){
     die 'Локальные порты панели/подписок не прошли проверку после настройки. x-ui остановлен.'
   fi
   step 85 'Локальные сервисы проверены'
-  msg 'Создаём inbound-ы Reality RAW / XHTTP / MTProto'
-  # Not fatal: the panel is already installed and inbounds can be created later (menu 19).
-  if setup_inbounds; then
-    inbounds_ok=1
-    step 93 'Inbound-ы и пользователь user1 созданы'
+  msg "$inbound_stage"
+  # Not fatal: the panel is already installed and inbounds can be created later.
+  if ((want_inbounds)); then
+    if setup_inbounds; then
+      inbounds_ok=1
+      step 93 'Inbound-ы и пользователь user1 созданы'
+    else
+      warn 'Inbound-ы не созданы. Создай их в меню «Inbound-ы».'
+      step 93 'Inbound-ы пропущены'
+    fi
   else
-    warn 'Inbound-ы не созданы автоматически. Создай их в меню «Inbound-ы».'
-    step 93 'Inbound-ы пропущены'
+    write_helper; write_helper_env
+    if ensure_api_token; then
+      helper enable-access-log >>"$LOG" 2>&1 || :
+      setup_activity_timer || :
+    fi
+    step 93 'Inbound-ы не создавались'
   fi
   msg 'Записываем параметры входа'
   save_state; write_info
@@ -1165,7 +1213,8 @@ install_fresh(){
   fi
   ui_stop
   if ((inbounds_ok)); then
-    warn "Открой во внешнем файрволе провайдера TCP-порты inbound-ов: $(helper ports 2>/dev/null || echo '?')."
+    # shellcheck disable=SC2086
+    warn "Открой во внешнем файрволе провайдера порты inbound-ов: $(helper ports $CREATED_IDS 2>/dev/null || echo '?')."
   fi
   tui_show 'Установка завершена' install_summary
   flush_notes 'Обрати внимание'
@@ -1907,15 +1956,15 @@ reinstall_proxy(){
 }
 api_base(){
   if [[ "${TLS_MODE:-proxy}" == direct && "${PROXY_INSTALLED:-1}" == 0 ]]; then
-    printf 'https://127.0.0.1:443/%s/panel/api' "$PANEL_PATH"
+    printf 'https://127.0.0.1:443/%s/panel/api' "${PANEL_PATH:-}"
   else
-    printf 'http://127.0.0.1:%s/%s/panel/api' "$PANEL_PORT" "$PANEL_PATH"
+    printf 'http://127.0.0.1:%s/%s/panel/api' "${PANEL_PORT:-0}" "${PANEL_PATH:-}"
   fi
 }
 helper(){
   [[ -f "$HELPER" ]] || write_helper
   XR_API="$(api_base)" XR_TLS_SNI="$DOMAIN" XR_TOKEN_FILE="$API_TOKEN" \
-  XR_STATE_DIR="$BASE" XR_ACCESS_LOG="$ACCESS_LOG" python3 -I "$HELPER" "$@"
+  XR_STATE_DIR="${HELPER_STATE:-$BASE}" XR_ACCESS_LOG="$ACCESS_LOG" python3 -I "$HELPER" "$@"
 }
 write_helper_env(){
   [[ -d "$BASE" && -n "${PANEL_PATH:-}" ]] || return 0
@@ -1953,12 +2002,6 @@ ensure_api_token(){
   done
   return 1
 }
-valid_sni_list(){
-  local s; local -a list
-  IFS=, read -ra list <<< "$1"
-  ((${#list[@]} == 3)) || return 1
-  for s in "${list[@]}"; do valid_domain "$s" || return 1; done
-}
 setup_activity_timer(){
   [[ -f "$HELPER" ]] || write_helper
   write_helper_env
@@ -1989,62 +2032,330 @@ remove_activity_timer(){
   rm -f "/etc/systemd/system/$ACTIVITY_UNIT.service" "/etc/systemd/system/$ACTIVITY_UNIT.timer"
   run systemctl daemon-reload || :
 }
+
+# ---------------------------------------------------------------- inbound catalog
+# Kinds offered by the script (keys match the Python helper's catalog).
+declare -A KIND_LABEL=(
+  [vless-tcp-reality]='VLESS TCP Reality' [vless-xhttp-reality]='VLESS XHTTP Reality'
+  [vless-xhttp-tls]='VLESS XHTTP TLS' [trojan-tcp]='Trojan TCP'
+  [trojan-tcp-reality]='Trojan TCP Reality' [trojan-xhttp-reality]='Trojan XHTTP Reality'
+  [trojan-xhttp-tls]='Trojan XHTTP TLS' [hysteria]='Hysteria2' [amneziawg]='AmneziaWG' [mtproto]='MTProto'
+)
+TLS_KINDS=' vless-xhttp-tls trojan-xhttp-tls hysteria '
+SNI_KINDS=' vless-tcp-reality vless-xhttp-reality trojan-tcp-reality trojan-xhttp-reality mtproto '
+INB_KINDS=()
+declare -A INB_TLS=()
+CREATED_IDS=''
+TLS_SPEC=''
+
+# Certificate the proxy (or acme.sh in direct mode) obtained for $DOMAIN.
+# Prints two lines: certificate and key. Xray re-reads them hourly, so renewals
+# are picked up without a restart.
+domain_cert_paths(){
+  local crt key
+  if [[ "${PROXY_INSTALLED:-1}" == 1 && "$PROXY" == caddy ]]; then
+    crt=$(find "$(certdir)" -type f -path "*/certificates/*/$DOMAIN/$DOMAIN.crt" 2>/dev/null | sort | head -n1)
+    key=${crt%.crt}.key
+  elif [[ "${PROXY_INSTALLED:-1}" == 1 ]]; then
+    crt="$(certdir)/live/$DOMAIN/fullchain.pem"; key="$(certdir)/live/$DOMAIN/privkey.pem"
+  else
+    crt="/root/cert/$DOMAIN/fullchain.pem"; key="/root/cert/$DOMAIN/privkey.pem"
+  fi
+  [[ -n "$crt" && -s "$crt" && -s "$key" ]] || return 1
+  printf '%s\n%s\n' "$crt" "$key"
+}
+# Caddy obtains the certificate in the background right after it starts.
+wait_domain_cert(){
+  local i
+  for ((i=0; i<45; i++)); do
+    domain_cert_paths && return 0
+    sleep 2
+  done
+  return 1
+}
+# Checks a user-supplied certificate: files, expiry, host name and key pair.
+check_cert_files(){
+  local crt=$1 key=$2 sni=$3
+  [[ -s "$crt" ]] || { printf 'файл сертификата не найден: %s' "$crt"; return 1; }
+  [[ -s "$key" ]] || { printf 'файл ключа не найден: %s' "$key"; return 1; }
+  openssl x509 -in "$crt" -noout >/dev/null 2>&1 || { printf '%s — не сертификат в формате PEM' "$crt"; return 1; }
+  openssl x509 -in "$crt" -noout -checkend 0 >/dev/null 2>&1 || { printf 'срок действия сертификата истёк'; return 1; }
+  if ! openssl x509 -in "$crt" -noout -checkhost "$sni" 2>/dev/null | grep -q 'does match'; then
+    printf 'сертификат не выдан для %s' "$sni"; return 1
+  fi
+  if [[ "$(openssl x509 -in "$crt" -noout -pubkey 2>/dev/null)" != "$(openssl pkey -in "$key" -pubout 2>/dev/null)" ]]; then
+    printf 'ключ не подходит к сертификату'; return 1
+  fi
+  return 0
+}
+cert_label(){
+  local crt=$1
+  if [[ "$crt" == "$(certdir)"/* || "$crt" == "/root/cert/$DOMAIN/"* ]]; then
+    printf 'сертификат домена %s' "$DOMAIN"
+  else
+    printf 'свой: %s' "$crt"
+  fi
+}
+# Asks which certificate a TLS inbound uses. Result in TLS_SPEC:
+# "domain" (resolved when the inbound is created) or "CERT|KEY|SNI".
+choose_tls(){
+  local label=$1 src crt key sni err
+  src=$(tui_radiolist "TLS: $label" "Какой сертификат использовать для $label?" \
+        domain $'Сертификат домена\t{dim}'"$DOMAIN"$' · продлевается автоматически{/}' ON \
+        own $'Другой сертификат\t{dim}свои файлы .crt / .key{/}' OFF) || return 1
+  if [[ "$src" == domain ]]; then TLS_SPEC=domain; return 0; fi
+  crt=$(tui_input "Сертификат: $label" 'Полный путь к файлу сертификата (fullchain, PEM):' '/root/cert/') || return 1
+  key=$(tui_input "Сертификат: $label" 'Полный путь к файлу закрытого ключа (PEM):' "${crt%/*}/") || return 1
+  sni=$(openssl x509 -in "$crt" -noout -ext subjectAltName 2>/dev/null | grep -o 'DNS:[^,]*' | head -n1 | cut -d: -f2)
+  sni=$(tui_input "Сертификат: $label" 'Домен (SNI), на который выдан сертификат:' "$sni") || return 1
+  sni=${sni,,}
+  if ! err=$(check_cert_files "$crt" "$key" "$sni"); then
+    tui_msg 'Сертификат не подходит' "{red}✗ $err{/}"
+    return 1
+  fi
+  TLS_SPEC="$crt|$key|$sni"
+}
+# Inbound selection list → INB_KINDS / INB_TLS. $1=fresh: no panel yet.
+select_inbounds(){
+  local sel k
+  local -a picked=()
+  read_check menu-kinds ${1:+--fresh}
+  if ((${#TSV_ITEMS[@]} == 0)); then tui_msg 'Inbound-ы' 'Не удалось получить список inbound-ов.'; return 1; fi
+  sel=$(tui_checklist 'Какие inbound-ы создать?' \
+        'Порты подбираются свободные, SNI — доступные из России сайты. Отмечены рекомендуемые.' \
+        "${TSV_ITEMS[@]}") || return 1
+  mapfile -t picked <<< "$sel"
+  INB_KINDS=()
+  INB_TLS=()
+  for k in "${picked[@]}"; do
+    [[ -n "$k" && -n "${KIND_LABEL[$k]:-}" ]] || continue
+    INB_KINDS+=("$k")
+    if [[ "$TLS_KINDS" == *" $k "* ]]; then
+      choose_tls "${KIND_LABEL[$k]}" || return 1
+      INB_TLS[$k]=$TLS_SPEC
+    fi
+  done
+  ((${#INB_KINDS[@]})) || { tui_msg 'Inbound-ы' 'Ничего не выбрано.'; return 1; }
+}
+selected_labels(){
+  local k out=''
+  for k in "${INB_KINDS[@]}"; do out+="${out:+, }${KIND_LABEL[$k]}"; done
+  printf '%s' "$out"
+}
 open_firewall_ports(){
   # Only touches a firewall that is already active; the provider's external
   # firewall (security groups) still has to be opened by hand.
   local ports p
-  ports=$(helper ports 2>>"$LOG") || return 1
+  ports=$(helper ports "$@" 2>>"$LOG") || return 1
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
-    for p in $ports; do run ufw allow "$p/tcp" || :; done
+    for p in $ports; do run ufw allow "$p" || :; done
   elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
-    for p in $ports; do run firewall-cmd --permanent --add-port="$p/tcp" || :; done
+    for p in $ports; do run firewall-cmd --permanent --add-port="$p" || :; done
     run firewall-cmd --reload || :
   fi
   return 0
 }
-# Creates the missing ones of: Vless RAW Reality, Vless xhttp Reality, mtproto,
-# plus user1 attached to all of them. Safe to re-run: existing inbounds are kept.
+# Creates INB_KINDS (with INB_TLS certificates); new ids in CREATED_IDS.
 setup_inbounds(){
-  local snis p1 p2 p3
+  local k spec out kinds='' paths
+  local -a args=() snis=()
+  CREATED_IDS=''
   write_helper
   write_helper_env
   ensure_api_token || { warn 'Не удалось получить API-токен 3x-ui.'; return 1; }
-  TAKEN_PORTS=$(helper all-ports 2>>"$LOG") || TAKEN_PORTS=''
-  p1=$(inbound_port) || { warn 'Нет свободного порта для inbound.'; return 1; }
-  TAKEN_PORTS+=" $p1"
-  p2=$(inbound_port) || { warn 'Нет свободного порта для inbound.'; return 1; }
-  TAKEN_PORTS+=" $p2"
-  p3=$(inbound_port) || { warn 'Нет свободного порта для inbound.'; return 1; }
-  TAKEN_PORTS+=" $p3"
-  if [[ -n "${XR_SNI:-}" ]]; then
-    snis=$XR_SNI
-  elif ! snis=$(helper pick-sni 3 2>>"$LOG"); then
-    warn 'Не удалось подобрать SNI автоматически (см. лог). Можно задать вручную: XR_SNI=a.com,b.com,c.com'
+  [[ -n "${XR_SNI:-}" ]] && IFS=, read -ra snis <<< "$XR_SNI"
+  for k in "${INB_KINDS[@]}"; do
+    spec=${INB_TLS[$k]:-}
+    if [[ "$TLS_KINDS" == *" $k "* ]]; then
+      if [[ "$spec" == domain || -z "$spec" ]]; then
+        if ! paths=$(wait_domain_cert); then
+          warn "${KIND_LABEL[$k]} не создан: сертификат домена ещё не выпущен. Создай его позже в меню «Inbound-ы»."
+          continue
+        fi
+        spec="$(sed -n 1p <<< "$paths")|$(sed -n 2p <<< "$paths")|$DOMAIN"
+      fi
+      args+=(--tls "$k|$spec")
+    elif [[ "$SNI_KINDS" == *" $k "* ]] && ((${#snis[@]})); then
+      args+=(--sni "$k|${snis[0]}")
+      snis=("${snis[@]:1}")
+    fi
+    kinds+="${kinds:+,}$k"
+  done
+  [[ -n "$kinds" ]] || return 1
+  printf 'Creating inbounds: %s\n' "$kinds" >>"$LOG"
+  if ! out=$(helper create-inbounds "$kinds" --sniff "$XR_SNIFF" "${args[@]}" 2>&1); then
+    printf '%s\n' "$out" >>"$LOG"
+    warn "Не удалось создать inbound-ы: ${out#Ошибка: }"
     return 1
   fi
-  valid_sni_list "$snis" || { warn "Некорректный список SNI: $snis"; return 1; }
-  printf 'Inbound ports %s %s %s, SNI %s\n' "$p1" "$p2" "$p3" "$snis" >>"$LOG"
-  helper create-inbounds "$p1,$p2,$p3" "$snis" "$XR_SNIFF" >>"$LOG" 2>&1 \
-    || { warn 'Не удалось создать inbound-ы (см. лог).'; return 1; }
+  CREATED_IDS=$(tail -n1 <<< "$out")
   helper enable-access-log >>"$LOG" 2>&1 || warn 'Не удалось включить журнал активности Xray.'
   setup_activity_timer || warn 'Не удалось включить учёт активности.'
-  open_firewall_ports || :
+  # shellcheck disable=SC2086  # ids are numbers separated by spaces
+  open_firewall_ports $CREATED_IDS || :
   return 0
 }
-sub_base(){
-  if [[ "${PROXY_INSTALLED:-1}" == 1 ]]; then printf 'https://%s' "$DOMAIN"
-  elif [[ "${TLS_MODE:-none}" == direct ]]; then printf 'https://%s:%s' "$DOMAIN" "$SUB_PORT"
+
+# ---------------------------------------------------------------- DNS check
+# Like dnschecker.org: public resolvers in several countries and the domain's
+# authoritative server must point the A record at this VPS.
+dns_check_screen(){
+  local out table verdict auth aaaa okn ip head ch first
+  while :; do
+    if ! out=$(helper dns-check "$DOMAIN" 2>&1); then
+      if getent ahostsv4 "$DOMAIN" >/dev/null; then return 0; fi
+      tui_yesno 'Проверка DNS' "{red}✗ Для $DOMAIN не найдена A-запись.{/} Настрой DNS у регистратора домена." \
+        'Проверить снова' 'Отмена' yes || return 1
+      continue
+    fi
+    table=$(grep -v '^VERDICT ' <<< "$out")
+    read -r _ verdict auth aaaa okn ip <<< "$(grep '^VERDICT ' <<< "$out" | tail -n1)"
+    auth=${auth#AUTH=}; aaaa=${aaaa#AAAA=}; okn=${okn#OK=}; ip=${ip#IP=}
+    case "$verdict" in
+      ok)      head="{green}✓ $DOMAIN указывает на этот сервер ($ip) во всех DNS ($okn).{/}"; first=go ;;
+      partial) head="{yellow}⚠ Правильный адрес видят не все DNS ($okn) — запись ещё распространяется.{/}"
+               if [[ "$auth" == ok ]]; then
+                 head+=$'\n'"Авторитетный сервер уже отдаёт верный адрес — сертификат выпустится, можно продолжать."; first=go
+               else first=again; fi ;;
+      wrong)   head="{red}✗ $DOMAIN не указывает на этот сервер ($ip).{/}"$'\n'"Создай или исправь A-запись у регистратора и проверь снова (обновление занимает от минут до нескольких часов)."
+               first=again ;;
+      *)       head="{yellow}⚠ Не удалось опросить DNS-серверы (закрыты UDP 53 и DoH?).{/}"; first=go ;;
+    esac
+    if [[ "$aaaa" == wrong ]]; then
+      head+=$'\n'"{yellow}⚠ У домена есть AAAA-запись (IPv6) на другой адрес: Let's Encrypt может проверить её и не выдать сертификат. Удали её или укажи IPv6 этого сервера.{/}"
+    fi
+    if [[ "$first" == go ]]; then
+      ch=$(TUI_LOGO=1 TUI_DEFAULT=go TUI_CANCEL='Отмена' tui_menu 'Проверка DNS' "$head"$'\n\n'"$table" \
+           go '{green}Продолжить установку{/}' again 'Проверить снова' cancel 'Отменить') || return 1
+    else
+      ch=$(TUI_LOGO=1 TUI_DEFAULT=again TUI_CANCEL='Отмена' tui_menu 'Проверка DNS' "$head"$'\n\n'"$table" \
+           again 'Проверить снова' go '{yellow}Всё равно продолжить{/}' cancel 'Отменить') || return 1
+    fi
+    case "$ch" in
+      go) return 0 ;;
+      again) continue ;;
+      *) return 1 ;;
+    esac
+  done
+}
+
+# ---------------------------------------------------------------- inbound screens
+inbound_add(){
+  select_inbounds || return 0
+  if with_progress 'Создание inbound-ов' "Создаём: $(selected_labels)" setup_inbounds; then
+    note "{green}✓ Создано: $(selected_labels).{/}"
+    # shellcheck disable=SC2086
+    note "Открой во внешнем файрволе провайдера: $(helper ports $CREATED_IDS 2>/dev/null || echo '?')."
+    note 'Подключи пользователей к новым inbound-ам: Пользователи или Группы → Inbound-ы.'
   fi
 }
-print_user_links(){
-  local email=$1 sid base
-  sid=$(helper sub-id "$email" 2>>"$LOG") || return 1
-  base=$(sub_base)
-  if [[ -z "$base" ]]; then warn 'Подписки недоступны: прокси удалён.'; return 0; fi
-  # Label and URL on separate lines: long links must not wrap inside dialogs.
-  printf '  Обычная (VLESS, MTProto):\n    %s\n' "$base/$SUB_PATH/$sid"
-  printf '  JSON:\n    %s\n' "$base/$JSON_PATH/$sid"
-  printf '  Mihomo / Clash:\n    %s\n' "$base/$CLASH_PATH/$sid"
+pick_inbound(){
+  read_menu menu-all-inbounds
+  if ((${#TSV_ITEMS[@]} == 0)); then tui_msg "$1" 'В панели нет inbound-ов.'; return 1; fi
+  tui_menu "$1" "${2:-Выбери inbound:}" "${TSV_ITEMS[@]}"
+}
+# Loads "helper inbound-info" into IB_* variables.
+IB_ID='' IB_KIND='' IB_LABEL='' IB_REMARK='' IB_PORT='' IB_TRANSPORT='' IB_SECURITY=''
+IB_SNI='' IB_CERT='' IB_KEY='' IB_ENABLE='' IB_PROTOCOL=''
+# shellcheck disable=SC2034  # IB_KIND and IB_KEY are kept for later screens
+load_inbound(){
+  local k v info
+  info=$(helper inbound-info "$1" 2>>"$LOG") || return 1
+  while IFS='=' read -r k v; do
+    case "$k" in
+      id) IB_ID=$v;; kind) IB_KIND=$v;; label) IB_LABEL=$v;; remark) IB_REMARK=$v;;
+      port) IB_PORT=$v;; transport) IB_TRANSPORT=$v;; security) IB_SECURITY=$v;; sni) IB_SNI=$v;;
+      cert) IB_CERT=$v;; key) IB_KEY=$v;; enable) IB_ENABLE=$v;; protocol) IB_PROTOCOL=$v;;
+    esac
+  done <<< "$info"
+}
+inbound_set_port(){
+  local id=$1 v reason
+  while :; do
+    v=$(tui_input "Порт: $IB_REMARK" "Новый порт ($IB_TRANSPORT). Сейчас: $IB_PORT" "$IB_PORT") || return 0
+    [[ "$v" == "$IB_PORT" ]] && return 0
+    if reason=$(helper check-port "$v" "$IB_TRANSPORT" "$id" 2>&1); then break; fi
+    tui_msg 'Порт недоступен' "{red}✗ $v/$IB_TRANSPORT ${reason#Ошибка: }{/}"$'\n\n'"Выбери другой порт."
+  done
+  if run_h "{green}✓ Порт изменён на $v/$IB_TRANSPORT.{/}" set-port "$id" "$v"; then
+    open_firewall_ports "$id" || :
+    note "Открой $v/$IB_TRANSPORT во внешнем файрволе провайдера. Ссылки у клиентов обновятся после обновления подписки."
+  fi
+}
+inbound_set_name(){
+  local id=$1 v reason
+  while :; do
+    v=$(tui_input "Название: $IB_REMARK" 'Новое название inbound-а:' "$IB_REMARK") || return 0
+    [[ "$v" == "$IB_REMARK" ]] && return 0
+    if reason=$(helper check-name "$v" "$id" 2>&1); then break; fi
+    tui_msg 'Название недоступно' "{red}✗ «$v»: ${reason#Ошибка: }{/}"
+  done
+  run_h "{green}✓ Название изменено на «$v».{/}" set-name "$id" "$v" || :
+}
+inbound_set_sni(){
+  local id=$1 how host
+  how=$(tui_menu "SNI: $IB_REMARK" "Сейчас: {bold}$IB_SNI{/}" \
+        auto $'Подобрать лучший для России\t{dim}проверка сайтов с этого сервера, ~30 с{/}' \
+        manual 'Ввести вручную') || return 0
+  if [[ "$how" == auto ]]; then
+    ui_start 'Подбор SNI' 'Проверяем сайты: TLS 1.3, HTTP/2, X25519, задержка'
+    msg 'Проверяем сайты: TLS 1.3, HTTP/2, X25519, задержка'
+    step 30
+    read_menu sni-list
+    ui_stop
+    if ((${#TSV_ITEMS[@]} == 0)); then tui_msg 'Подбор SNI' 'Ни один сайт не прошёл проверку — введи SNI вручную.'; return 0; fi
+    host=$(tui_menu "SNI: $IB_REMARK" 'Подходящие сайты, лучшие сверху (не заблокированы в России, не за Cloudflare):' \
+           "${TSV_ITEMS[@]}") || return 0
+  else
+    host=$(tui_input "SNI: $IB_REMARK" 'Домен чужого сайта (TLS 1.3, HTTP/2), например www.microsoft.com:' "$IB_SNI") || return 0
+  fi
+  [[ -n "$host" && "$host" != "$IB_SNI" ]] || return 0
+  run_h "{green}✓ SNI: $host.{/} Клиентам нужно обновить подписку." set-sni "$id" "$host" || :
+}
+inbound_set_tls(){
+  local id=$1 crt key paths
+  choose_tls "$IB_REMARK" || return 0
+  if [[ "$TLS_SPEC" == domain ]]; then
+    paths=$(domain_cert_paths) || { tui_msg 'Сертификат' "{red}✗ Сертификат домена $DOMAIN не найден.{/}"; return 0; }
+    crt=$(sed -n 1p <<< "$paths"); key=$(sed -n 2p <<< "$paths")
+    run_h "{green}✓ Используется сертификат домена $DOMAIN.{/}" set-tls "$id" "$crt" "$key" "$DOMAIN" || :
+  else
+    IFS='|' read -r crt key paths <<< "$TLS_SPEC"
+    run_h "{green}✓ Сертификат обновлён ($paths).{/}" set-tls "$id" "$crt" "$key" "$paths" || :
+  fi
+}
+inbound_screen(){
+  local id=$1 ch
+  local -a items
+  while :; do
+    load_inbound "$id" || { note "Inbound $id не найден."; return 0; }
+    items=(port $'Порт\t'"$IB_PORT/$IB_TRANSPORT" name $'Название\t'"$IB_REMARK")
+    if [[ "$IB_SECURITY" == reality || "$IB_PROTOCOL" == mtproto ]]; then
+      items+=(sni $'SNI\t'"$IB_SNI")
+    fi
+    if [[ "$IB_SECURITY" == tls ]]; then
+      items+=(tls $'TLS-сертификат\t'"$(cert_label "$IB_CERT") · SNI $IB_SNI")
+    fi
+    if [[ "$IB_ENABLE" == 1 ]]; then items+=(toggle $'Выключить\t{dim}клиенты не смогут подключиться{/}')
+    else items+=(toggle $'{green}Включить{/}'); fi
+    items+=(delete '{red}Удалить inbound{/}')
+    ch=$(tui_menu "$IB_REMARK" "{dim}$IB_LABEL · id $IB_ID · $([[ $IB_ENABLE == 1 ]] && echo '{green}● включён{/}' || echo '{red}○ выключен{/}'){/}" \
+         "${items[@]}") || return 0
+    case "$ch" in
+      port) inbound_set_port "$id" ;;
+      name) inbound_set_name "$id" ;;
+      sni) inbound_set_sni "$id" ;;
+      tls) inbound_set_tls "$id" ;;
+      toggle) if [[ "$IB_ENABLE" == 1 ]]; then run_h '○ Inbound выключен.' set-enable "$id" 0 || :
+              else run_h '{green}● Inbound включён.{/}' set-enable "$id" 1 || :; fi ;;
+      delete)
+        if tui_yesno 'Удалить inbound' "Удалить «$IB_REMARK» ($IB_PORT/$IB_TRANSPORT)?
+Пользователи останутся, но потеряют это подключение." 'Удалить' 'Отмена'; then
+          run_h "✓ Inbound «$IB_REMARK» удалён." del-inbound "$id" && { flush_notes; return 0; }
+        fi ;;
+    esac
+    flush_notes
+  done
 }
 
 # ---------------------------------------------------------------- TUI screens
@@ -2321,7 +2632,7 @@ menu_groups(){
 
 # ---- inbounds
 inbounds_screen_text(){
-  helper inbounds 2>/dev/null || printf '  нет данных'
+  helper inbounds --compact 2>/dev/null || printf '  нет данных'
   return 0
 }
 firewall_ports_text(){
@@ -2333,29 +2644,24 @@ firewall_ports_text(){
 }
 menu_inbounds(){
   need_panel_api || return 0
-  local ch list
+  local ch list id
   while :; do
     ch=$(tui_menu 'Inbound-ы' "$(inbounds_screen_text)" \
-         list 'Подробный список всех inbound-ов' \
-         create 'Создать недостающие inbound-ы скрипта (порты и SNI — автоматически)' \
+         add $'Добавить inbound-ы\t{dim}10 типов: VLESS, Trojan, Hysteria2, AmneziaWG, MTProto{/}' \
+         edit $'Изменить inbound\t{dim}порт, название, SNI, TLS, вкл/выкл, удалить{/}' \
+         list 'Подробный список' \
          ports 'Порты для внешнего файрвола') || return 0
     case "$ch" in
-      list) tui_show 'Inbound-ы панели' helper inbounds ;;
-      create)
-        if tui_yesno 'Создание inbound-ов' 'Создать отсутствующие из Vless RAW Reality, Vless xhttp Reality и mtproto?
-Остальные inbound-ы панели не изменяются. SNI проверяются сканером панели — это может занять до минуты.' 'Создать' 'Отмена' yes; then
-          if with_progress 'Создание inbound-ов' 'Подбираем порты и SNI, создаём inbound-ы' setup_inbounds; then
-            note '{green}✓ Inbound-ы созданы.{/}'
-            note "Открой во внешнем файрволе провайдера порты: $(helper ports 2>/dev/null || echo '?') (TCP)."
-          fi
-        fi ;;
+      add) inbound_add ;;
+      edit) if id=$(pick_inbound 'Изменить inbound'); then inbound_screen "$id"; fi ;;
+      list) tui_show 'Inbound-ы панели' helper inbounds "$(ui_width)" ;;
       ports)
         list=$(firewall_ports_text)
         tui_msg 'Порты inbound-ов' "Порты всех включённых inbound-ов — их нужно открыть во внешнем файрволе провайдера:
 
 ${list:-  нет данных}
 
-Скрипт сам открывает порты только своих inbound-ов и только в уже включённом ufw/firewalld." ;;
+Скрипт сам открывает порты только в уже включённом ufw/firewalld." ;;
     esac
     flush_notes
   done
@@ -2508,8 +2814,9 @@ menu_remove(){
 }
 
 write_helper(){
-  [[ -d "$BASE" ]] || return 0
-  local tmp; tmp=$(mktemp "$BASE/xr_helper.XXXXXXXX")
+  local dir=${HELPER%/*} tmp
+  [[ -d "$dir" ]] || return 0
+  tmp=$(mktemp "$dir/xr_helper.XXXXXXXX")
   cat > "$tmp" <<'XRHELPER'
 #!/usr/bin/env python3
 # 3x-ui_reverse helper: talks to the local 3x-ui API (Bearer token) for inbounds,
@@ -2538,8 +2845,6 @@ TLS_SNI = os.environ.get('XR_TLS_SNI', '')         # direct-TLS mode: verify aga
 STATE_DIR = os.environ.get('XR_STATE_DIR', '/opt/3x-ui_reverse')
 ACCESS_LOG = os.environ.get('XR_ACCESS_LOG', '/var/log/x-ui/3xr-access.log')
 ACTIVITY = os.path.join(STATE_DIR, 'activity.json')
-REMARKS = {'raw': 'Vless RAW Reality', 'xhttp': 'Vless xhttp Reality', 'mtproto': 'mtproto'}
-
 # Hosts that are not blocked in Russia, are served from global CDNs other than
 # Cloudflare (throttled in RU) and are not on Xray's discouraged list (apple/icloud).
 # The panel's scanner keeps only those offering TLS 1.3 + h2 + X25519 from this VPS.
@@ -2686,24 +2991,29 @@ def c(style, s):
     return '{%s}%s{/}' % (style, s)
 
 
-# ------------------------------------------------------------ country names
-COUNTRY_RU = {
-    'AE': 'ОАЭ', 'AL': 'Албания', 'AM': 'Армения', 'AR': 'Аргентина', 'AT': 'Австрия', 'AU': 'Австралия',
-    'AZ': 'Азербайджан', 'BA': 'Босния и Герцеговина', 'BD': 'Бангладеш', 'BE': 'Бельгия', 'BG': 'Болгария',
-    'BH': 'Бахрейн', 'BR': 'Бразилия', 'BY': 'Беларусь', 'CA': 'Канада', 'CH': 'Швейцария', 'CL': 'Чили',
-    'CN': 'Китай', 'CO': 'Колумбия', 'CY': 'Кипр', 'CZ': 'Чехия', 'DE': 'Германия', 'DK': 'Дания',
-    'EE': 'Эстония', 'EG': 'Египет', 'ES': 'Испания', 'FI': 'Финляндия', 'FR': 'Франция', 'GB': 'Великобритания',
-    'GE': 'Грузия', 'GR': 'Греция', 'HK': 'Гонконг', 'HR': 'Хорватия', 'HU': 'Венгрия', 'ID': 'Индонезия',
-    'IE': 'Ирландия', 'IL': 'Израиль', 'IN': 'Индия', 'IR': 'Иран', 'IS': 'Исландия', 'IT': 'Италия',
-    'JP': 'Япония', 'KE': 'Кения', 'KG': 'Киргизия', 'KR': 'Южная Корея', 'KZ': 'Казахстан', 'LT': 'Литва',
-    'LU': 'Люксембург', 'LV': 'Латвия', 'MA': 'Марокко', 'MD': 'Молдова', 'ME': 'Черногория', 'MK': 'Северная Македония',
-    'MN': 'Монголия', 'MT': 'Мальта', 'MX': 'Мексика', 'MY': 'Малайзия', 'NG': 'Нигерия', 'NL': 'Нидерланды',
-    'NO': 'Норвегия', 'NZ': 'Новая Зеландия', 'PE': 'Перу', 'PH': 'Филиппины', 'PK': 'Пакистан', 'PL': 'Польша',
-    'PT': 'Португалия', 'QA': 'Катар', 'RO': 'Румыния', 'RS': 'Сербия', 'RU': 'Россия', 'SA': 'Саудовская Аравия',
-    'SC': 'Сейшелы', 'SE': 'Швеция', 'SG': 'Сингапур', 'SI': 'Словения', 'SK': 'Словакия', 'TH': 'Таиланд',
-    'TJ': 'Таджикистан', 'TM': 'Туркмения', 'TR': 'Турция', 'TW': 'Тайвань', 'UA': 'Украина', 'US': 'США',
-    'UZ': 'Узбекистан', 'VN': 'Вьетнам', 'ZA': 'ЮАР',
+# ------------------------------------------------------------ countries
+COUNTRY_EN = {
+    'AE': 'UAE', 'AL': 'Albania', 'AM': 'Armenia', 'AR': 'Argentina', 'AT': 'Austria', 'AU': 'Australia',
+    'AZ': 'Azerbaijan', 'BA': 'Bosnia', 'BD': 'Bangladesh', 'BE': 'Belgium', 'BG': 'Bulgaria',
+    'BH': 'Bahrain', 'BR': 'Brazil', 'BY': 'Belarus', 'CA': 'Canada', 'CH': 'Switzerland', 'CL': 'Chile',
+    'CN': 'China', 'CO': 'Colombia', 'CY': 'Cyprus', 'CZ': 'Czechia', 'DE': 'Germany', 'DK': 'Denmark',
+    'EE': 'Estonia', 'EG': 'Egypt', 'ES': 'Spain', 'FI': 'Finland', 'FR': 'France', 'GB': 'United Kingdom',
+    'GE': 'Georgia', 'GR': 'Greece', 'HK': 'Hong Kong', 'HR': 'Croatia', 'HU': 'Hungary', 'ID': 'Indonesia',
+    'IE': 'Ireland', 'IL': 'Israel', 'IN': 'India', 'IR': 'Iran', 'IS': 'Iceland', 'IT': 'Italy',
+    'JP': 'Japan', 'KE': 'Kenya', 'KG': 'Kyrgyzstan', 'KR': 'South Korea', 'KZ': 'Kazakhstan', 'LT': 'Lithuania',
+    'LU': 'Luxembourg', 'LV': 'Latvia', 'MA': 'Morocco', 'MD': 'Moldova', 'ME': 'Montenegro',
+    'MK': 'North Macedonia', 'MN': 'Mongolia', 'MT': 'Malta', 'MX': 'Mexico', 'MY': 'Malaysia', 'NG': 'Nigeria',
+    'NL': 'Netherlands', 'NO': 'Norway', 'NZ': 'New Zealand', 'PE': 'Peru', 'PH': 'Philippines', 'PK': 'Pakistan',
+    'PL': 'Poland', 'PT': 'Portugal', 'QA': 'Qatar', 'RO': 'Romania', 'RS': 'Serbia', 'RU': 'Russia',
+    'SA': 'Saudi Arabia', 'SC': 'Seychelles', 'SE': 'Sweden', 'SG': 'Singapore', 'SI': 'Slovenia', 'SK': 'Slovakia',
+    'TH': 'Thailand', 'TJ': 'Tajikistan', 'TM': 'Turkmenistan', 'TR': 'Turkey', 'TW': 'Taiwan', 'UA': 'Ukraine',
+    'US': 'USA', 'UZ': 'Uzbekistan', 'VN': 'Vietnam', 'ZA': 'South Africa',
 }
+# Russian names used by v2.0.x, recognised when shortening inbound names.
+LEGACY_COUNTRY_RU = ('Нидерланды', 'Германия', 'Финляндия', 'Франция', 'Швеция', 'Польша', 'США',
+                     'Великобритания', 'Латвия', 'Литва', 'Эстония', 'Казахстан', 'Турция', 'Швейцария',
+                     'Австрия', 'Чехия', 'Румыния', 'Болгария', 'Сербия', 'Молдова', 'Грузия', 'Армения',
+                     'Сингапур', 'Япония', 'Канада', 'Испания', 'Италия', 'Норвегия', 'Россия')
 
 
 def _fetch(url, timeout=6):
@@ -2713,85 +3023,307 @@ def _fetch(url, timeout=6):
         return r.read(1 << 20).decode('utf-8', 'replace')
 
 
-def country_name():
-    """Russian name of the VPS's country by its public IP (cached); '' if unknown.
-    XR_COUNTRY overrides: a name, an ISO code, or 'none' to disable the prefix."""
-    forced = os.environ.get('XR_COUNTRY', '').strip()
-    if forced:
-        return '' if forced.lower() == 'none' else COUNTRY_RU.get(forced.upper(), forced)
+def country_code():
+    """ISO code of the VPS's country by its public IP (cached); '' if unknown."""
     cache = os.path.join(STATE_DIR, 'country.txt')
     try:
         with open(cache) as f:
             code = f.read().strip()
     except OSError:
         code = ''
-    if not re.fullmatch(r'[A-Z]{2}', code):
-        code = ''
-        probes = [('https://ipinfo.io/country', lambda t: t.strip()),
-                  ('https://api.country.is/', lambda t: json.loads(t).get('country', '')),
-                  ('https://ipapi.co/country/', lambda t: t.strip()),
-                  ('http://ip-api.com/line/?fields=countryCode', lambda t: t.strip())]
-        for url, parse in probes:
-            try:
-                value = (parse(_fetch(url)) or '').upper()
-            except Exception:
-                continue
-            if re.fullmatch(r'[A-Z]{2}', value):
-                code = value
-                break
-        if code:
+    if re.fullmatch(r'[A-Z]{2}', code):
+        return code
+    probes = [('https://ipinfo.io/country', lambda t: t.strip()),
+              ('https://api.country.is/', lambda t: json.loads(t).get('country', '')),
+              ('https://ipapi.co/country/', lambda t: t.strip()),
+              ('http://ip-api.com/line/?fields=countryCode', lambda t: t.strip())]
+    for url, parse in probes:
+        try:
+            value = (parse(_fetch(url)) or '').upper()
+        except Exception:
+            continue
+        if re.fullmatch(r'[A-Z]{2}', value):
             try:
                 with open(cache, 'w') as f:
-                    f.write(code + '\n')
+                    f.write(value + '\n')
             except OSError:
                 pass
-    return COUNTRY_RU.get(code, code)
+            return value
+    return ''
 
 
-def remark_for(key):
-    name = country_name()
-    return ('%s %s' % (name, REMARKS[key])) if name else REMARKS[key]
+def country_name():
+    """English country name for inbound names. XR_COUNTRY overrides: an ISO
+    code, any text, or 'none' to drop the prefix."""
+    forced = os.environ.get('XR_COUNTRY', '').strip()
+    if forced:
+        return '' if forced.lower() == 'none' else COUNTRY_EN.get(forced.upper(), forced)
+    code = country_code()
+    return COUNTRY_EN.get(code, code)
 
 
 def cmd_country(_args):
     print(country_name())
 
 
-def managed():
-    """Inbounds created by this tool, keyed raw/xhttp/mtproto."""
+def short_name(remark):
+    """Inbound name without the country prefix (for compact tables)."""
+    for prefix in list(COUNTRY_EN.values()) + list(LEGACY_COUNTRY_RU):
+        if remark.startswith(prefix + ' ') and len(remark) > len(prefix) + 1:
+            return remark[len(prefix) + 1:]
+    return remark
+
+
+# ------------------------------------------------------------ catalog
+# (kind, label, transport, note). Order = order in the selection list.
+KINDS = [
+    ('vless-tcp-reality', 'VLESS TCP Reality', 'tcp',
+     'рекомендуется · маскировка под чужой сайт, XTLS Vision'),
+    ('vless-xhttp-reality', 'VLESS XHTTP Reality', 'tcp',
+     'рекомендуется · HTTP-транспорт с паддингом'),
+    ('vless-xhttp-tls', 'VLESS XHTTP TLS', 'tcp',
+     'сертификат твоего домена, можно ставить за CDN'),
+    ('trojan-tcp', 'Trojan TCP', 'tcp',
+     'без TLS, трафик не шифруется — только для цепочек'),
+    ('trojan-tcp-reality', 'Trojan TCP Reality', 'tcp',
+     'Reality без XTLS Vision'),
+    ('trojan-xhttp-reality', 'Trojan XHTTP Reality', 'tcp',
+     'XHTTP + Reality'),
+    ('trojan-xhttp-tls', 'Trojan XHTTP TLS', 'tcp',
+     'сертификат твоего домена'),
+    ('hysteria', 'Hysteria2', 'udp',
+     'QUIC + обфускация Salamander, SNI домена'),
+    ('amneziawg', 'AmneziaWG', 'udp',
+     'WireGuard с обфускацией AmneziaWG 3.1'),
+    ('mtproto', 'MTProto', 'tcp',
+     'прокси для Telegram (FakeTLS)'),
+]
+KIND = {k: {'label': l, 'transport': t, 'note': n} for k, l, t, n in KINDS}
+DEFAULT_KINDS = ('vless-tcp-reality', 'vless-xhttp-reality', 'mtproto')
+REALITY_KINDS = {'vless-tcp-reality', 'vless-xhttp-reality', 'trojan-tcp-reality', 'trojan-xhttp-reality'}
+TLS_KINDS = {'vless-xhttp-tls', 'trojan-xhttp-tls', 'hysteria'}
+# Names used by v2.0.x for the inbounds it created.
+LEGACY_REMARKS = ('vless raw reality', 'vless xhttp reality', 'mtproto')
+REGISTRY = os.path.join(STATE_DIR, 'inbounds.json')
+
+NET_NAMES = {'tcp': 'TCP', 'raw': 'TCP', 'xhttp': 'XHTTP', 'ws': 'WS', 'grpc': 'gRPC',
+             'httpupgrade': 'HTTPUpgrade', 'kcp': 'mKCP', 'quic': 'QUIC', 'splithttp': 'XHTTP'}
+UDP_PROTOCOLS = {'wireguard', 'hysteria', 'hysteria2', 'tuic', 'amneziawg', 'masque'}
+
+
+def stream(ib):
+    return jload(ib.get('streamSettings'), {})
+
+
+def classify(ib):
+    """Catalog kind of an inbound by its structure ('' if not in the catalog)."""
+    proto = ib.get('protocol')
+    ss = stream(ib)
+    net = ss.get('network') or 'tcp'
+    net = 'tcp' if net == 'raw' else net
+    sec = ss.get('security') or 'none'
+    if proto in ('vless', 'trojan') and net in ('tcp', 'xhttp'):
+        if proto == 'vless' and sec == 'none':
+            return ''
+        if net == 'tcp' and sec == 'tls':
+            return ''
+        return '%s-%s%s' % (proto, net, '' if sec == 'none' else '-' + sec)
+    return proto if proto in ('hysteria', 'amneziawg', 'mtproto') else ''
+
+
+def inbound_kind(ib):
+    """'vless · XHTTP · Reality'"""
+    ss = stream(ib)
+    parts = [ib.get('protocol') or '?']
+    net = ss.get('network') or ''
+    if net and ib.get('protocol') not in UDP_PROTOCOLS | {'mtproto'}:
+        parts.append(NET_NAMES.get(net, net.upper()))
+    sec = ss.get('security') or ''
+    if sec and sec != 'none':
+        parts.append({'reality': 'Reality', 'tls': 'TLS'}.get(sec, sec))
+    return ' · '.join(parts)
+
+
+def inbound_sni(ib):
+    st, ss = jload(ib.get('settings'), {}), stream(ib)
+    if ib.get('protocol') == 'mtproto':
+        return st.get('fakeTlsDomain') or ''
+    if ss.get('security') == 'reality':
+        return ','.join((ss.get('realitySettings') or {}).get('serverNames') or [])
+    if ss.get('security') == 'tls':
+        return (ss.get('tlsSettings') or {}).get('serverName') or ''
+    return ''
+
+
+def inbound_transport(ib):
+    """tcp | udp — which firewall port the inbound needs."""
+    if ib.get('protocol') in UDP_PROTOCOLS or stream(ib).get('network') in ('kcp', 'quic'):
+        return 'udp'
+    return 'tcp'
+
+
+def registry():
+    try:
+        with open(REGISTRY) as f:
+            return set(int(x) for x in json.load(f).get('ids', []))
+    except (OSError, ValueError, TypeError):
+        return set()
+
+
+def register(ids, remove=False):
+    current = registry()
+    current = current - set(ids) if remove else current | set(ids)
+    try:
+        with open(REGISTRY + '.tmp', 'w') as f:
+            json.dump({'ids': sorted(current)}, f)
+        os.replace(REGISTRY + '.tmp', REGISTRY)
+    except OSError:
+        pass
+
+
+def managed(ibs=None):
+    """Inbounds created by this tool: {id: inbound}."""
+    reg = registry()
     out = {}
-    # Matches "Vless RAW Reality" as well as "<Страна> Vless RAW Reality".
-    for ib in inbounds():
-        remark = (ib.get('remark') or '').lower()
-        for key, base in REMARKS.items():
-            if remark == base.lower() or remark.endswith(' ' + base.lower()):
-                out.setdefault(key, ib)
+    for ib in ibs if ibs is not None else inbounds():
+        name = short_name(ib.get('remark') or '').lower()
+        if ib['id'] in reg or (name in LEGACY_REMARKS and classify(ib)):
+            out[ib['id']] = ib
     return out
 
 
-# --------------------------------------------------------------- SNI picking
-def pick_sni(count, exclude=()):
-    targets = [h for h in SNI_CANDIDATES if h not in exclude]
+def default_user_inbounds(ibs=None):
+    """Inbounds a new user is attached to: the tool's own, else every enabled one."""
+    ibs = ibs if ibs is not None else inbounds()
+    own = [i for i, ib in managed(ibs).items() if ib.get('enable')]
+    return sorted(own) or sorted(ib['id'] for ib in ibs if ib.get('enable') and ib.get('protocol') != 'tunnel')
+
+
+# ------------------------------------------------------------ ports
+PREFERRED_PORTS = {'tcp': [8443, 2053, 2083, 2087, 9443, 10443, 4443, 6443, 7443, 3443],
+                   'udp': [443, 8443, 2053, 2083, 9443, 10443, 4443, 6443]}
+
+
+def listening(transport):
+    """Ports with a listening socket on this host (from /proc/net)."""
+    ports = set()
+    for fam in ('', '6'):
+        try:
+            with open('/proc/net/%s%s' % (transport, fam)) as f:
+                next(f)
+                for line in f:
+                    parts = line.split()
+                    if transport == 'tcp' and parts[3] != '0A':
+                        continue
+                    ports.add(int(parts[1].rsplit(':', 1)[1], 16))
+        except (OSError, StopIteration, ValueError, IndexError):
+            pass
+    return ports
+
+
+def port_problem(port, transport, ibs, ignore_id=None):
+    """'' if PORT/TRANSPORT is free for an inbound, else why it is not."""
+    if not 1 <= port <= 65535:
+        return 'порт должен быть от 1 до 65535'
+    for ib in ibs:
+        if ib['id'] != ignore_id and ib.get('port') == port and inbound_transport(ib) == transport:
+            return 'занят inbound-ом «%s»' % (ib.get('remark') or ib['id'])
+    own = next((ib for ib in ibs if ib['id'] == ignore_id), None)
+    if port in listening(transport) and not (own and own.get('port') == port):
+        return 'занят другой программой на этом сервере (%s)' % transport.upper()
+    return ''
+
+
+def pick_port(transport, ibs, taken):
+    import random
+    candidates = PREFERRED_PORTS[transport] + random.sample(range(20000, 60000), 200)
+    for p in candidates:
+        if (p, transport) not in taken and not port_problem(p, transport, ibs):
+            return p
+    die('не нашлось свободного порта (%s)' % transport)
+
+
+def cmd_check_port(args):
+    """check-port PORT TRANSPORT [ID] — prints the reason when busy (exit 1)."""
+    try:
+        port = int(args[0])
+    except (ValueError, IndexError):
+        die('порт — число')
+    reason = port_problem(port, args[1] if len(args) > 1 else 'tcp', inbounds(),
+                          int(args[2]) if len(args) > 2 and args[2] else None)
+    if reason:
+        print(reason)
+        sys.exit(1)
+
+
+# ------------------------------------------------------------ names
+def name_taken(name, ibs, ignore_id=None):
+    low = name.strip().lower()
+    return any(ib['id'] != ignore_id and (ib.get('remark') or '').strip().lower() == low for ib in ibs)
+
+
+def unique_name(base, ibs):
+    name, n = base, 2
+    while name_taken(name, ibs):
+        name = '%s %d' % (base, n)
+        n += 1
+    return name
+
+
+def cmd_check_name(args):
+    name = (args[0] if args else '').strip()
+    if not name or len(name) > 64:
+        print('название: от 1 до 64 символов')
+        sys.exit(1)
+    if name_taken(name, inbounds(), int(args[1]) if len(args) > 1 and args[1] else None):
+        print('inbound с таким названием уже есть')
+        sys.exit(1)
+
+
+# ------------------------------------------------------------ SNI
+def scan_snis(extra=()):
+    """Reality targets usable from this VPS, best first: [(host, latency_ms)]."""
+    targets = list(dict.fromkeys(list(extra) + SNI_CANDIDATES))
     reply = call('/server/scanRealityTargets', {'targets': ','.join(targets)}, form=True, timeout=180)
-    results = ok(reply, 'проверка SNI') or []
     good = []
-    for r in results:
+    for r in ok(reply, 'проверка SNI') or []:
         host = r.get('host') or ''
-        if not (r.get('feasible') and r.get('tls13') and r.get('h2') and r.get('x25519')):
-            continue
-        if r.get('privateTarget') or host not in targets or host in good:
-            continue
-        good.append(host)          # API ranks by feasibility, then latency
+        if r.get('feasible') and r.get('tls13') and r.get('h2') and r.get('x25519') \
+                and not r.get('privateTarget') and host in targets and host not in [g[0] for g in good]:
+            good.append((host, int(r.get('latencyMs') or 0)))
+    return good
+
+
+def pick_sni(count, exclude=()):
+    # Domains already used by other inbounds go last: one SNI per inbound is
+    # harder to correlate, but reuse is still better than failing.
+    used = {inbound_sni(ib) for ib in inbounds()} if API else set()
+    hosts = [h for h, _ in scan_snis() if h not in exclude]
+    good = [h for h in hosts if h not in used] + [h for h in hosts if h in used]
     if len(good) < count:
         die('найдено только %d подходящих SNI из %d нужных (проверь исходящий доступ VPS к :443)'
             % (len(good), count))
     return good[:count]
 
 
-# --------------------------------------------------------- inbound creation
+def cmd_sni_list(_args):
+    """Menu rows: host <TAB> host <TAB> latency."""
+    for host, ms in scan_snis():
+        print('%s\t%s\t{dim}%d мс{/}' % (host, host, ms))
+
+
+def check_reality_sni(host):
+    """Raises die() with the reason when HOST cannot serve as a Reality target."""
+    if not re.fullmatch(r'[A-Za-z0-9.-]+\.[A-Za-z]{2,}', host or ''):
+        die('SNI — доменное имя, например www.microsoft.com')
+    r = ok(call('/server/scanRealityTarget', {'target': host + ':443'}, form=True, timeout=60), 'проверка SNI')
+    if not r.get('feasible'):
+        die('%s не подходит для Reality: %s' % (host, r.get('reason') or 'нет TLS 1.3 / h2 / X25519'))
+
+
+# ------------------------------------------------------------ building inbounds
 def sniffing(mode):
-    s = {'enabled': True, 'destOverride': ['http', 'tls', 'quic'],
-         'metadataOnly': False, 'routeOnly': True}
+    s = {'enabled': True, 'destOverride': ['http', 'tls', 'quic'], 'metadataOnly': False, 'routeOnly': True}
     if mode == 'metadata':
         s.update(metadataOnly=True, routeOnly=False)
     return s
@@ -2809,137 +3341,381 @@ def reality(sni):
     }
 
 
+def tls(cert, key, sni, alpn):
+    for path in (cert, key):
+        if not path or not os.path.isfile(path):
+            die('файл сертификата не найден: %s' % (path or '(не указан)'))
+    # ocspStapling also sets how often Xray re-reads the files: renewed
+    # certificates are picked up within an hour without a restart.
+    return {'serverName': sni, 'minVersion': '1.2', 'maxVersion': '1.3', 'alpn': alpn,
+            'rejectUnknownSni': False,
+            'certificates': [{'certificateFile': cert, 'keyFile': key, 'ocspStapling': 3600,
+                              'oneTimeLoading': False, 'usage': 'encipherment', 'buildChain': False}],
+            'settings': {'fingerprint': 'chrome'}}
+
+
+def xhttp():
+    return {'path': '/' + secrets.token_hex(8), 'host': '', 'mode': 'auto', 'xPaddingBytes': '100-1000'}
+
+
+def build(kind, port, sni='', cert='', key='', sniff='route'):
+    """Inbound payload for the panel API."""
+    sn = sniffing(sniff)
+    vless = {'clients': [], 'decryption': 'none', 'fallbacks': []}
+    trojan = {'clients': [], 'fallbacks': []}
+    tcp = {'acceptProxyProtocol': False, 'header': {'type': 'none'}}
+    proto, net, sec = (kind.split('-') + ['', ''])[:3] if kind.startswith(('vless', 'trojan')) else (kind, '', '')
+    if proto in ('vless', 'trojan'):
+        ss = {'network': net, 'security': sec or 'none', 'externalProxy': []}
+        if net == 'tcp':
+            ss['tcpSettings'] = tcp
+        else:
+            ss['xhttpSettings'] = xhttp()
+        if sec == 'reality':
+            ss['realitySettings'] = reality(sni)
+        elif sec == 'tls':
+            ss['tlsSettings'] = tls(cert, key, sni, ['h2', 'http/1.1'])
+        return dict(protocol=proto, port=port, settings=vless if proto == 'vless' else trojan,
+                    streamSettings=ss, sniffing=sn)
+    if kind == 'hysteria':
+        # Salamander makes the QUIC handshake look like random UDP: plain QUIC to
+        # foreign servers is fingerprinted and throttled in Russia.
+        ss = {'network': 'hysteria', 'security': 'tls',
+              'hysteriaSettings': {'version': 2, 'udpIdleTimeout': 60},
+              'tlsSettings': tls(cert, key, sni, ['h3']),
+              'finalmask': {'udp': [{'type': 'salamander', 'settings': {'password': secrets.token_urlsafe(18)}}]}}
+        return dict(protocol='hysteria', port=port, settings={'version': 2, 'clients': []},
+                    streamSettings=ss, sniffing=sn)
+    if kind == 'amneziawg':
+        # The panel generates keys and a random AmneziaWG 3.1 obfuscation set.
+        return dict(protocol='amneziawg', port=port, settings={'clients': []},
+                    streamSettings={}, sniffing={'enabled': False})
+    if kind == 'mtproto':
+        return dict(protocol='mtproto', port=port, settings={'fakeTlsDomain': sni, 'clients': []},
+                    streamSettings={}, sniffing={'enabled': False})
+    die('неизвестный тип inbound: %s' % kind)
+
+
+def parse_opts(args):
+    """Positional args + --key value options."""
+    pos, opts, i = [], {}, 0
+    while i < len(args):
+        if args[i].startswith('--'):
+            opts.setdefault(args[i][2:], []).append(args[i + 1] if i + 1 < len(args) else '')
+            i += 2
+        else:
+            pos.append(args[i])
+            i += 1
+    return pos, opts
+
+
 def cmd_create_inbounds(args):
-    # args: ports(raw,xhttp,mtproto) snis(raw,xhttp,mtproto) sniff-mode
-    ports = [int(p) for p in args[0].split(',')]
-    snis = args[1].split(',')
-    sniff = sniffing(args[2] if len(args) > 2 else 'route')
-    have = managed()
-    base = {'enable': True, 'listen': '', 'expiryTime': 0, 'total': 0}
-    if 'raw' not in have:
-        ok(call('/inbounds/add', dict(base, remark=remark_for('raw'), port=ports[0], protocol='vless',
-            settings={'clients': [], 'decryption': 'none', 'fallbacks': []},
-            streamSettings={'network': 'tcp', 'security': 'reality', 'externalProxy': [],
-                            'realitySettings': reality(snis[0]),
-                            'tcpSettings': {'acceptProxyProtocol': False, 'header': {'type': 'none'}}},
-            sniffing=sniff)), 'создание Vless RAW Reality')
-    if 'xhttp' not in have:
-        ok(call('/inbounds/add', dict(base, remark=remark_for('xhttp'), port=ports[1], protocol='vless',
-            settings={'clients': [], 'decryption': 'none', 'fallbacks': []},
-            streamSettings={'network': 'xhttp', 'security': 'reality', 'externalProxy': [],
-                            'realitySettings': reality(snis[1]),
-                            'xhttpSettings': {'path': '/' + secrets.token_hex(8), 'host': '',
-                                              'mode': 'auto', 'xPaddingBytes': '100-1000'}},
-            sniffing=sniff)), 'создание Vless xhttp Reality')
-    if 'mtproto' not in have:
-        # MTProto is served by the mtg sidecar, not Xray: sniffing does not apply.
-        ok(call('/inbounds/add', dict(base, remark=remark_for('mtproto'), port=ports[2], protocol='mtproto',
-            settings={'fakeTlsDomain': snis[2], 'clients': []}, streamSettings={},
-            sniffing={'enabled': False})), 'создание mtproto')
-    have = managed()
-    if not any((jload(ib.get('settings'), {}).get('clients') or []) for ib in have.values()):
-        cmd_add_user(['user1', '0', '0'], quiet=True)
-    cmd_inbounds([])
+    """create-inbounds KIND[,KIND…] [--sniff route|metadata]
+         [--tls KIND|CERT|KEY|SNI]… [--port KIND|PORT]… [--sni KIND|HOST]… [--name KIND|NAME]…
+    Creates the inbounds (same kind may repeat), attaches user1 when the panel has
+    no clients yet and prints the ids of the new inbounds."""
+    pos, opts = parse_opts(args)
+    kinds = [k for k in (pos[0] if pos else '').split(',') if k]
+    for k in kinds:
+        if k not in KIND:
+            die('неизвестный тип inbound: %s' % k)
+    if not kinds:
+        die('не выбран ни один inbound')
+    per = lambda name: dict(v.split('|', 1) for v in opts.get(name, []) if '|' in v)
+    tls_opts = {k: v.split('|') for k, v in per('tls').items()}
+    ports, snis, names = per('port'), per('sni'), per('name')
+    sniff = (opts.get('sniff') or ['route'])[0]
+    for k in kinds:
+        if k in TLS_KINDS and (k not in tls_opts or len(tls_opts[k]) != 3):
+            die('для %s нужен сертификат: --tls "%s|CERT|KEY|SNI"' % (KIND[k]['label'], k))
+    ibs = inbounds()
+    # Everything is checked before the first inbound is created.
+    for k, (cert, key, _) in ((k, tls_opts[k]) for k in kinds if k in TLS_KINDS):
+        for path in (cert, key):
+            if not os.path.isfile(path):
+                die('%s: файл сертификата не найден: %s' % (KIND[k]['label'], path))
+    for k, host in snis.items():
+        if k in REALITY_KINDS:
+            check_reality_sni(host)
+    # One scan gives a different Reality/FakeTLS domain to every inbound that needs one.
+    need = [k for k in kinds if (k in REALITY_KINDS or k == 'mtproto') and k not in snis]
+    auto_snis = pick_sni(len(need)) if need else []
+    taken, plan = set(), []
+    for k in kinds:
+        transport = KIND[k]['transport']
+        if k in ports:
+            port = int(ports[k])
+            reason = port_problem(port, transport, ibs)
+            if reason:
+                die('порт %d: %s' % (port, reason))
+        else:
+            port = pick_port(transport, ibs, taken)
+        taken.add((port, transport))
+        cert = key = ''
+        if k in TLS_KINDS:
+            cert, key, sni = tls_opts[k]
+        else:
+            sni = snis.get(k) or (auto_snis.pop(0) if k in REALITY_KINDS or k == 'mtproto' else '')
+        plan.append((k, port, sni, cert, key))
+    created = []
+    country = country_name()
+    for k, port, sni, cert, key in plan:
+        base = names.get(k) or ('%s %s' % (country, KIND[k]['label'])).strip()
+        payload = build(k, port, sni, cert, key, sniff)
+        payload.update(enable=True, remark=unique_name(base, ibs), listen='', expiryTime=0, total=0)
+        ok(call('/inbounds/add', payload), 'создание %s' % KIND[k]['label'])
+        ibs = inbounds()
+        new = max((ib for ib in ibs if ib.get('remark') == payload['remark']), key=lambda x: x['id'])
+        created.append(new['id'])
+        register([new['id']])
+    if not any(jload(ib.get('settings'), {}).get('clients') for ib in ibs) and \
+            not any(cl.get('email') == 'user1' for cl in clients_all()):
+        ok(call('/clients/add', {'client': {'email': 'user1', 'enable': True, 'flow': 'xtls-rprx-vision',
+                                            'totalGB': 0, 'expiryTime': 0, 'limitIp': 0},
+                                 'inboundIds': created}), 'создание user1')
+    print(' '.join(str(i) for i in created))
 
 
-NET_NAMES = {'tcp': 'TCP', 'raw': 'TCP', 'xhttp': 'XHTTP', 'ws': 'WS', 'grpc': 'gRPC',
-             'httpupgrade': 'HTTPUpgrade', 'kcp': 'mKCP', 'quic': 'QUIC', 'splithttp': 'XHTTP'}
-UDP_PROTOCOLS = {'wireguard', 'hysteria', 'hysteria2', 'tuic', 'amneziawg', 'masque'}
+# ------------------------------------------------------------ editing inbounds
+def get_inbound(ib_id):
+    ib = ok(call('/inbounds/get/%d' % ib_id), 'inbound %d' % ib_id)
+    if not ib:
+        die('inbound %d не найден' % ib_id)
+    return ib
 
 
-def inbound_kind(ib):
-    """'vless · XHTTP · Reality'"""
-    ss = jload(ib.get('streamSettings'), {})
-    parts = [ib.get('protocol') or '?']
-    net = ss.get('network') or ''
-    if net and ib.get('protocol') not in UDP_PROTOCOLS | {'mtproto'}:
-        parts.append(NET_NAMES.get(net, net.upper()))
-    sec = ss.get('security') or ''
-    if sec and sec != 'none':
-        parts.append({'reality': 'Reality', 'tls': 'TLS'}.get(sec, sec))
-    return ' · '.join(parts)
+def save_inbound(ib):
+    payload = {k: ib[k] for k in ('remark', 'enable', 'listen', 'port', 'protocol', 'expiryTime',
+                                  'total', 'up', 'down', 'tag', 'trafficReset', 'settings',
+                                  'streamSettings', 'sniffing') if k in ib}
+    for k in ('settings', 'streamSettings', 'sniffing'):
+        payload[k] = jload(payload.get(k), {})
+    ok(call('/inbounds/update/%d' % ib['id'], payload), 'сохранение inbound')
 
 
-def inbound_sni(ib):
-    st = jload(ib.get('settings'), {})
-    ss = jload(ib.get('streamSettings'), {})
+def update_client(email, change):
+    """Change some fields of a client; the update API replaces the whole record."""
+    r = ok(call('/clients/get/' + urllib.parse.quote(email, safe='')), 'клиент %s' % email) or {}
+    cl = r.get('client') or {}
+    body = {k: v for k, v in cl.items() if k not in ('id', 'createdAt', 'updatedAt')}
+    ips = body.get('allowedIPs')
+    body['allowedIPs'] = [x.strip() for x in ips.split(',') if x.strip()] if isinstance(ips, str) else (ips or [])
+    body.update(change)
+    body['inboundIds'] = r.get('inboundIds') or []
+    ok(call('/clients/update/' + urllib.parse.quote(email, safe=''), body), 'обновление клиента %s' % email)
+
+
+def int_arg(args, i, what):
+    try:
+        return int(args[i])
+    except (ValueError, IndexError):
+        die('%s — число' % what)
+
+
+def cmd_inbound_info(args):
+    """KEY=VALUE lines about one inbound (for the script's edit screen)."""
+    ib = get_inbound(int_arg(args, 0, 'ID'))
+    kind = classify(ib)
+    ss = stream(ib)
+    cert = ((ss.get('tlsSettings') or {}).get('certificates') or [{}])[0]
+    for k, v in (('id', ib['id']), ('kind', kind), ('label', KIND.get(kind, {}).get('label', inbound_kind(ib))),
+                 ('remark', ib.get('remark') or ''), ('port', ib.get('port')),
+                 ('transport', inbound_transport(ib)), ('security', ss.get('security') or ''),
+                 ('sni', inbound_sni(ib)), ('cert', cert.get('certificateFile') or ''),
+                 ('key', cert.get('keyFile') or ''), ('enable', 1 if ib.get('enable') else 0),
+                 ('protocol', ib.get('protocol'))):
+        print('%s=%s' % (k, str(v).replace('\n', ' ')))
+
+
+def cmd_menu_all_inbounds(_args):
+    """Menu rows: id <TAB> name <TAB> type <TAB> port/transport."""
+    for ib in sorted(inbounds(), key=lambda x: x['id']):
+        dot = '{green}●{/}' if ib.get('enable') else '{red}○{/}'
+        print('%s\t%s %s\t%s\t%s/%s' % (ib['id'], dot, ib.get('remark') or ib.get('tag'), inbound_kind(ib),
+                                       ib.get('port'), inbound_transport(ib)))
+
+
+def cmd_menu_kinds(args):
+    """Checklist rows: kind <TAB> ON|OFF <TAB> label <TAB> note (+ how many exist).
+    --fresh: before the panel is installed (no API)."""
+    counts = {}
+    for ib in ([] if '--fresh' in args else inbounds()):
+        counts[classify(ib)] = counts.get(classify(ib), 0) + 1
+    fresh = not any(counts.values())
+    for k, label, _, note in KINDS:
+        have = counts.get(k, 0)
+        mark = 'ON' if fresh and k in DEFAULT_KINDS else 'OFF'
+        extra = ('{green}✓ есть%s{/}' % (' ×%d' % have if have > 1 else '')) if have else ' '
+        print('%s\t%s\t%s\t%s\t{dim}%s{/}' % (k, mark, label, extra, note))
+
+
+def cmd_kind_info(args):
+    """kind-info KIND — transport and whether a certificate / SNI is needed."""
+    k = args[0] if args else ''
+    if k not in KIND:
+        die('неизвестный тип inbound: %s' % k)
+    print('label=%s' % KIND[k]['label'])
+    print('transport=%s' % KIND[k]['transport'])
+    print('tls=%d' % (k in TLS_KINDS))
+    print('reality=%d' % (k in REALITY_KINDS))
+
+
+def cmd_set_port(args):
+    ib = get_inbound(int_arg(args, 0, 'ID'))
+    port = int_arg(args, 1, 'порт')
+    reason = port_problem(port, inbound_transport(ib), inbounds(), ib['id'])
+    if reason:
+        die('порт %d %s' % (port, reason))
+    ib['port'] = port
+    save_inbound(ib)
+
+
+def cmd_set_name(args):
+    ib = get_inbound(int_arg(args, 0, 'ID'))
+    name = (args[1] if len(args) > 1 else '').strip()
+    if not name or len(name) > 64:
+        die('название: от 1 до 64 символов')
+    if name_taken(name, inbounds(), ib['id']):
+        die('inbound «%s» уже есть' % name)
+    ib['remark'] = name
+    save_inbound(ib)
+
+
+def cmd_set_sni(args):
+    """set-sni ID HOST [--force] — Reality target / MTProto FakeTLS domain."""
+    ib = get_inbound(int_arg(args, 0, 'ID'))
+    host = (args[1] if len(args) > 1 else '').strip().lower()
+    if not re.fullmatch(r'[a-z0-9.-]+\.[a-z]{2,}', host):
+        die('SNI — доменное имя, например www.microsoft.com')
+    ss = stream(ib)
     if ib.get('protocol') == 'mtproto':
-        return st.get('fakeTlsDomain') or ''
-    if ss.get('security') == 'reality':
-        return ','.join((ss.get('realitySettings') or {}).get('serverNames') or [])
-    if ss.get('security') == 'tls':
-        return (ss.get('tlsSettings') or {}).get('serverName') or ''
-    return ''
+        st = jload(ib.get('settings'), {})
+        st['fakeTlsDomain'] = host
+        ib['settings'] = st
+        save_inbound(ib)
+        # Each client's secret embeds its own FakeTLS domain and the panel keeps
+        # it: rebuild them with the new domain, keeping the random middle part.
+        for cl in st.get('clients') or []:
+            sec = cl.get('secret') or ''
+            middle = sec[2:34] if len(sec) >= 34 and re.fullmatch(r'[0-9a-f]+', sec[2:34]) else secrets.token_hex(16)
+            if cl.get('email'):
+                update_client(cl['email'], {'secret': 'ee' + middle + host.encode().hex()})
+        return
+    elif ss.get('security') == 'reality':
+        if '--force' not in args:
+            check_reality_sni(host)
+        rs = ss['realitySettings']
+        rs['target'] = host + ':443'
+        rs['serverNames'] = [host]
+        ib['streamSettings'] = ss
+    elif ss.get('security') == 'tls':
+        die('у TLS-inbound-а SNI задаётся вместе с сертификатом (изменить TLS)')
+    else:
+        die('у этого inbound-а нет SNI')
+    save_inbound(ib)
 
 
-def inbound_transport(ib):
-    """tcp | udp — which firewall port the inbound needs."""
-    ss = jload(ib.get('streamSettings'), {})
-    if ib.get('protocol') in UDP_PROTOCOLS or ss.get('network') in ('kcp', 'quic'):
-        return 'udp'
-    return 'tcp'
+def cmd_set_tls(args):
+    """set-tls ID CERT KEY SNI — certificate of a TLS inbound."""
+    ib = get_inbound(int_arg(args, 0, 'ID'))
+    if len(args) < 4:
+        die('set-tls ID CERT KEY SNI')
+    ss = stream(ib)
+    if ss.get('security') != 'tls':
+        die('этот inbound не использует TLS')
+    old = ss.get('tlsSettings') or {}
+    new = tls(args[1], args[2], args[3].strip().lower(), old.get('alpn') or ['h2', 'http/1.1'])
+    old.update(serverName=new['serverName'], certificates=new['certificates'])
+    ss['tlsSettings'] = old
+    ib['streamSettings'] = ss
+    save_inbound(ib)
 
 
-def cmd_inbounds(_args):
-    """Every inbound of the panel; ◆ marks those created by 3x-ui_reverse."""
+def cmd_set_enable(args):
+    ib_id = int_arg(args, 0, 'ID')
+    ok(call('/inbounds/setEnable/%d' % ib_id, {'enable': (args[1] if len(args) > 1 else '1') in ('1', 'true', 'on')}),
+       'включение inbound')
+
+
+def cmd_del_inbound(args):
+    ib_id = int_arg(args, 0, 'ID')
+    get_inbound(ib_id)
+    ok(call('/inbounds/del/%d' % ib_id, {}), 'удаление inbound')
+    register([ib_id], remove=True)
+
+
+# ------------------------------------------------------------ listing
+def cmd_inbounds(args):
+    """Every inbound of the panel; ◆ marks those created by 3x-ui_reverse.
+    inbounds [WIDTH] — table fitted to WIDTH; inbounds --compact — short list."""
     ibs = sorted(inbounds(), key=lambda x: x['id'])
-    have = managed()
-    ours = {ib['id'] for ib in have.values()}
+    ours = set(managed(ibs))
     if not ibs:
         out('{yellow}⚠ В панели нет inbound-ов.{/}')
-    else:
-        rows = []
+        return
+    if '--compact' in args:
+        w = max(len(ib.get('remark') or '') for ib in ibs)
         for ib in ibs:
-            clients = len(jload(ib.get('settings'), {}).get('clients') or [])
-            used = (ib.get('up') or 0) + (ib.get('down') or 0)
-            total = ib.get('total') or 0
-            rows.append((ib, str(ib['id']), ib.get('remark') or ib.get('tag') or '—', inbound_kind(ib),
-                         str(ib.get('port')), str(clients),
-                         '%s / %s' % (human(used), human(total) if total else '∞'), inbound_sni(ib) or '—'))
-        head = ('', 'ID', 'НАЗВАНИЕ', 'ПРОТОКОЛ', 'ПОРТ', 'КЛ.', 'ТРАФИК', 'SNI')
-        caps = [1, 4, 26, 26, 6, 4, 20, 30]
-        widths = [min(caps[i], max([len(head[i])] + [len(r[i]) for r in rows])) for i in range(1, 8)]
-        widths.insert(0, 2)
-        out('{accent}' + '  '.join(head[i].ljust(widths[i]) for i in range(8)).rstrip() + '{/}')
-        for r in rows:
-            ib = r[0]
-            dot = ('{green}●{/}' if ib.get('enable') else '{red}○{/}') + \
-                ('{accent}◆{/}' if ib['id'] in ours else ' ')
-            name = cut(r[2], widths[2]).ljust(widths[2])
-            if ib['id'] in ours:
-                name = '{bold}%s{/}' % name
-            cells = [dot, '{dim}%s{/}' % r[1].rjust(widths[1]), name, cut(r[3], widths[3]).ljust(widths[3]),
-                     r[4].ljust(widths[4]), r[5].rjust(widths[5]), r[6].ljust(widths[6]),
-                     '{dim}%s{/}' % cut(r[7], widths[7])]
-            out('  '.join(cells).rstrip())
-    missing = [k for k in REMARKS if k not in have]
+            dot = '{green}●{/}' if ib.get('enable') else '{red}○{/}'
+            sni = inbound_sni(ib)
+            out('%s %s  %-10s {dim}%s{/}' % (dot, (ib.get('remark') or ib.get('tag') or '').ljust(min(w, 34)),
+                                          '%s/%s' % (ib.get('port'), inbound_transport(ib)), sni))
+        out('{dim}%d inbound-ов · изменить порт, название, SNI или TLS — «Изменить inbound»{/}' % len(ibs))
+        return
+    max_w = int(args[0]) if args and args[0].isdigit() else 200
+    rows = []
+    for ib in ibs:
+        clients = len(jload(ib.get('settings'), {}).get('clients') or [])
+        used = (ib.get('up') or 0) + (ib.get('down') or 0)
+        total = ib.get('total') or 0
+        rows.append((ib, str(ib['id']), ib.get('remark') or ib.get('tag') or '—', inbound_kind(ib),
+                     '%s/%s' % (ib.get('port'), inbound_transport(ib)), str(clients),
+                     '%s / %s' % (human(used), human(total) if total else '∞'), inbound_sni(ib) or '—'))
+    head = ('', 'ID', 'НАЗВАНИЕ', 'ПРОТОКОЛ', 'ПОРТ', 'КЛ.', 'ТРАФИК', 'SNI')
+    caps = [2, 4, 34, 24, 10, 4, 20, 28]
+    widths = [2] + [min(caps[i], max([len(head[i])] + [len(r[i]) for r in rows])) for i in range(1, 8)]
+    cols = list(range(8))
+    # Narrow screens: drop traffic, then client count, then shorten names and SNI.
+    for drop in (6, 5):
+        if sum(widths[i] + 2 for i in cols) > max_w:
+            cols.remove(drop)
+    while sum(widths[i] + 2 for i in cols) > max_w and (widths[2] > 18 or widths[7] > 14):
+        i = 2 if widths[2] - 18 >= widths[7] - 14 else 7
+        widths[i] -= 1
+    out('{accent}' + '  '.join(head[i].ljust(widths[i]) for i in cols).rstrip() + '{/}')
+    for r in rows:
+        ib = r[0]
+        dot = ('{green}●{/}' if ib.get('enable') else '{red}○{/}') + ('{accent}◆{/}' if ib['id'] in ours else ' ')
+        name = cut(r[2], widths[2]).ljust(widths[2])
+        cells = {0: dot, 1: '{dim}%s{/}' % r[1].rjust(widths[1]),
+                 2: ('{bold}%s{/}' % name) if ib['id'] in ours else name,
+                 3: cut(r[3], widths[3]).ljust(widths[3]), 4: r[4].ljust(widths[4]), 5: r[5].rjust(widths[5]),
+                 6: r[6].ljust(widths[6]), 7: '{dim}%s{/}' % cut(r[7], widths[7])}
+        out('  '.join(cells[i] for i in cols).rstrip())
     off = sum(1 for ib in ibs if not ib.get('enable'))
     out('')
-    out('{dim}Всего %d%s · {/}{accent}◆{/}{dim} создан скриптом%s{/}' % (
-        len(ibs), (' · выключено %d' % off) if off else '',
-        (' · не хватает: ' + ', '.join(remark_for(k) for k in missing)) if missing else ''))
+    out('{dim}Всего %d%s · {/}{accent}◆{/}{dim} создан скриптом{/}' % (len(ibs), (' · выключено %d' % off) if off else ''))
 
 
 def cmd_ports_all(_args):
-    """PORT PROTO REMARK for every enabled inbound (what the firewall must allow)."""
+    """PORT TRANSPORT REMARK for every enabled inbound (what the firewall must allow)."""
     for ib in sorted(inbounds(), key=lambda x: x['id']):
         if ib.get('enable'):
             print('%s %s %s' % (ib.get('port'), inbound_transport(ib), ib.get('remark') or ib.get('tag') or ''))
 
 
-def cmd_ports(_args):
-    print(' '.join(str(ib.get('port')) for ib in managed().values()))
+def cmd_ports(args):
+    """PORT/TRANSPORT of the tool's inbounds (or of the given ids)."""
+    ibs = inbounds()
+    want = {int(x) for x in args if x.isdigit()}
+    sel = [ib for ib in ibs if ib['id'] in want] if want else list(managed(ibs).values())
+    print(' '.join('%s/%s' % (ib.get('port'), inbound_transport(ib)) for ib in sorted(sel, key=lambda x: x['id'])))
 
 
 def cmd_all_ports(_args):
-    # Disabled inbounds do not listen, but their ports are still reserved.
     print(' '.join(str(ib.get('port')) for ib in inbounds()))
 
-
-
-
 # -------------------------------------------------------------------- users
-SHORT = {'raw': 'RAW', 'xhttp': 'XHTTP', 'mtproto': 'MTProto'}
 NAME_RE = re.compile(r'[A-Za-z0-9._@-]{2,64}')
 GROUP_RE = re.compile(r'[\w .-]{1,32}')
 
@@ -2956,14 +3732,8 @@ def find_client(email, clients=None):
 
 
 def inbound_names(ibs):
-    """inbound id -> short display name (RAW / XHTTP / MTProto or remark)."""
-    names = {}
-    for ib in ibs:
-        remark = (ib.get('remark') or '').lower()
-        key = next((k for k, base in REMARKS.items()
-                    if remark == base.lower() or remark.endswith(' ' + base.lower())), None)
-        names[ib['id']] = SHORT[key] if key else (ib.get('remark') or ib.get('tag') or str(ib['id']))
-    return names
+    """inbound id -> compact display name (without the country prefix)."""
+    return {ib['id']: short_name(ib.get('remark') or ib.get('tag') or str(ib['id'])) for ib in ibs}
 
 
 def parse_ids(text, ibs):
@@ -3118,7 +3888,7 @@ def cmd_menu_inbounds(args):
     target = args[0] if args else ''
     attached = set()
     if target == 'managed':      # preselection for a new user
-        attached = {ib['id'] for ib in managed().values()}
+        attached = set(default_user_inbounds(snap.ibs))
     elif target.startswith('group:'):
         members = set(group_emails(target[6:]))
         sets = [set(cl.get('inboundIds') or []) for cl in snap.clients if cl.get('email') in members]
@@ -3161,7 +3931,7 @@ def cmd_add_user(args, quiet=False):
     if not NAME_RE.fullmatch(email):
         die('имя: 2–64 символа A-Z a-z 0-9 . _ @ -')
     ibs = inbounds()
-    ids = parse_ids(args[4], ibs) if len(args) > 4 and args[4] else [ib['id'] for ib in managed().values()]
+    ids = parse_ids(args[4], ibs) if len(args) > 4 and args[4] else default_user_inbounds(ibs)
     if not ids:
         die('не выбран ни один inbound')
     if any(cl.get('email') == email for cl in clients_all()):
@@ -3289,6 +4059,230 @@ def cmd_group_set_members(args):
     if have - want:
         ok(call('/clients/groups/bulkRemove', {'emails': sorted(have - want)}), 'исключение из группы')
     print('+%d / −%d' % (len(want - have), len(have - want)))
+
+
+# ------------------------------------------------------------ DNS check
+# Public resolvers in different countries, like dnschecker.org: they show
+# whether the domain's A record has propagated and points to this server.
+RESOLVERS = [
+    ('Google', 'США', '8.8.8.8'),
+    ('Cloudflare', 'anycast', '1.1.1.1'),
+    ('Quad9', 'Швейцария', '9.9.9.9'),
+    ('OpenDNS', 'США', '208.67.222.222'),
+    ('Level3', 'США', '4.2.2.1'),
+    ('Comodo', 'США', '8.26.56.26'),
+    ('Hurricane Electric', 'США', '74.82.42.42'),
+    ('Control D', 'Канада', '76.76.2.0'),
+    ('DNS.SB', 'Германия', '185.222.222.222'),
+    ('Gcore', 'Люксембург', '95.85.95.85'),
+    ('AdGuard', 'Кипр', '94.140.14.14'),
+    ('CleanBrowsing', 'Великобритания', '185.228.168.9'),
+    ('Yandex', 'Россия', '77.88.8.8'),
+    ('SafeDNS', 'Россия', '195.46.39.39'),
+    ('Alibaba', 'Китай', '223.5.5.5'),
+    ('DNSPod', 'Китай', '119.29.29.29'),
+]
+DOH = {'8.8.8.8': 'https://dns.google/resolve?name=%s&type=%s',
+       '1.1.1.1': 'https://cloudflare-dns.com/dns-query?name=%s&type=%s',
+       '223.5.5.5': 'https://dns.alidns.com/resolve?name=%s&type=%s'}
+QTYPE = {'A': 1, 'NS': 2, 'CNAME': 5, 'AAAA': 28}
+
+
+def _dns_name(buf, pos):
+    labels, jumped, end = [], False, pos
+    for _ in range(128):
+        n = buf[pos]
+        if n == 0:
+            pos += 1
+            break
+        if n & 0xC0 == 0xC0:
+            if not jumped:
+                end = pos + 2
+            pos = ((n & 0x3F) << 8) | buf[pos + 1]
+            jumped = True
+            continue
+        labels.append(buf[pos + 1:pos + 1 + n].decode('ascii', 'replace'))
+        pos += 1 + n
+    return '.'.join(labels).lower(), (end if jumped else pos)
+
+
+def dns_query(server, name, qtype='A', timeout=2.5, recursive=True):
+    """Minimal DNS client over UDP: returns (rcode, [values]) for QTYPE records."""
+    import struct
+    qid = secrets.randbits(16)
+    q = struct.pack('>HHHHHH', qid, 0x0100 if recursive else 0, 1, 0, 0, 0)
+    for part in name.strip('.').split('.'):
+        q += bytes([len(part)]) + part.encode('idna')
+    q += b'\0' + struct.pack('>HH', QTYPE[qtype], 1)
+    family = socket.AF_INET6 if ':' in server else socket.AF_INET
+    with socket.socket(family, socket.SOCK_DGRAM) as s:
+        s.settimeout(timeout)
+        s.sendto(q, (server, 53))
+        while True:
+            buf, _ = s.recvfrom(4096)
+            if len(buf) >= 12 and struct.unpack('>H', buf[:2])[0] == qid:
+                break
+    flags, qd, an, ns_count = struct.unpack('>HHHH', buf[2:10])
+    pos = 12
+    for _ in range(qd):
+        _, pos = _dns_name(buf, pos)
+        pos += 4
+    values = []
+    for _ in range(an + ns_count):
+        _, pos = _dns_name(buf, pos)
+        rtype, _, _, rdlen = struct.unpack('>HHIH', buf[pos:pos + 10])
+        pos += 10
+        rdata = buf[pos:pos + rdlen]
+        if rtype == QTYPE[qtype]:
+            if rtype == 1 and rdlen == 4:
+                values.append(socket.inet_ntop(socket.AF_INET, rdata))
+            elif rtype == 28 and rdlen == 16:
+                values.append(socket.inet_ntop(socket.AF_INET6, rdata))
+            elif rtype == 2:
+                values.append(_dns_name(buf, pos)[0])
+        pos += rdlen
+    return flags & 0xF, values
+
+
+def doh_query(server, name, qtype):
+    url = DOH[server] % (urllib.parse.quote(name), qtype)
+    import urllib.request
+    req = urllib.request.Request(url, headers={'Accept': 'application/dns-json', 'User-Agent': '3x-ui_reverse'})
+    with urllib.request.urlopen(req, timeout=6) as r:
+        data = json.loads(r.read().decode())
+    return data.get('Status', 0), [a.get('data', '') for a in data.get('Answer') or [] if a.get('type') == QTYPE[qtype]]
+
+
+def public_ips():
+    """This server's public IPv4 (and IPv6) as seen from the Internet + local addresses."""
+    found = set()
+    for url in ('https://api.ipify.org', 'https://ifconfig.me/ip', 'https://icanhazip.com', 'https://ipinfo.io/ip'):
+        try:
+            ip = _fetch(url, 5).strip()
+            socket.inet_aton(ip)
+            found.add(ip)
+            break
+        except Exception:
+            continue
+    for url in ('https://api6.ipify.org', 'https://ipv6.icanhazip.com'):
+        try:
+            ip = _fetch(url, 5).strip()
+            socket.inet_pton(socket.AF_INET6, ip)
+            found.add(ip)
+            break
+        except Exception:
+            continue
+    for fam, probe in ((socket.AF_INET, '1.1.1.1'), (socket.AF_INET6, '2606:4700:4700::1111')):
+        try:
+            with socket.socket(fam, socket.SOCK_DGRAM) as s:
+                s.connect((probe, 53))
+                found.add(s.getsockname()[0])
+        except OSError:
+            pass
+    return found
+
+
+def cmd_public_ip(_args):
+    print(' '.join(sorted(public_ips())))
+
+
+def authoritative(name):
+    """(ns host, ns ip) of the zone that serves NAME, via Google DNS."""
+    labels = name.strip('.').split('.')
+    for i in range(len(labels) - 1):
+        zone = '.'.join(labels[i:])
+        try:
+            rc, ns = dns_query('8.8.8.8', zone, 'NS')
+        except OSError:
+            try:
+                rc, ns = doh_query('8.8.8.8', zone, 'NS')
+                ns = [n.rstrip('.') for n in ns]
+            except Exception:
+                return '', ''
+        if ns:
+            host = sorted(ns)[0]
+            try:
+                _, ips = dns_query('8.8.8.8', host, 'A')
+            except OSError:
+                ips = []
+            return host, (ips[0] if ips else '')
+    return '', ''
+
+
+def cmd_dns_check(args):
+    """dns-check DOMAIN — table of resolvers and a verdict line:
+    VERDICT ok|partial|wrong|none AUTH=ok|wrong|none|unknown AAAA=ok|wrong|none IP=…"""
+    import concurrent.futures as cf
+    domain = (args[0] if args else '').strip().lower().rstrip('.')
+    if not re.fullmatch(r'([a-z0-9-]+\.)+[a-z]{2,63}', domain):
+        die('неверный домен')
+    mine = public_ips()
+    mine4 = sorted(ip for ip in mine if '.' in ip)
+    ns_host, ns_ip = authoritative(domain)
+
+    def ask(entry):
+        name, where, server = entry
+        try:
+            rc, ips = dns_query(server, domain, 'A', recursive=(where != 'NS'))
+            via = 'UDP'
+        except OSError:
+            if server not in DOH:
+                return entry, None, 'нет ответа'
+            try:
+                rc, ips = doh_query(server, domain, 'A')
+                via = 'DoH'
+            except Exception:
+                return entry, None, 'нет ответа'
+        if rc == 3:
+            return entry, [], 'NXDOMAIN'
+        return entry, ips, via
+
+    entries = list(RESOLVERS)
+    if ns_ip:
+        entries.insert(0, ('%s' % ns_host, 'NS', ns_ip))
+    with cf.ThreadPoolExecutor(max_workers=len(entries)) as pool:
+        results = list(pool.map(ask, entries))
+    good = answered = 0
+    auth = 'unknown'
+    w = max(len(e[0]) for e in entries)
+    out('{accent}%s  %-14s  %s{/}' % ('РЕЗОЛВЕР'.ljust(w), 'РАСПОЛОЖЕНИЕ', 'ОТВЕТ'))
+    for (name, where, server), ips, note in results:
+        place = 'авторитетный' if where == 'NS' else where
+        if ips is None:
+            mark, text = '{dim}·{/}', '{dim}%s{/}' % note
+        elif not ips:
+            mark, text = '{red}✗{/}', '{red}нет A-записи%s{/}' % (' (NXDOMAIN)' if note == 'NXDOMAIN' else '')
+        elif set(ips) & mine:
+            mark, text = '{green}✓{/}', '{green}%s{/}' % ', '.join(ips)
+        else:
+            mark, text = '{red}✗{/}', '{red}%s{/}' % ', '.join(ips)
+        if ips is not None:
+            if where == 'NS':
+                auth = 'ok' if ips and set(ips) & mine else ('none' if not ips else 'wrong')
+            else:
+                answered += 1
+                good += 1 if ips and set(ips) & mine else 0
+        out('%s %s  %-14s  %s' % (mark, name.ljust(w), place, text))
+    try:
+        _, aaaa = dns_query('8.8.8.8', domain, 'AAAA')
+    except OSError:
+        aaaa = []
+    aaaa_state = 'none' if not aaaa else ('ok' if set(aaaa) & mine else 'wrong')
+    out('')
+    out('{dim}IP этого сервера:{/} %s' % (', '.join(mine4) or '{yellow}не удалось определить{/}'))
+    if aaaa:
+        out('{dim}AAAA (IPv6):{/} %s %s' % (', '.join(aaaa), '{green}✓{/}' if aaaa_state == 'ok'
+                                             else '{yellow}⚠ не указывает на этот сервер{/}'))
+    if not answered:
+        verdict = 'none'
+    elif good == answered:
+        verdict = 'ok'
+    elif good:
+        verdict = 'partial'
+    else:
+        verdict = 'wrong'
+    print('VERDICT %s AUTH=%s AAAA=%s OK=%d/%d IP=%s' % (verdict, auth, aaaa_state, good, answered,
+                                                         ','.join(mine4) or '-'))
 
 # ------------------------------------------------------- activity tracking
 LOG_RE = re.compile(r'^(\S+ \S+) .*?\[(\S+) (?:>>|->) [^\]]*\].*?email: (\S+)')
@@ -3438,6 +4432,10 @@ def cmd_ping(_args):
 COMMANDS = {
     'ping': cmd_ping, 'pick-sni': None, 'create-inbounds': cmd_create_inbounds,
     'inbounds': cmd_inbounds, 'ports': cmd_ports, 'ports-all': cmd_ports_all, 'all-ports': cmd_all_ports,
+    'check-port': cmd_check_port, 'check-name': cmd_check_name, 'sni-list': cmd_sni_list,
+    'inbound-info': cmd_inbound_info, 'menu-all-inbounds': cmd_menu_all_inbounds, 'menu-kinds': cmd_menu_kinds,
+    'kind-info': cmd_kind_info, 'set-port': cmd_set_port, 'set-name': cmd_set_name, 'set-sni': cmd_set_sni,
+    'set-tls': cmd_set_tls, 'set-enable': cmd_set_enable, 'del-inbound': cmd_del_inbound,
     'users': cmd_users, 'stats': cmd_stats, 'user-card': cmd_user_card,
     'menu-users': cmd_menu_users, 'menu-groups': cmd_menu_groups, 'menu-inbounds': cmd_menu_inbounds,
     'add-user': cmd_add_user, 'del-user': cmd_del_user, 'sub-id': cmd_sub_id,
@@ -3446,6 +4444,7 @@ COMMANDS = {
     'group-add-users': cmd_group_add_users, 'group-inbounds': cmd_group_inbounds,
     'groups': cmd_groups, 'menu-members': cmd_menu_members, 'group-set-members': cmd_group_set_members,
     'country': cmd_country, 'update-check': cmd_update_check, 'update-fetch': cmd_update_fetch,
+    'dns-check': cmd_dns_check, 'public-ip': cmd_public_ip,
     'track-activity': cmd_track_activity, 'enable-access-log': cmd_enable_access_log,
 }
 
@@ -3485,6 +4484,19 @@ TAG_RE = re.compile(r'\{(/|green|red|yellow|accent|cyan|blue|magenta|dim|bold|wh
 ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
 GLYPHS = {'●': 'green', '✓': 'green', '✗': 'red', '⚠': 'yellow', '○': 'dim', '➜': 'accent'}
 SPIN = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+LOGO = [
+    '██████╗ ██╗  ██╗      ██╗   ██╗██╗',
+    '╚════██╗╚██╗██╔╝      ██║   ██║██║',
+    ' █████╔╝ ╚███╔╝ █████╗██║   ██║██║',
+    ' ╚═══██╗ ██╔██╗ ╚════╝██║   ██║██║',
+    '██████╔╝██╔╝ ██╗      ╚██████╔╝██║',
+    '╚═════╝ ╚═╝  ╚═╝       ╚═════╝ ╚═╝',
+]
+LOGO_SUB = '━━━━━━━  r e v e r s e  ━━━━━━━'
+LOGO_H = len(LOGO) + 2                    # logo, subtitle and a blank line
+LOGO_256 = [51, 45, 39, 33, 69, 105]      # cyan → blue → violet gradient
+LOGO_8 = [6, 6, 6, 4, 4, 5]
+LOGO_ANSI = ['38;5;%d' % n for n in LOGO_256]
 
 
 def cwidth(ch):
@@ -3621,11 +4633,15 @@ class TUI:
         self.busy_since = None
         self.ctx = ''
         self.clicks = []               # footer hot zones: (y, x0, x1, action)
+        self.want_logo = False
+        self.splash = None
         curses.curs_set(0)
         curses.raw()                   # Ctrl+C must not kill a half-done operation
         scr.keypad(True)
         try:
-            curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
+            # No REPORT_MOUSE_POSITION: with motion tracking ncurses may report a
+            # press at a new position as plain movement and the click is lost.
+            curses.mousemask(curses.ALL_MOUSE_EVENTS)
             curses.mouseinterval(0)
         except curses.error:
             pass
@@ -3639,6 +4655,9 @@ class TUI:
             for k in ('text', 'accent', 'green', 'red', 'yellow', 'cyan', 'blue', 'magenta',
                       'white', 'dim', 'border', 'title', 'sel', 'bar', 'barhi', 'key', 'field', 'track'):
                 self.st[k] = c.A_NORMAL
+            for i in range(len(LOGO)):
+                self.st['logo%d' % i] = c.A_BOLD
+            self.st['logosub'] = c.A_BOLD
             self.st.update(sel=c.A_REVERSE, bar=c.A_REVERSE, barhi=c.A_REVERSE | c.A_BOLD,
                            key=c.A_REVERSE, title=c.A_BOLD, bold=c.A_BOLD, field=c.A_UNDERLINE)
             return
@@ -3671,6 +4690,9 @@ class TUI:
             'bar': pair(barfg, barbg), 'barhi': pair(acc, barbg) | B, 'key': pair(keyfg, keybg) | B,
             'field': pair(white, fieldbg), 'track': pair(track),
         }
+        for i, col in enumerate(LOGO_256 if rich else LOGO_8):
+            self.st['logo%d' % i] = pair(col) | B
+        self.st['logosub'] = pair(mag if rich else 5) | B
 
     def a(self, style):
         return self.st.get(style or 'text', self.st['text'])
@@ -3729,11 +4751,28 @@ class TUI:
         if x + swidth(hint) + 2 < w:
             self.put(h - 1, w - swidth(hint) - 2, hint, self.a('dim'))
 
+    def draw_logo(self, y):
+        W = self.scr.getmaxyx()[1]
+        x = max(0, (W - swidth(LOGO[0])) // 2)
+        for i, line in enumerate(LOGO):
+            self.put(y + i, x, line, self.a('logo%d' % i))
+        self.put(y + len(LOGO), max(0, (W - swidth(LOGO_SUB)) // 2), LOGO_SUB, self.a('logosub'))
+
+    def logo_fits(self, inner_h):
+        H = self.scr.getmaxyx()[0]
+        return self.want_logo and H - 3 - (inner_h + 2) >= LOGO_H + 1
+
     def panel(self, title, inner_w, inner_h, top=None):
         """Rounded panel; returns (y, x, w, h) of the inner area."""
         H, W = self.scr.getmaxyx()
         w = min(inner_w + 4, W - 2)
         h = min(inner_h + 2, H - 3)
+        if top is None and self.logo_fits(inner_h):
+            # Logo and panel are centred together.
+            block = LOGO_H + h
+            ly = max(1, 1 + (H - 2 - block) // 2)
+            self.draw_logo(ly)
+            top = ly + LOGO_H
         y = top if top is not None else max(2, 1 + (H - 2 - h) // 2)
         x = max(1, (W - w) // 2)
         b = self.a('border')
@@ -3761,12 +4800,19 @@ class TUI:
         self.scr.timeout(-1 if timeout is None else int(timeout * 1000))
         try:
             k = self.scr.get_wch()
+            self.errors = 0
         except self.c.error:
+            if timeout is None:
+                # A blocking read that keeps failing means the terminal is gone.
+                self.errors = getattr(self, 'errors', 0) + 1
+                if self.errors > 50:
+                    raise SystemExit(1)
             return None
         if k == self.c.KEY_MOUSE:
             try:
                 _, mx, my, _, bstate = self.c.getmouse()
             except self.c.error:
+                self.lost_press = True    # the press was lost: let the release count
                 return None
             return ('mouse', my, mx, bstate)
         if k == '\x1b':
@@ -3845,8 +4891,15 @@ class TUI:
             return 'wheeldown'
         if bstate & (c.BUTTON1_DOUBLE_CLICKED | c.BUTTON1_TRIPLE_CLICKED):
             return 'double'
-        if bstate & (c.BUTTON1_CLICKED | c.BUTTON1_PRESSED | c.BUTTON1_RELEASED):
+        # Press and release arrive as separate events and only one of them may
+        # count, or a checkbox would toggle twice. ncurses occasionally loses the
+        # press (getmouse() fails): then the release stands in for it.
+        if bstate & (c.BUTTON1_CLICKED | c.BUTTON1_PRESSED):
+            self.lost_press = False
             return 'click'
+        if bstate & c.BUTTON1_RELEASED:
+            lost, self.lost_press = getattr(self, 'lost_press', False), False
+            return 'click' if lost else None
         if bstate & (c.BUTTON3_CLICKED | c.BUTTON3_PRESSED):
             return 'right'
         return None
@@ -3946,7 +4999,11 @@ class TUI:
                 self.put(ly + list_h, x + w - 2, '▼', self.a('accent'))
             self.scr.refresh()
 
-            k = self.norm(self.key())
+            raw = self.key()
+            if os.environ.get('XR_TUI_DEBUG'):
+                sys.stderr.write('%.2f key %r\n' % (time.time(), raw))
+                sys.stderr.flush()
+            k = self.norm(raw)
             act = k
             if isinstance(k, tuple):
                 _, my, mx, bstate = k
@@ -4127,6 +5184,18 @@ class TUI:
             elif act == 'end':
                 top = len(tl)
 
+    def draw_splash(self):
+        sp = self.splash
+        H, W = self.scr.getmaxyx()
+        self.scr.erase()
+        top = max(0, (H - LOGO_H - 3) // 2)
+        self.draw_logo(top)
+        line = sp.get('text') or ''
+        self.put(top + LOGO_H, max(0, (W - swidth(line)) // 2), line, self.a('dim'))
+        frame = SPIN[int(time.time() * 10) % len(SPIN)] + ' ' + (sp.get('status') or 'загрузка…')
+        self.put(top + LOGO_H + 2, max(0, (W - swidth(frame)) // 2), frame, self.a('accent'))
+        self.scr.refresh()
+
     def draw_gauge(self):
         g = self.gauge
         phases, states = g.get('phases') or [], g.get('states') or []
@@ -4172,7 +5241,9 @@ class TUI:
 
     def idle(self):
         """Between requests: animate the gauge or the 'busy' spinner, eat keys."""
-        if self.gauge:
+        if self.splash:
+            self.draw_splash()
+        elif self.gauge:
             self.draw_gauge()
         elif self.busy_since and time.time() - self.busy_since > 0.25:
             H, W = self.scr.getmaxyx()
@@ -4193,6 +5264,9 @@ class TUI:
         cmd = req.get('cmd')
         if 'ctx' in req:
             self.ctx = req.get('ctx') or ''
+        self.want_logo = bool(req.get('logo'))
+        if cmd != 'splash':
+            self.splash = None
         new_gauge = cmd == 'gauge' and (not self.gauge or self.gauge.get('title') != req.get('title'))
         if cmd != 'gauge':
             self.gauge = None
@@ -4217,6 +5291,10 @@ class TUI:
             self.gauge = req
             self.draw_gauge()
             return 0, ''
+        if cmd == 'splash':
+            self.splash = req
+            self.draw_splash()
+            return 0, ''
         if cmd == 'suspend':
             self.c.endwin()
             return 0, ''
@@ -4230,7 +5308,7 @@ class TUI:
 
     def loop(self):
         while True:
-            line = self.read_request(0.1 if (self.gauge or self.busy_since) else None)
+            line = self.read_request(0.1 if (self.gauge or self.busy_since or self.splash) else None)
             if line is None:
                 return
             if line == '':
@@ -4275,6 +5353,13 @@ def to_ansi(text, color=True):
     return '\n'.join(out)
 
 
+def print_logo(stream, color=True):
+    for i, line in enumerate(LOGO):
+        stream.write(('\x1b[1;%sm%s\x1b[0m' % (LOGO_ANSI[i], line) if color else line) + '\n')
+    stream.write(('\x1b[1;38;5;177m%s\x1b[0m' % LOGO_SUB if color else LOGO_SUB) + '\n')
+    stream.flush()
+
+
 def cli(req):
     tin = open('/dev/tty', 'r', encoding='utf-8', errors='replace')
     tty = open('/dev/tty', 'w', encoding='utf-8', errors='replace')
@@ -4294,6 +5379,13 @@ def cli(req):
 
     cmd = req.get('cmd')
     title, text = req.get('title', ''), req.get('text', '')
+    if cmd == 'splash':
+        print_logo(tty, color)
+        if req.get('text'):
+            say('{dim}%s{/}' % req['text'])
+        return 0, ''
+    if req.get('logo'):
+        print_logo(tty, color)
     if title:
         say('\n{accent}◆ %s{/}' % title)
     if text and cmd not in ('text',):
@@ -4378,6 +5470,9 @@ def main():
         rc, value = cli(req)
         sys.stdout.write(value)
         return rc
+    if len(sys.argv) >= 2 and sys.argv[1] == 'logo':
+        print_logo(sys.stdout, sys.stdout.isatty() and not os.environ.get('NO_COLOR'))
+        return 0
     if len(sys.argv) >= 2 and sys.argv[1] == 'ansi':      # markup -> ANSI for plain output
         color = sys.stdout.isatty() and not os.environ.get('NO_COLOR')
         sys.stdout.write(to_ansi(sys.stdin.read(), color))
@@ -4555,6 +5650,7 @@ menu_version(){
 manager(){
   [[ $EUID -eq 0 ]] || die 'Запусти через sudo.'
   ui_init || die 'Нужен интерактивный терминал. Для скриптов используй команды: 3x-ui_reverse --help'
+  ui_splash "$VERSION · управление 3x-ui за Caddy/Nginx" 'подключаемся к панели…'
   load_state
   touch "$LOG"; chmod 600 "$LOG"
   # Running a newer copy of this file upgrades the installed command,
@@ -4579,14 +5675,14 @@ manager(){
   local -a quit_item=()
   [[ $UI_MODE == tui ]] && quit_item=(quit '{dim}Выход{/}')
   while :; do
-    ch=$(TUI_CANCEL='Выход' tui_menu '3x-ui_reverse' "$(main_header)" \
+    ch=$(TUI_LOGO=1 TUI_CANCEL='Выход' tui_menu '3x-ui_reverse' "$(main_header)" \
          '#Обзор' '' \
          info $'Параметры и ссылки\t{dim}панель, подписки, файлы{/}' \
          status $'Состояние служб\t{dim}3x-ui, прокси, порты, HTTPS{/}' \
          '#Управление' '' \
          users $'Пользователи\t{dim}трафик, активность, inbound-ы{/}' \
          groups $'Группы\t{dim}массовые действия{/}' \
-         inbounds $'Inbound-ы\t{dim}Reality RAW / XHTTP, MTProto{/}' \
+         inbounds $'Inbound-ы\t{dim}VLESS, Trojan, Hysteria2, AmneziaWG, MTProto{/}' \
          '#Система' '' \
          settings $'Настройки панели\t{dim}порты, пути, логин{/}' \
          service $'Обслуживание\t{dim}перезапуск, переустановка{/}' \
@@ -4656,7 +5752,11 @@ usage(){
   groups create NAME | rename OLD NEW | delete NAME
   groups members GROUP [NAME…]          установить состав группы
   groups inbounds GROUP set|add|remove 1,2,3
-  inbounds [list] | inbounds create     список | создать недостающие
+  inbounds [list]                       все inbound-ы панели
+  inbounds kinds                        какие inbound-ы умеет создавать скрипт
+  inbounds add KIND[,KIND…] [--tls CERT:KEY:SNI] [--port N] [--sni HOST] [--name NAME]
+  inbounds edit ID [--port N] [--name NAME] [--sni HOST] [--tls domain|CERT:KEY:SNI] [--enable 0|1]
+  inbounds del ID
   version | update [--check]            версия | проверить/установить обновление
 
 Служебные: --repair  --demo  --uninstall  --remove-command  --restore-command
@@ -4716,7 +5816,12 @@ cli_cmd(){
       cli_need_panel
       case "$sub" in
         list) helper inbounds ;;
-        create) setup_inbounds || die 'Inbound-ы не созданы (см. журнал).'; helper inbounds ;;
+        kinds) local k; for k in vless-tcp-reality vless-xhttp-reality vless-xhttp-tls trojan-tcp trojan-tcp-reality \
+                 trojan-xhttp-reality trojan-xhttp-tls hysteria amneziawg mtproto; do
+                 printf '  %-22s %s\n' "$k" "${KIND_LABEL[$k]}"; done ;;
+        add|create) cli_inbounds_add "${@:3}" ;;
+        edit) cli_inbounds_edit "${@:3}" ;;
+        del) [[ -n "${3:-}" ]] || die 'inbounds del ID'; helper del-inbound "$3"; printf 'Удалён inbound %s\n' "$3" ;;
         *) die "Неизвестная подкоманда inbounds $sub" ;;
       esac ;;
     version)
@@ -4742,6 +5847,62 @@ cli_cmd(){
       install -m 755 -- "$tmp" "$SELF"; rm -f -- "$tmp" "$UPDATE_CACHE"
       printf 'Обновлено до %s: %s\n' "$tag" "$SELF" ;;
   esac
+}
+# inbounds add KIND[,KIND…] [--tls CERT:KEY:SNI] [--port N] [--sni HOST] [--name NAME]
+cli_inbounds_add(){
+  local kinds=${1:-} k tls port sni name crt key host err
+  [[ -n "$kinds" ]] || die 'inbounds add KIND[,KIND…] (список: 3x-ui_reverse inbounds kinds)'
+  tls=$(cli_opt tls "$@"); port=$(cli_opt port "$@"); sni=$(cli_opt sni "$@"); name=$(cli_opt name "$@")
+  INB_KINDS=(); INB_TLS=()
+  IFS=, read -ra INB_KINDS <<< "$kinds"
+  for k in "${INB_KINDS[@]}"; do
+    [[ -n "${KIND_LABEL[$k]:-}" ]] || die "Неизвестный тип: $k (список: 3x-ui_reverse inbounds kinds)"
+    if [[ "$TLS_KINDS" == *" $k "* ]]; then
+      if [[ -z "$tls" || "$tls" == domain ]]; then INB_TLS[$k]=domain
+      else
+        IFS=: read -r crt key host <<< "$tls"
+        err=$(check_cert_files "$crt" "$key" "${host,,}") || die "$err"
+        INB_TLS[$k]="$crt|$key|${host,,}"
+      fi
+    fi
+  done
+  if [[ -n "$port$sni$name" ]]; then
+    ((${#INB_KINDS[@]} == 1)) || die '--port/--sni/--name можно задать только для одного inbound-а'
+    [[ -z "$sni" ]] || XR_SNI=$sni
+  fi
+  setup_inbounds_cli "$port" "$name" || die 'Inbound-ы не созданы (см. журнал).'
+  helper inbounds
+}
+setup_inbounds_cli(){
+  local port=$1 name=$2 k=${INB_KINDS[0]}
+  if [[ -n "$port" || -n "$name" ]]; then
+    setup_inbounds || return 1
+    [[ -z "$port" ]] || helper set-port "$CREATED_IDS" "$port" || return 1
+    [[ -z "$name" ]] || helper set-name "$CREATED_IDS" "$name" || return 1
+    open_firewall_ports "$CREATED_IDS" || :
+    printf 'Создан %s (id %s)\n' "${KIND_LABEL[$k]}" "$CREATED_IDS"
+    return 0
+  fi
+  setup_inbounds
+}
+# inbounds edit ID [--port N] [--name NAME] [--sni HOST] [--tls domain|CERT:KEY:SNI] [--enable 0|1]
+cli_inbounds_edit(){
+  local id=${1:-} v crt key host paths err
+  [[ "$id" =~ ^[0-9]+$ ]] || die 'inbounds edit ID [--port N] [--name NAME] [--sni HOST] [--tls …] [--enable 0|1]'
+  v=$(cli_opt port "$@");   [[ -z "$v" ]] || { helper set-port "$id" "$v" && open_firewall_ports "$id"; } || exit 1
+  v=$(cli_opt name "$@");   [[ -z "$v" ]] || helper set-name "$id" "$v" || exit 1
+  v=$(cli_opt sni "$@");    [[ -z "$v" ]] || helper set-sni "$id" "$v" || exit 1
+  v=$(cli_opt enable "$@"); [[ -z "$v" ]] || helper set-enable "$id" "$v" || exit 1
+  v=$(cli_opt tls "$@")
+  if [[ "$v" == domain ]]; then
+    paths=$(domain_cert_paths) || die "Сертификат домена $DOMAIN не найден."
+    helper set-tls "$id" "$(sed -n 1p <<< "$paths")" "$(sed -n 2p <<< "$paths")" "$DOMAIN" || exit 1
+  elif [[ -n "$v" ]]; then
+    IFS=: read -r crt key host <<< "$v"
+    err=$(check_cert_files "$crt" "$key" "${host,,}") || die "$err"
+    helper set-tls "$id" "$crt" "$key" "${host,,}" || exit 1
+  fi
+  helper inbound-info "$id"
 }
 main_interactive(){
   if [[ -f "$STATE" ]]; then manager; else install_fresh; manager; fi
