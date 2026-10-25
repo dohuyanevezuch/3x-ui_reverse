@@ -3,7 +3,8 @@
 **Русский** | [English](#english)
 
 ![version](https://img.shields.io/github/v/release/dohuyanevezuch/3x-ui_reverse?label=version)
-![platform](https://img.shields.io/badge/Debian%2012%2F13%20%7C%20Ubuntu%2022.04%2F24.04-blue)
+![platform](https://img.shields.io/badge/Debian%2012%2F13%20%7C%20Ubuntu%2022.04%2F24.04%2F26.04-blue)
+
 
 ![screen_1](./img/1.png)
 
