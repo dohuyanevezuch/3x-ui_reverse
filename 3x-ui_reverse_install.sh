@@ -6,7 +6,7 @@ set -Eeuo pipefail
 umask 077
 
 # Release version = the git tag of the commit this file comes from.
-VERSION=v2.2.1
+VERSION=v2.2.2
 # GitHub repository (owner/name) that publishes tagged releases of this script.
 # Can also be set from the "Версия" screen or with XR_REPO=owner/name.
 DEFAULT_REPO='dohuyanevezuch/3x-ui_reverse'
@@ -23,6 +23,7 @@ SELF=/usr/local/sbin/3x-ui_reverse
 XUI_INSTALL_URL=https://raw.githubusercontent.com/MHSanaei/3x-ui/main/install.sh
 # API helper, its token and the short-lived Xray access log used for "last inbound".
 HELPER=$BASE/xr_helper.py
+SUPPORTED_OS='Debian 12/13 и Ubuntu 22.04/24.04/26.04'
 HELPER_STATE=''   # overrides XR_STATE_DIR before $BASE exists
 NODE_TOKEN=$BASE/node.token     # node-sync API token handed to a master panel
 PAIR_ACTIVE=$BASE/pair.active   # pairing files currently published on the stub site
@@ -467,8 +468,24 @@ check_environment(){
   local os_id os_ver
   os_id=$(. /etc/os-release && printf '%s' "${ID:-}")
   os_ver=$(. /etc/os-release && printf '%s' "${VERSION_ID:-}")
-  [[ $os_id == debian || $os_id == ubuntu ]] || die 'Поддерживаются только Debian 12/13 и Ubuntu 22.04/24.04.'
-  case "$os_id:$os_ver" in debian:12|debian:13|ubuntu:22.04|ubuntu:24.04) ;; *) die 'Неподдерживаемая версия Debian/Ubuntu.';; esac
+  [[ $os_id == debian || $os_id == ubuntu ]] || die "Поддерживаются только $SUPPORTED_OS."
+  case "$os_id:$os_ver" in
+    debian:12|debian:13|ubuntu:22.04|ubuntu:24.04|ubuntu:26.04) ;;
+    *)
+      # Releases newer than the tested ones usually work: ask instead of refusing.
+      local major=${os_ver%%.*}
+      local newer=0
+      if [[ "$major" =~ ^[0-9]+$ ]]; then
+        if [[ $os_id == debian ]]; then ((major > 13)) && newer=1; else ((major >= 24)) && newer=1; fi
+      fi
+      if ((newer)); then
+        tui_yesno 'Версия ОС' "{yellow}⚠ $os_id $os_ver ещё не проверялась{/} — поддерживаются $SUPPORTED_OS.
+
+Скорее всего, установка пройдёт, но возможны ошибки. Продолжить?" 'Продолжить' 'Отмена' no || exit 0
+      else
+        die "Неподдерживаемая версия: $os_id ${os_ver:-?}. Поддерживаются $SUPPORTED_OS."
+      fi ;;
+  esac
   if [[ -e "$STATE" || -e "$DB" || -e /usr/local/x-ui/x-ui ]] || systemctl list-unit-files --no-legend x-ui.service 2>/dev/null | grep -q '^x-ui.service'; then
     die 'Обнаружена существующая 3x-ui / конфигурация. Установка только на чистый VPS.'
   fi
