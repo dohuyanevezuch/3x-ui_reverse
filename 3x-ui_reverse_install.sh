@@ -6,7 +6,7 @@ set -Eeuo pipefail
 umask 077
 
 # Release version = the git tag of the commit this file comes from.
-VERSION=v2.3.0
+VERSION=v2.4.0
 # GitHub repository (owner/name) that publishes tagged releases of this script.
 # Can also be set from the "Версия" screen or with XR_REPO=owner/name.
 DEFAULT_REPO='dohuyanevezuch/3x-ui_reverse'
@@ -2044,7 +2044,7 @@ api_base(){
 }
 helper(){
   [[ -f "$HELPER" ]] || write_helper
-  XR_API="$(api_base)" XR_TLS_SNI="$DOMAIN" XR_TOKEN_FILE="$API_TOKEN" \
+  XR_API="$(api_base)" XR_TLS_SNI="${DOMAIN:-}" XR_TOKEN_FILE="$API_TOKEN" \
   XR_STATE_DIR="${HELPER_STATE:-$BASE}" XR_ACCESS_LOG="$ACCESS_LOG" python3 -I "$HELPER" "$@"
 }
 write_helper_env(){
@@ -3427,14 +3427,118 @@ start_menu(){
 {dim}$os · $(hostname 2>/dev/null || echo VPS){/}" \
          install $'Установить 3x-ui + прокси\t{dim}Caddy или Nginx, HTTPS, сайт-заглушка{/}' \
          dns $'Проверить DNS-записи\t{dim}куда указывает домен в 16 DNS мира{/}' \
+         diag $'Диагностика сервера\t{dim}iPerf3 до РФ, IP Region, Censorcheck DPI{/}' \
+         multitest $'Multitest by @saveksme\t{dim}полный набор тестов сервера{/}' \
          quit '{dim}Выход{/}') || return 0
     case "$ch" in
       install)
         if install_fresh && [[ -f "$STATE" ]]; then manager; return 0; fi
         DOMAIN='' ;;
       dns) dns_standalone ;;
+      diag) menu_diag ;;
+      multitest) diag_multitest ;;
       quit) return 0 ;;
     esac
+  done
+}
+
+# ---- Diagnostics: iPerf3 to Russia (own screen) and original third-party tests
+DIAG_IPREGION_URL='https://github.com/Davoyan/ipregion/raw/main/ipregion.sh'
+DIAG_CENSOR_URL='https://github.com/vernette/censorcheck/raw/master/censorcheck.sh'
+MULTITEST_URL='https://github.com/saveksme/multitest/raw/master/multitest.sh'
+
+iperf_ensure(){
+  command -v iperf3 >/dev/null 2>&1 && return 0
+  run apt-get update || :
+  run env DEBIAN_FRONTEND=noninteractive apt-get install -y iperf3
+}
+# iperf_run SECONDS RESULTFILE — one gauge phase per city.
+iperf_run(){
+  local secs=$1 res=$2 n i
+  local -a cities=()
+  mapfile -t cities < <(helper iperf-cities 2>>"$LOG")
+  n=${#cities[@]}
+  ((n > 0)) || return 1
+  : > "$res"
+  ui_start "iPerf3 до РФ · ${secs} с на тест" 'Устанавливаем iperf3' "${cities[@]}"
+  msg 'Устанавливаем iperf3'
+  if ! iperf_ensure; then ui_stop failed; warn 'Не удалось установить iperf3 (apt-get install iperf3).'; return 1; fi
+  step 4 'iperf3 готов'
+  for ((i = 0; i < n; i++)); do
+    msg "${cities[i]}"
+    helper iperf-city "$i" "$secs" >> "$res" 2>>"$LOG" ||
+      printf '{"city":"%s","error":"ошибка теста"}\n' "${cities[i]}" >> "$res"
+    step $(( 4 + 96 * (i + 1) / n )) "${cities[i]} — готово"
+  done
+  ui_stop
+}
+diag_iperf(){
+  local mode secs res
+  mode=$(tui_radiolist 'iPerf3 до РФ' "Скорость между этим VPS и серверами провайдеров в 5 городах России:
+отдача (VPS → РФ — то, что получают клиенты VPN), загрузка (РФ → VPS) и пинг.
+
+{dim}Тест создаёт заметный трафик. Серверы: github.com/itdoginfo/russian-iperf3-servers{/}" \
+         quick 'Быстрый — 3 с на направление (≈ 40 с)' ON \
+         full 'Полный — 10 с на направление (≈ 2 мин)' OFF) || return 0
+  secs=3; [[ "$mode" == full ]] && secs=10
+  res=$(mktemp "${UI_DIR:-${TMPDIR:-/tmp}}/iperf.XXXXXXXX")
+  if iperf_run "$secs" "$res"; then
+    tui_show 'iPerf3 до РФ' helper iperf-table "$res"
+  fi
+  rm -f -- "$res"
+}
+
+# run_external TITLE URL [ARGS…] — download an original script and run it in
+# the terminal; the TUI steps aside meanwhile.
+run_external(){
+  local title=$1 url=$2 tmp rc=0; shift 2
+  tmp=$(mktemp "${UI_DIR:-${TMPDIR:-/tmp}}/ext.XXXXXXXX")
+  if ! with_progress "$title" 'Скачиваем скрипт с GitHub' \
+       run curl -fsSL --retry 2 --connect-timeout 10 --max-time 120 -o "$tmp" "$url" ||
+     ! bash -n "$tmp" 2>/dev/null; then
+    rm -f -- "$tmp"
+    tui_msg "$title" "{red}✗ Не удалось скачать скрипт:{/} $url"
+    return 0
+  fi
+  tui_suspend
+  {
+    printf '\033[H\033[2J'
+    printf '\033[1;36m◆ %s\033[0m\n\033[2m%s\033[0m\n\033[2mCtrl+C — прервать тест\033[0m\n\n' "$title" "$url"
+  } >/dev/tty
+  # A handler (not an ignore) for INT: Ctrl+C stops the test, not this menu.
+  trap ':' INT
+  bash "$tmp" "$@" </dev/tty >/dev/tty 2>&1 {TUI_REQ}>&- {TUI_RESP}>&- || rc=$?
+  trap 'exit 130' INT
+  printf '\n\033[2m%s — Enter, чтобы вернуться в 3x-ui_reverse\033[0m' \
+    "$( ((rc == 0)) && echo 'Готово' || echo "Завершено с кодом $rc")" >/dev/tty
+  read -r _ </dev/tty || :
+  tui_resume
+  rm -f -- "$tmp"
+}
+diag_multitest(){
+  tui_yesno 'Multitest by @saveksme' "Интерактивный набор тестов сервера: IP Region, Censorcheck,
+iPerf3, YABS, bench.sh, IPQuality и другие ({accent}github.com/saveksme/multitest{/}).
+
+{yellow}⚠ Это сторонний скрипт:{/} он сам ставит нужные пакеты, а в конце загружает картинку
+с результатами (IP замаскированы, есть строка спонсора) на imgdb.io.
+Перед запуском он будет скачан с GitHub." 'Запустить' 'Отмена' yes || return 0
+  run_external 'Multitest by @saveksme' "$MULTITEST_URL"
+}
+menu_diag(){
+  local ch
+  while :; do
+    ch=$(tui_menu 'Диагностика сервера' 'Скорость до России, видимость IP и блокировки.' \
+         iperf $'iPerf3 до РФ\t{dim}скорость до 5 городов России · встроенный тест{/}' \
+         ipregion $'IP Region\t{dim}страна IP для сервисов · оригинал Davoyan/ipregion{/}' \
+         dpi $'Censorcheck DPI\t{dim}сайты, блокируемые в РФ · оригинал vernette/censorcheck{/}' \
+         multitest $'Multitest by @saveksme\t{dim}все тесты разом · оригинал{/}') || return 0
+    case "$ch" in
+      iperf) diag_iperf ;;
+      ipregion) run_external 'IP Region (Davoyan/ipregion)' "$DIAG_IPREGION_URL" ;;
+      dpi) run_external 'Censorcheck DPI (vernette/censorcheck)' "$DIAG_CENSOR_URL" --mode dpi ;;
+      multitest) diag_multitest ;;
+    esac
+    flush_notes
   done
 }
 
@@ -5340,11 +5444,13 @@ def cmd_node_probe(args):
 
 
 # ------------------------------------------------------------------ PDF
-# A one-page (two if needed) A4 summary of the server: what «Параметры и
-# ссылки» shows, plus QR codes. Needs python3-reportlab and fonts-dejavu-core.
+# The server summary as a page styled like a modern landing site: navbar,
+# gradient hero with buttons and QR, feature tiles, form-like credential
+# fields, subscription cards and a dark footer. Links are clickable.
+# Needs python3-reportlab and fonts-dejavu-core.
 PDF_FONTS = {
-    'Sans': ('DejaVuSans.ttf',), 'Sans-Bold': ('DejaVuSans-Bold.ttf',),
-    'Mono': ('DejaVuSansMono.ttf',), 'Mono-Bold': ('DejaVuSansMono-Bold.ttf',),
+    'Sans': 'DejaVuSans.ttf', 'Sans-Bold': 'DejaVuSans-Bold.ttf',
+    'Mono': 'DejaVuSansMono.ttf', 'Mono-Bold': 'DejaVuSansMono-Bold.ttf',
 }
 PDF_FONT_DIRS = ('/usr/share/fonts/truetype/dejavu', '/usr/share/fonts/dejavu', '/usr/share/fonts/TTF',
                  '/usr/share/fonts/truetype')
@@ -5353,17 +5459,10 @@ PDF_FONT_DIRS = ('/usr/share/fonts/truetype/dejavu', '/usr/share/fonts/dejavu', 
 def _pdf_fonts():
     from reportlab.pdfbase import pdfmetrics
     from reportlab.pdfbase.ttfonts import TTFont
-    for name, files in PDF_FONTS.items():
-        path = None
-        for d in PDF_FONT_DIRS:
-            for f in files:
-                if os.path.isfile(os.path.join(d, f)):
-                    path = os.path.join(d, f)
-                    break
-            if path:
-                break
+    for name, fname in PDF_FONTS.items():
+        path = next((os.path.join(d, fname) for d in PDF_FONT_DIRS if os.path.isfile(os.path.join(d, fname))), None)
         if not path:
-            die('не найден шрифт %s — установи fonts-dejavu-core' % files[0])
+            die('не найден шрифт %s — установи fonts-dejavu-core' % fname)
         pdfmetrics.registerFont(TTFont('XR-' + name, path))
 
 
@@ -5372,7 +5471,7 @@ def cmd_pdf(args):
     out_path, data_file = args[:2]
     try:
         from reportlab.pdfgen import canvas
-        from reportlab.lib.colors import HexColor, white
+        from reportlab.lib.colors import HexColor, white, Color
         from reportlab.lib.pagesizes import A4
         from reportlab.graphics.barcode.qr import QrCodeWidget
         from reportlab.graphics.shapes import Drawing
@@ -5389,196 +5488,502 @@ def cmd_pdf(args):
                 d[k] = v
 
     W, H = A4
-    M = 40                                         # page margin
-    INK, MUTED, FAINT = HexColor('#0F172A'), HexColor('#64748B'), HexColor('#94A3B8')
-    CARD, LINE = HexColor('#F5F7FB'), HexColor('#E3E8F0')
-    ACCENT, VIOLET, AMBER = HexColor('#0EA5E9'), HexColor('#7C3AED'), HexColor('#B45309')
-    GREEN = HexColor('#059669')
-    GRAD = ['#22D3EE', '#38BDF8', '#3B82F6', '#6366F1', '#8B5CF6', '#A855F7']
+    M = 34
+    INK, BODY, MUTED, FAINT = HexColor('#0B1020'), HexColor('#334155'), HexColor('#64748B'), HexColor('#94A3B8')
+    BG, CARD, LINE, FIELD = HexColor('#F4F6FB'), white, HexColor('#E2E8F0'), HexColor('#F8FAFC')
+    INDIGO, VIOLET, CYAN = HexColor('#4F46E5'), HexColor('#7C3AED'), HexColor('#06B6D4')
+    AMBER, GREEN, ROSE = HexColor('#D97706'), HexColor('#059669'), HexColor('#E11D48')
 
     tmp_path = out_path + '.tmp'
     c = canvas.Canvas(tmp_path, pagesize=A4)
     c.setTitle('3x-ui_reverse — %s' % d.get('domain', ''))
     c.setAuthor('3x-ui_reverse')
     c.setSubject('Параметры сервера')
-    state = {'y': 0, 'page': 1}
+    st = {'y': 0, 'page': 1}
 
-    def text(x, y, s, font='Sans', size=10, color=INK):
-        c.setFont('XR-' + font, size)
+    # ---------------------------------------------------------- primitives
+    def font(name, size):
+        c.setFont('XR-' + name, size)
+
+    def text(x, y, s, f='Sans', size=10, color=INK):
+        font(f, size)
         c.setFillColor(color)
         c.drawString(x, y, s)
 
-    def wrap(s, font, size, width):
-        """Lines that fit width: by words, long words (URLs, tokens) by characters."""
-        fn = 'XR-' + font
+    def rtext(x, y, s, f='Sans', size=10, color=INK):
+        font(f, size)
+        c.setFillColor(color)
+        c.drawRightString(x, y, s)
+
+    def sw(s, f, size):
+        return stringWidth(s, 'XR-' + f, size)
+
+    def fit(s, f, size, width, floor=7.0):
+        """Largest size <= size at which s fits width (down to floor)."""
+        while size > floor and sw(s, f, size) > width:
+            size -= 0.25
+        return size
+
+    def wrap(s, f, size, width):
         lines, cur = [], ''
         for word in re.findall(r'\S+\s*', s) or ['']:
-            if stringWidth(cur + word.rstrip(), fn, size) <= width:
+            if sw(cur + word.rstrip(), f, size) <= width:
                 cur += word
                 continue
             if cur:
                 lines.append(cur.rstrip())
                 cur = ''
             for ch in word:
-                if stringWidth(cur + ch, fn, size) > width and cur.strip():
+                if sw(cur + ch, f, size) > width and cur.strip():
                     lines.append(cur.rstrip())
                     cur = ''
                 cur += ch
         lines.append(cur.rstrip())
         return lines
 
+    def rrect(x, y, w, h, r, fill=None, stroke=None, width=0.8, alpha=None):
+        c.saveState()
+        if fill is not None:
+            c.setFillColor(fill)
+        if alpha is not None:          # after the colour: setFillColor resets alpha
+            c.setFillAlpha(alpha)
+        if stroke is not None:
+            c.setStrokeColor(stroke)
+            c.setLineWidth(width)
+        c.roundRect(x, y, w, h, r, stroke=1 if stroke is not None else 0, fill=1 if fill is not None else 0)
+        c.restoreState()
+
+    def gradient_rect(x, y, w, h, r, stops, diagonal=True):
+        c.saveState()
+        p = c.beginPath()
+        p.roundRect(x, y, w, h, r)
+        c.clipPath(p, stroke=0, fill=0)
+        c.linearGradient(x, y + h if diagonal else y, x + w, y, [HexColor(s) for s in stops], extend=True)
+        c.restoreState()
+
+    def shadow(x, y, w, h, r):
+        for i, a in ((6, 0.025), (3, 0.04), (1.2, 0.05)):
+            rrect(x - i / 2, y - i, w + i, h + i, r + i / 2, fill=HexColor('#0F172A'), alpha=a)
+
+    def link(url, x, y, w, h):
+        if url:
+            c.linkURL(url, (x, y, x + w, y + h), relative=0, thickness=0)
+
     def qr(value, x, y, size):
-        w = QrCodeWidget(value, barLevel='M')
-        b = w.getBounds()
+        wdg = QrCodeWidget(value, barLevel='M')
+        b = wdg.getBounds()
         bw, bh = b[2] - b[0], b[3] - b[1]
         dr = Drawing(size, size, transform=[size / bw, 0, 0, size / bh, 0, 0])
-        dr.add(w)
-        c.setFillColor(white)
-        c.roundRect(x - 6, y - 6, size + 12, size + 12, 8, stroke=0, fill=1)
+        dr.add(wdg)
         renderPDF.draw(dr, c, x, y)
 
+    def icon(x, y, glyph, color, size=26):
+        """Rounded tinted square with a glyph — like a website feature icon."""
+        rrect(x, y, size, size, 8, fill=color, alpha=0.12)
+        gs = size * 0.5
+        text(x + (size - sw(glyph, 'Sans-Bold', gs)) / 2, y + size * 0.3, glyph, 'Sans-Bold', gs, color)
+
+    def page_bg():
+        c.setFillColor(BG)
+        c.rect(0, 0, W, H, stroke=0, fill=1)
+
     def footer():
-        c.setStrokeColor(LINE)
-        c.setLineWidth(0.6)
-        c.line(M, 34, W - M, 34)
-        text(M, 22, '3x-ui_reverse %s  ·  создано %s' % (d.get('version', ''), d.get('date', '')),
-             size=7.5, color=FAINT)
-        s = 'стр. %d' % state['page']
-        text(W - M - stringWidth(s, 'XR-Sans', 7.5), 22, s, size=7.5, color=FAINT)
+        h = 46
+        c.setFillColor(INK)
+        c.rect(0, 0, W, h, stroke=0, fill=1)
+        gradient_rect(0, h - 2, W, 2, 0, ['#06B6D4', '#6366F1', '#A855F7'], diagonal=False)
+        text(M, 26, '◆ 3x-ui_reverse', 'Sans-Bold', 9, white)
+        text(M, 13, 'Создано %s · %s' % (d.get('date', ''), d.get('version', '')), 'Sans', 7, FAINT)
+        rtext(W - M, 26, 'Документ содержит пароль и токены — храни его в защищённом месте', 'Sans', 7, HexColor('#FCA5A5'))
+        rtext(W - M, 13, 'стр. %d' % st['page'], 'Sans', 7, FAINT)
 
     def new_page():
         footer()
         c.showPage()
-        state['page'] += 1
-        state['y'] = H - M
+        st['page'] += 1
+        page_bg()
+        st['y'] = H - M
 
-    def hero():
-        top = 156
-        c.setFillColor(HexColor('#0B1220'))
-        c.rect(0, H - top, W, top, stroke=0, fill=1)
-        # soft glow circles, clipped to the hero band
-        c.saveState()
-        clip = c.beginPath()
-        clip.rect(0, H - top, W, top)
-        c.clipPath(clip, stroke=0, fill=0)
-        for cx, cy, r, col, alpha in ((W - 60, H - 30, 150, '#0EA5E9', 0.18), (W - 200, H - 150, 105, '#8B5CF6', 0.20)):
-            c.setFillColor(HexColor(col))
-            c.setFillAlpha(alpha)
-            c.circle(cx, cy, r, stroke=0, fill=1)
-        c.restoreState()
-        # gradient stripe under the hero
-        seg = W / len(GRAD)
-        for i, col in enumerate(GRAD):
-            c.setFillColor(HexColor(col))
-            c.rect(i * seg, H - top - 4, seg + 1, 4, stroke=0, fill=1)
-        text(M, H - 52, '◆', 'Sans-Bold', 16, HexColor('#38BDF8'))
-        text(M + 22, H - 52, '3x-ui_reverse', 'Sans-Bold', 24, white)
-        text(M, H - 74, 'Параметры сервера и доступ к панели', 'Sans', 11, HexColor('#CBD5E1'))
-        text(M, H - 108, d.get('domain', ''), 'Sans-Bold', 20, HexColor('#7DD3FC'))
-        chips = [x for x in (d.get('proxy_label'), d.get('tls_label'), d.get('server_label'), d.get('bbr_label')) if x]
-        x = M
-        for chip in chips:
-            w = stringWidth(chip, 'XR-Sans', 8.5) + 18
-            c.saveState()
-            c.setFillColor(white)
-            c.setFillAlpha(0.10)
-            c.roundRect(x, H - 140, w, 18, 9, stroke=0, fill=1)
-            c.restoreState()
-            text(x + 9, H - 134, chip, 'Sans', 8.5, HexColor('#E2E8F0'))
-            x += w + 8
-        state['y'] = H - top - 22
-
-    def card(title, rows, accent=ACCENT, qr_value=None, qr_caption=None, note=None):
-        """rows: (label, value, kind) with kind in mono|text|path|secret."""
-        inner = W - 2 * M - 32
-        qr_size = 80 if qr_value else 0
-        val_w = inner - 118 - (qr_size + 22 if qr_value else 0)
-        laid = []
-        for label, value, kind in rows:
-            font = 'Mono-Bold' if kind == 'secret' else ('Mono' if kind in ('mono', 'path') else 'Sans')
-            size = 9.5
-            # Tokens and URLs: shrink a little before wrapping onto a 2nd line.
-            while size > 8 and ' ' not in (value or '') and \
-                    stringWidth(value or '', 'XR-' + font, size) > val_w:
-                size -= 0.25
-            lines = wrap(value or '—', font, size, val_w)
-            laid.append((label, lines, font, size, kind))
-        body_h = sum(max(1, len(l[1])) * 12.5 + 6.5 for l in laid)
-        note_h = 0
-        if note:
-            note_lines = wrap(note, 'Sans', 8, inner - (qr_size + 22 if qr_value else 0))
-            note_h = len(note_lines) * 11 + 6
-        h = 26 + max(body_h + note_h, qr_size + 26 if qr_value else 0) + 10
-        if state['y'] - h < 50:
+    def need(h):
+        if st['y'] - h < 62:
             new_page()
-        top = state['y']
-        c.setFillColor(CARD)
-        c.roundRect(M, top - h, W - 2 * M, h, 12, stroke=0, fill=1)
-        c.setFillColor(accent)
-        c.roundRect(M, top - h, 4, h, 2, stroke=0, fill=1)
-        text(M + 16, top - 20, title.upper(), 'Sans-Bold', 8.5, accent)
-        y = top - 39
-        for label, lines, font, size, kind in laid:
-            text(M + 16, y, label, 'Sans', 9, MUTED)
-            color = AMBER if kind == 'path' else (VIOLET if kind == 'secret' else INK)
-            for i, ln in enumerate(lines):
-                text(M + 16 + 118, y - i * 12.5, ln, font, size, color)
-            y -= max(1, len(lines)) * 12.5 + 6.5
-        if note:
-            for i, ln in enumerate(note_lines):
-                text(M + 16, y - 2 - i * 11, ln, 'Sans', 8, MUTED)
-        if qr_value:
-            qx, qy = W - M - 16 - qr_size, top - 30 - qr_size
-            qr(qr_value, qx, qy, qr_size)
-            if qr_caption:
-                cw = stringWidth(qr_caption, 'XR-Sans', 7.5)
-                text(qx + (qr_size - cw) / 2, qy - 18, qr_caption, 'Sans', 7.5, MUTED)
-        state['y'] = top - h - 11
 
-    hero()
-    card('Сайт и HTTPS', [
-        ('Домен', 'https://%s' % d.get('domain', ''), 'text'),
-        ('Веб-сервер', d.get('proxy_line', ''), 'text'),
-        ('TLS-сертификаты', d.get('certpath', ''), 'mono'),
-    ])
+    def section(eyebrow, title, subtitle='', body=0):
+        need(60 + body)                # keep the heading with its content
+        y = st['y']
+        text(M, y - 10, eyebrow.upper(), 'Sans-Bold', 7.5, INDIGO)
+        text(M, y - 30, title, 'Sans-Bold', 17, INK)
+        if subtitle:
+            text(M, y - 46, subtitle, 'Sans', 9, MUTED)
+            st['y'] = y - 60
+        else:
+            st['y'] = y - 44
+
+    # ---------------------------------------------------------- navbar
+    page_bg()
+    nav_h = 48
+    c.setFillColor(white)
+    c.rect(0, H - nav_h, W, nav_h, stroke=0, fill=1)
+    c.setStrokeColor(LINE)
+    c.setLineWidth(0.6)
+    c.line(0, H - nav_h, W, H - nav_h)
+    gradient_rect(M, H - nav_h + 12, 24, 24, 7, ['#06B6D4', '#6366F1', '#A855F7'])
+    text(M + 6.5, H - nav_h + 19.5, '3x', 'Sans-Bold', 9, white)
+    text(M + 32, H - nav_h + 19, '3x-ui_reverse', 'Sans-Bold', 12, INK)
+    x = W - M
+    pill = '● В работе'
+    pw = sw(pill, 'Sans-Bold', 8) + 18
+    rrect(x - pw, H - nav_h + 14, pw, 20, 10, fill=GREEN, alpha=0.12)
+    text(x - pw + 9, H - nav_h + 20.5, pill, 'Sans-Bold', 8, GREEN)
+    x -= pw + 16
+    for item in reversed(('Сервер', 'Доступ', 'Подписки')):
+        iw = sw(item, 'Sans', 8.5)
+        text(x - iw, H - nav_h + 20.5, item, 'Sans', 8.5, MUTED)
+        x -= iw + 16
+
+    # ---------------------------------------------------------- hero
+    hero_top = H - nav_h - 18
+    hero_h = 214
+    hx, hy, hw = M, hero_top - hero_h, W - 2 * M
+    shadow(hx, hy, hw, hero_h, 18)
+    gradient_rect(hx, hy, hw, hero_h, 18, ['#1E1B4B', '#4338CA', '#7C3AED', '#0891B2'])
+    c.saveState()                       # decorative rings
+    p = c.beginPath()
+    p.roundRect(hx, hy, hw, hero_h, 18)
+    c.clipPath(p, stroke=0, fill=0)
+    c.setStrokeColor(white)
+    for r, a in ((150, 0.07), (110, 0.08), (70, 0.09)):
+        c.setStrokeAlpha(a)
+        c.setLineWidth(18)
+        c.circle(hx + hw - 40, hy + hero_h - 10, r, stroke=1, fill=0)
+    c.restoreState()
+    qr_box = 132
+    content_w = hw - qr_box - 64
+    eyebrow = 'СЕРВЕР ГОТОВ К РАБОТЕ'
+    ew = sw(eyebrow, 'Sans-Bold', 7.5) + 20
+    rrect(hx + 26, hy + hero_h - 44, ew, 18, 9, fill=white, alpha=0.16)
+    text(hx + 36, hy + hero_h - 38, eyebrow, 'Sans-Bold', 7.5, white)
+    dom = d.get('domain', '')
+    ds = fit(dom, 'Sans-Bold', 28, content_w, 14)
+    text(hx + 26, hy + hero_h - 82, dom, 'Sans-Bold', ds, white)
+    sub = 'Панель 3x-ui за HTTPS-прокси: снаружи сервер выглядит как обычный сайт, панель и подписки скрыты за секретными путями.'
+    for i, ln in enumerate(wrap(sub, 'Sans', 9.5, content_w)[:3]):
+        text(hx + 26, hy + hero_h - 104 - i * 14, ln, 'Sans', 9.5, HexColor('#E0E7FF'))
+    # buttons
+    by = hy + 30
+    bx = hx + 26
     if d.get('panel_url'):
-        rows = [('Адрес панели', d['panel_url'], 'mono'),
-                ('Логин', d.get('user', ''), 'secret'),
-                ('Пароль', d.get('pass', ''), 'secret'),
-                ('Порт (127.0.0.1)', d.get('port', ''), 'mono')]
-        if d.get('node_token'):
-            rows.append(('API-токен узла', d['node_token'], 'mono'))
-        card('Панель 3x-ui', rows, accent=VIOLET, qr_value=d['panel_url'], qr_caption='адрес панели',
-             note='API-токен узла нужен, чтобы подключить эту панель к мастер-панели как узел.'
-             if d.get('node_token') else None)
-        card('Подписки', [
-            ('Обычная / VLESS', d.get('sub', ''), 'path'),
-            ('JSON', d.get('json', ''), 'path'),
-            ('Mihomo / Clash', d.get('clash', ''), 'path'),
-        ], accent=AMBER, note='Полный адрес: https://%s<путь>SUB_ID, где SUB_ID — Sub ID пользователя '
-                             '(карточка пользователя в меню «Пользователи»).' % d.get('domain', ''))
+        label = 'Открыть панель  →'
+        bw = sw(label, 'Sans-Bold', 9.5) + 32
+        rrect(bx, by, bw, 30, 15, fill=white)
+        text(bx + 16, by + 10.5, label, 'Sans-Bold', 9.5, INDIGO)
+        link(d['panel_url'], bx, by, bw, 30)
+        bx += bw + 10
     if d.get('user1_sub'):
-        card('Пользователь user1', [
-            ('Подписка', d['user1_sub'], 'mono'),
-            ('JSON', d.get('user1_json', ''), 'mono'),
-            ('Mihomo / Clash', d.get('user1_clash', ''), 'mono'),
-        ], accent=GREEN, qr_value=d['user1_sub'], qr_caption='подписка user1',
-            note='Отсканируй QR в Happ, v2rayNG, Streisand или Hiddify.')
-    # warning strip
-    msg = 'Документ содержит пароль и токены доступа. Не пересылай его посторонним и храни в защищённом месте.'
-    lines = wrap(msg, 'Sans', 8.5, W - 2 * M - 44)
-    h = 18 + len(lines) * 12
-    if state['y'] - h < 50:
-        new_page()
-    c.setFillColor(HexColor('#FFF7ED'))
-    c.roundRect(M, state['y'] - h, W - 2 * M, h, 10, stroke=0, fill=1)
-    text(M + 14, state['y'] - 18, '⚠', 'Sans-Bold', 11, HexColor('#EA580C'))
-    for i, ln in enumerate(lines):
-        text(M + 32, state['y'] - 17 - i * 12, ln, 'Sans', 8.5, HexColor('#9A3412'))
+        label = 'Подписка user1'
+        bw = sw(label, 'Sans-Bold', 9.5) + 32
+        rrect(bx, by, bw, 30, 15, stroke=white, width=1)
+        text(bx + 16, by + 10.5, label, 'Sans-Bold', 9.5, white)
+        link(d['user1_sub'], bx, by, bw, 30)
+    # QR card
+    if d.get('panel_url'):
+        qx, qy = hx + hw - qr_box - 24, hy + (hero_h - qr_box - 18) / 2 + 8
+        rrect(qx, qy - 18, qr_box, qr_box + 18, 14, fill=white)
+        qr(d['panel_url'], qx + 12, qy - 4, qr_box - 24)
+        cap = 'Сканируй — откроется панель'
+        text(qx + (qr_box - sw(cap, 'Sans', 7)) / 2, qy - 11, cap, 'Sans', 7, MUTED)
+    st['y'] = hy - 20
+
+    # ---------------------------------------------------------- feature tiles
+    tiles = [('⚙', INDIGO, 'Веб-сервер', d.get('proxy_label', '—')),
+             ('⌂', CYAN, 'Сервер', d.get('server_label') or '—'),
+             ('⚡', AMBER, 'Сеть', d.get('bbr_label') or 'стандартная'),
+             ('✓', GREEN, 'Сертификат', d.get('tls_label') or '—')]
+    gap = 10
+    tw = (W - 2 * M - gap * 3) / 4
+    th = 64
+    for i, (g, col, title, val) in enumerate(tiles):
+        tx = M + i * (tw + gap)
+        ty = st['y'] - th
+        shadow(tx, ty, tw, th, 12)
+        rrect(tx, ty, tw, th, 12, fill=CARD)
+        icon(tx + 12, ty + th - 36, g, col, 24)
+        text(tx + 44, ty + th - 22, title, 'Sans', 7.5, MUTED)
+        vs = fit(val, 'Sans-Bold', 9.5, tw - 24, 7)
+        text(tx + 12, ty + 12, val, 'Sans-Bold', vs, INK)
+    st['y'] -= th + 26
+
+    # ---------------------------------------------------------- access
+    if d.get('panel_url'):
+        section('Доступ', 'Вход в панель 3x-ui', 'Панель слушает только 127.0.0.1 — снаружи она доступна лишь по секретному пути.',
+                body=18 + (3 if d.get('node_token') else 2) * 48)
+        fields = [('Адрес панели', d['panel_url'], 'Mono', INK, True),
+                  ('Логин', d.get('user', ''), 'Mono-Bold', VIOLET, False),
+                  ('Пароль', d.get('pass', ''), 'Mono-Bold', VIOLET, False)]
+        if d.get('node_token'):
+            fields.append(('API-токен узла · для подключения к мастер-панели', d['node_token'], 'Mono', INK, False))
+        layout = [[fields[0]], fields[1:3]] + ([[fields[3]]] if len(fields) > 3 else [])
+        card_h = 18 + len(layout) * 48
+        need(card_h)
+        cy = st['y'] - card_h
+        shadow(M, cy, W - 2 * M, card_h, 14)
+        rrect(M, cy, W - 2 * M, card_h, 14, fill=CARD)
+        fy = st['y'] - 18
+        for line in layout:
+            n = len(line)
+            fw = (W - 2 * M - 32 - (n - 1) * 16) / n
+            for j, (label, val, f, col, is_url) in enumerate(line):
+                fx = M + 16 + j * (fw + 16)
+                text(fx, fy - 8, label, 'Sans-Bold', 7.5, MUTED)
+                rrect(fx, fy - 40, fw, 26, 8, fill=FIELD, stroke=LINE, width=0.8)
+                vs = fit(val, f, 10, fw - 22, 7)
+                text(fx + 11, fy - 31, val, f, vs, col)
+                if is_url:
+                    link(val, fx, fy - 40, fw, 26)
+            fy -= 48
+        st['y'] = cy - 26
+
+    # ---------------------------------------------------------- subscriptions
+    if d.get('sub'):
+        section('Подписки', 'Три формата для любых клиентов',
+                'Полный адрес: https://%s<путь>SUB_ID — Sub ID есть в карточке пользователя.' % d.get('domain', ''),
+                body=104)
+        subs = [('Обычная', 'VLESS · Trojan · MTProto', d.get('sub', ''), 'Happ, v2rayNG, Streisand, Hiddify', INDIGO),
+                ('JSON', 'конфигурация Xray', d.get('json', ''), 'v2rayN, v2rayNG', CYAN),
+                ('Mihomo / Clash', 'YAML-профиль', d.get('clash', ''), 'Clash Verge, FlClash, Mihomo', VIOLET)]
+        cw = (W - 2 * M - 2 * 12) / 3
+        ch = 104
+        need(ch)
+        for i, (title, kind, path, apps, col) in enumerate(subs):
+            x0 = M + i * (cw + 12)
+            y0 = st['y'] - ch
+            shadow(x0, y0, cw, ch, 14)
+            rrect(x0, y0, cw, ch, 14, fill=CARD)
+            c.saveState()                  # accent stripe along the card's rounded top
+            p = c.beginPath()
+            p.roundRect(x0, y0, cw, ch, 14)
+            c.clipPath(p, stroke=0, fill=0)
+            p2 = c.beginPath()
+            p2.rect(x0, y0 + ch - 4, cw, 4)
+            c.clipPath(p2, stroke=0, fill=0)
+            c.linearGradient(x0, y0, x0 + cw, y0, [HexColor(h) for h in
+                             (['#06B6D4', '#6366F1'] if i != 2 else ['#8B5CF6', '#EC4899'])], extend=True)
+            c.restoreState()
+            text(x0 + 14, y0 + ch - 24, title, 'Sans-Bold', 11, INK)
+            text(x0 + 14, y0 + ch - 37, kind, 'Sans', 7.5, MUTED)
+            rrect(x0 + 12, y0 + 34, cw - 24, 22, 7, fill=AMBER, alpha=0.10)
+            ps = fit(path, 'Mono-Bold', 9, cw - 40, 6.5)
+            text(x0 + 20, y0 + 41.5, path, 'Mono-Bold', ps, AMBER)
+            for k, ln in enumerate(wrap(apps, 'Sans', 7, cw - 28)[:2]):
+                text(x0 + 14, y0 + 20 - k * 9, ln, 'Sans', 7, MUTED)
+        st['y'] -= ch + 26
+
+    # ---------------------------------------------------------- user1
+    if d.get('user1_sub'):
+        section('Быстрый старт', 'Подключи первое устройство',
+                'Отсканируй QR в приложении или скопируй ссылку подписки пользователя user1.', body=136)
+        links = [('Обычная', d['user1_sub']), ('JSON', d.get('user1_json', '')), ('Mihomo / Clash', d.get('user1_clash', ''))]
+        box = 108
+        ch = box + 28
+        need(ch)
+        y0 = st['y'] - ch
+        shadow(M, y0, W - 2 * M, ch, 14)
+        rrect(M, y0, W - 2 * M, ch, 14, fill=CARD)
+        rrect(M + 14, y0 + 14, box, box, 12, fill=FIELD, stroke=LINE)
+        qr(d['user1_sub'], M + 20, y0 + 20, box - 12)
+        lx = M + 14 + box + 18
+        lw = W - M - 16 - lx
+        ly = y0 + ch - 22
+        for label, url in links:
+            text(lx, ly, label, 'Sans-Bold', 7.5, MUTED)
+            rrect(lx, ly - 27, lw, 20, 7, fill=FIELD, stroke=LINE, width=0.7)
+            us = fit(url, 'Mono', 8.5, lw - 18, 6)
+            text(lx + 9, ly - 20.5, url, 'Mono', us, INK)
+            link(url, lx, ly - 27, lw, 20)
+            ly -= 38
+        st['y'] = y0 - 22
+
+    # ---------------------------------------------------------- server details
+    section('Сервер', 'Технические детали', body=100)
+    rows = [('Домен', 'https://%s' % d.get('domain', '')), ('Веб-сервер', d.get('proxy_line', '')),
+            ('TLS-сертификаты', d.get('certpath', '')), ('Порт панели (локальный)', d.get('port', '') or '—')]
+    rh = 22
+    ch = 10 + len(rows) * rh
+    need(ch)
+    y0 = st['y'] - ch
+    shadow(M, y0, W - 2 * M, ch, 14)
+    rrect(M, y0, W - 2 * M, ch, 14, fill=CARD)
+    ry = st['y'] - 20
+    for i, (k, v) in enumerate(rows):
+        if i:
+            c.setStrokeColor(LINE)
+            c.setLineWidth(0.5)
+            c.line(M + 14, ry + 14, W - M - 14, ry + 14)
+        text(M + 16, ry, k, 'Sans', 8.5, MUTED)
+        vs = fit(v, 'Mono', 8.5, W - 2 * M - 200, 6.5)
+        rtext(W - M - 16, ry, v, 'Mono', vs, BODY)
+        ry -= rh
+    st['y'] = y0 - 10
+
     footer()
     c.save()
     os.chmod(tmp_path, 0o600)
     os.replace(tmp_path, out_path)
+
+
+# ------------------------------------------------------------------ iPerf3 to Russia
+# Public iperf3 servers of Russian providers; the list (primary + fallback per
+# city) follows github.com/itdoginfo/russian-iperf3-servers.
+IPERF_RU = [
+    ('Москва', 'spd-rudp.hostkey.ru', 'Тверь', 'st.tver.ertelecom.ru'),
+    ('Санкт-Петербург', 'st.spb.ertelecom.ru', 'Ярославль', 'st.yar.ertelecom.ru'),
+    ('Нижний Новгород', 'st.nn.ertelecom.ru', 'Нижний Новгород', 'speed-nn.vtt.net'),
+    ('Челябинск', 'st.chel.ertelecom.ru', 'Магнитогорск', 'st.mgn.ertelecom.ru'),
+    ('Тюмень', 'st.tmn.ertelecom.ru', 'Красноярск', 'st.krsk.ertelecom.ru'),
+]
+IPERF_PORTS = range(5201, 5210)
+
+
+def iperf_servers():
+    """XR_IPERF="Город=host[,Город=host…]" replaces the built-in list."""
+    custom = os.environ.get('XR_IPERF', '').strip()
+    if not custom:
+        return IPERF_RU
+    out = []
+    for item in custom.split(','):
+        city, _, host = item.partition('=')
+        if city.strip() and host.strip():
+            out.append((city.strip(), host.strip(), '', ''))
+    return out or IPERF_RU
+
+
+def _iperf_run(host, port, reverse, secs, streams=8):
+    """One iperf3 run -> (result dict | None, error text, retry_other_port)."""
+    import subprocess
+    cmd = ['iperf3', '-c', host, '-p', str(port), '-t', str(secs), '-P', str(streams), '-J',
+           '--connect-timeout', '4000'] + (['-R'] if reverse else [])
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=secs + 20)
+    except subprocess.TimeoutExpired:
+        return None, 'таймаут', True
+    except FileNotFoundError:
+        die('iperf3 не установлен')
+    try:
+        j = json.loads(r.stdout)
+    except ValueError:
+        return None, (r.stderr or r.stdout or 'нет ответа').strip().splitlines()[-1][:80], True
+    err = (j.get('error') or '').lower()
+    if err:
+        hard = any(s in err for s in ('resolve', 'name or service', 'no route', 'network is unreachable'))
+        return None, j.get('error', '')[:80], not hard
+    end = j.get('end') or {}
+    bps = (end.get('sum_received') or {}).get('bits_per_second') or \
+        (end.get('sum_sent') or {}).get('bits_per_second') or 0
+    rtts = [((s.get('sender') or {}).get('mean_rtt') or 0) for s in end.get('streams') or []]
+    rtts = [x for x in rtts if x]
+    return {'mbps': bps / 1e6, 'rtt': (sum(rtts) / len(rtts) / 1000) if rtts else None}, '', False
+
+
+def _iperf_host(host, secs):
+    """Upload (VPS -> server) and download (server -> VPS) on the first free port."""
+    last = 'нет свободного порта'
+    for port in IPERF_PORTS:
+        up, err, retry = _iperf_run(host, port, False, secs)
+        if not up:
+            last = err or last
+            if retry:
+                continue
+            break
+        down = None
+        for p2 in [port] + [p for p in IPERF_PORTS if p != port]:
+            down, err, retry = _iperf_run(host, p2, True, secs)
+            if down or not retry:
+                break
+        return {'up': up['mbps'], 'down': down['mbps'] if down else None, 'rtt': up['rtt'],
+                'port': port}, ''
+    return None, last
+
+
+def cmd_iperf_cities(args):
+    for city, *_ in iperf_servers():
+        print(city)
+
+
+def cmd_iperf_city(args):
+    """iperf-city INDEX SECONDS -> one JSON line."""
+    i, secs = int(args[0]), int(args[1])
+    city, host, fcity, fhost = iperf_servers()[i]
+    res, err = _iperf_host(host, secs)
+    used_city, used_host, fallback = city, host, False
+    if not res and fhost:
+        res2, err2 = _iperf_host(fhost, secs)
+        if res2:
+            res, used_city, used_host, fallback = res2, fcity, fhost, True
+        else:
+            err = err or err2
+    row = {'city': city, 'via': used_city if fallback else '', 'host': used_host, 'error': '' if res else err}
+    if res:
+        row.update(res)
+    print(json.dumps(row, ensure_ascii=False))
+
+
+def _speed(v):
+    if v is None:
+        return c('dim', '—')
+    if v >= 1000:
+        return '%.2f Гбит/с' % (v / 1000)
+    return '%.0f Мбит/с' % v if v >= 10 else '%.1f Мбит/с' % v
+
+
+def _iperf_reason(err):
+    e = (err or '').lower()
+    if 'busy' in e or 'свободного' in e:
+        return 'занят другими тестами — повтори позже'
+    if 'name or service' in e or 'resolve' in e:
+        return 'сервер не найден в DNS'
+    if 'таймаут' in e or 'timed out' in e or 'timeout' in e:
+        return 'нет ответа (таймаут)'
+    if 'unable to connect' in e or 'refused' in e or 'unreachable' in e or 'no route' in e:
+        return 'не отвечает (закрыт или блокирует этот VPS)'
+    return 'ошибка: ' + (err or '?')[:50]
+
+
+def _vpad(s, w):
+    return s + ' ' * max(0, w - len(MARK_RE.sub('', s)))
+
+
+def cmd_iperf_table(args):
+    rows = []
+    with open(args[0], encoding='utf-8') as fh:
+        for line in fh:
+            try:
+                rows.append(json.loads(line))
+            except ValueError:
+                pass
+    if not rows:
+        out(c('red', '✗ Нет результатов.'))
+        return
+    peak = max([r.get('up') or 0 for r in rows] + [1])
+    bar_w = 14
+    out(c('dim', '  %-18s  %-*s %-13s %-13s %s' % ('ГОРОД', bar_w + 14, 'VPS → РФ (отдача)', 'РФ → VPS', 'ПИНГ', '')))
+    for r in rows:
+        name = r['city'] + (' → ' + r['via'] if r.get('via') else '')
+        if r.get('error'):
+            out('  %s  %s' % (_vpad(name, 18), c('red', '✗ ' + _iperf_reason(r['error']))))
+            continue
+        up = r.get('up') or 0
+        filled = max(1, round(bar_w * up / peak)) if up else 0
+        bar = c('green' if up >= 300 else ('yellow' if up >= 50 else 'red'), '█' * filled) + c('dim', '░' * (bar_w - filled))
+        rtt = ('%.0f мс' % r['rtt']) if r.get('rtt') else '—'
+        out('  %s  %s %s %s %s' % (_vpad(name, 18), bar, _vpad(_speed(r.get('up')), 13),
+                                   _vpad(_speed(r.get('down')), 13), rtt))
+    ok_rows = [r for r in rows if not r.get('error')]
+    out('')
+    if ok_rows:
+        avg_up = sum(r.get('up') or 0 for r in ok_rows) / len(ok_rows)
+        out('  Средняя отдача в РФ: %s · отвечают %d из %d серверов' % (c('accent', _speed(avg_up)), len(ok_rows), len(rows)))
+    out(c('dim', '  «VPS → РФ» — с какой скоростью сервер отдаёт данные клиентам в России (главное для VPN).'))
+    out(c('dim', '  Серверы: github.com/itdoginfo/russian-iperf3-servers'))
 
 
 # ------------------------------------------------------------ self-update
@@ -5662,6 +6067,7 @@ COMMANDS = {
     'parse-url': cmd_parse_url, 'node-add': cmd_node_add, 'nodes': cmd_nodes, 'nodes-count': cmd_nodes_count,
     'menu-nodes': cmd_menu_nodes, 'node-card': cmd_node_card, 'node-del': cmd_node_del,
     'node-enable': cmd_node_enable, 'node-probe': cmd_node_probe, 'pdf': cmd_pdf,
+    'iperf-cities': cmd_iperf_cities, 'iperf-city': cmd_iperf_city, 'iperf-table': cmd_iperf_table,
 }
 
 if __name__ == '__main__':
@@ -6549,6 +6955,8 @@ class TUI:
 
     def idle(self):
         """Between requests: animate the gauge or the 'busy' spinner, eat keys."""
+        if getattr(self, 'suspended', False):
+            return                      # another program owns the terminal
         if self.splash:
             self.draw_splash()
         elif self.gauge:
@@ -6605,8 +7013,10 @@ class TUI:
             return 0, ''
         if cmd == 'suspend':
             self.c.endwin()
+            self.suspended = True
             return 0, ''
         if cmd == 'resume':
+            self.suspended = False
             self.scr.clear()
             self.scr.refresh()
             return 0, ''
@@ -6616,7 +7026,8 @@ class TUI:
 
     def loop(self):
         while True:
-            line = self.read_request(0.1 if (self.gauge or self.busy_since or self.splash) else None)
+            busy = (self.gauge or self.busy_since or self.splash) and not getattr(self, 'suspended', False)
+            line = self.read_request(0.1 if busy else None)
             if line is None:
                 return
             if line == '':
@@ -7007,6 +7418,9 @@ manager(){
          groups $'Группы\t{dim}массовые действия{/}' \
          inbounds $'Inbound-ы\t{dim}VLESS, Trojan, Hysteria2, AmneziaWG, MTProto{/}' \
          nodes $'Подключить узел\t{dim}другие серверы 3x-ui под управлением этой панели{/}' \
+         '#Диагностика' '' \
+         diag $'Диагностика сервера\t{dim}iPerf3 до РФ, IP Region, Censorcheck DPI{/}' \
+         multitest $'Multitest by @saveksme\t{dim}полный набор тестов сервера{/}' \
          '#Система' '' \
          settings $'Настройки панели\t{dim}порты, пути, логин{/}' \
          service $'Обслуживание\t{dim}перезапуск, переустановка{/}' \
@@ -7021,6 +7435,8 @@ manager(){
       groups) menu_groups ;;
       inbounds) menu_inbounds ;;
       nodes) menu_nodes ;;
+      diag) menu_diag ;;
+      multitest) diag_multitest ;;
       settings) menu_settings ;;
       service) menu_service ;;
       version) menu_version ;;
@@ -7070,6 +7486,9 @@ usage(){
   info | status                         параметры и ссылки | состояние служб
   pdf                                   (пере)создать PDF с параметрами
   bbr [on|off]                          TCP BBR + CAKE: состояние | включить | выключить
+  diag iperf [--full]                   скорость до 5 городов России (iPerf3)
+  diag ipregion | diag dpi              IP Region / Censorcheck DPI (оригинальные скрипты)
+  multitest                             Multitest by @saveksme (оригинальный скрипт)
   users [list]                          пользователи: группа, inbound-ы, трафик, активность
   users show NAME                       карточка и ссылки подписки
   users add NAME [--gb N] [--days N] [--group G] [--inbounds 1,2,3]
@@ -7095,7 +7514,7 @@ usage(){
 
 Служебные: --repair  --demo  --uninstall  --remove-command  --restore-command
 
-Переменные: XR_UI=cli|tui  XR_SNI=a.com,b.com,c.com  XR_SNIFF=route|metadata
+Переменные: XR_IPERF='Город=host,…'  XR_UI=cli|tui  XR_SNI=a.com,b.com,c.com  XR_SNIFF=route|metadata
             XR_COUNTRY=NL|none  XR_REPO=owner/name  NO_COLOR=1
 EOF
 }
@@ -7125,6 +7544,24 @@ cli_cmd(){
       pdf_ready || pdf_install_deps || die 'Не удалось установить python3-reportlab и fonts-dejavu-core.'
       write_pdf || die "Не удалось сформировать PDF (см. $LOG)."
       printf 'PDF: %s\nСкачать: %s\n' "$PDF_FILE" "$(pdf_download_hint)" ;;
+    diag|multitest)
+      [[ $EUID -eq 0 ]] || die 'Запусти через sudo.'
+      [[ -r "$STATE" ]] && load_state
+      if [[ ! -d "$BASE" ]]; then      # not installed: work from a temporary dir
+        local d; d=$(mktemp -d "${TMPDIR:-/tmp}/3xr-diag.XXXXXXXX")
+        HELPER=$d/xr_helper.py; HELPER_STATE=$d; LOG=$d/diag.log
+      fi
+      write_helper
+      if [[ "$cmd" == multitest ]]; then run_external 'Multitest by @saveksme' "$MULTITEST_URL"; return; fi
+      case "$sub" in
+        iperf)
+          local res secs=3; [[ "${3:-}" == --full ]] && secs=10
+          res=$(mktemp); iperf_run "$secs" "$res" || die 'iPerf3: тест не выполнен.'
+          helper iperf-table "$res"; rm -f -- "$res" ;;
+        ipregion) run_external 'IP Region (Davoyan/ipregion)' "$DIAG_IPREGION_URL" ;;
+        dpi) run_external 'Censorcheck DPI (vernette/censorcheck)' "$DIAG_CENSOR_URL" --mode dpi ;;
+        *) die 'diag iperf [--full] | diag ipregion | diag dpi' ;;
+      esac ;;
     bbr)
       [[ $EUID -eq 0 ]] || die 'Запусти через sudo.'; load_state
       case "$sub" in
@@ -7305,7 +7742,7 @@ if [[ "${XUI_REVERSE_LIB_ONLY:-0}" != 1 ]]; then
     --remove-command) remove_manager_command || : ;;
     --restore-command) restore_manager_command ;;
     --help|-h|help) usage ;;
-    info|status|pdf|bbr|users|groups|inbounds|node|nodes|version|update) cli_cmd "$@" ;;
+    info|status|pdf|bbr|diag|multitest|users|groups|inbounds|node|nodes|version|update) cli_cmd "$@" ;;
     '') main_interactive ;;
     *) die "Неизвестный параметр: $1 (см. --help)" ;;
   esac
