@@ -6,7 +6,7 @@ set -Eeuo pipefail
 umask 077
 
 # Release version = the git tag of the commit this file comes from.
-VERSION=v2.4.1
+VERSION=v2.5.0
 # GitHub repository (owner/name) that publishes tagged releases of this script.
 # Can also be set from the "Версия" screen or with XR_REPO=owner/name.
 DEFAULT_REPO='dohuyanevezuch/3x-ui_reverse'
@@ -3427,8 +3427,7 @@ start_menu(){
 {dim}$os · $(hostname 2>/dev/null || echo VPS){/}" \
          install $'Установить 3x-ui + прокси\t{dim}Caddy или Nginx, HTTPS, сайт-заглушка{/}' \
          dns $'Проверить DNS-записи\t{dim}куда указывает домен в 16 DNS мира{/}' \
-         diag $'Диагностика сервера\t{dim}iPerf3 до РФ, IP Region, Censorcheck DPI{/}' \
-         multitest $'Multitest by @saveksme\t{dim}полный набор тестов сервера{/}' \
+         diag $'Диагностика сервера\t{dim}iPerf3 до РФ, IP Region{/}' \
          quit '{dim}Выход{/}') || return 0
     case "$ch" in
       install)
@@ -3436,16 +3435,13 @@ start_menu(){
         DOMAIN='' ;;
       dns) dns_standalone ;;
       diag) menu_diag ;;
-      multitest) diag_multitest ;;
       quit) return 0 ;;
     esac
   done
 }
 
-# ---- Diagnostics: iPerf3 to Russia (own screen) and original third-party tests
+# ---- Diagnostics: iPerf3 to Russia and IP Region (original script, our table)
 DIAG_IPREGION_URL='https://github.com/Davoyan/ipregion/raw/main/ipregion.sh'
-DIAG_CENSOR_URL='https://github.com/vernette/censorcheck/raw/master/censorcheck.sh'
-MULTITEST_URL='https://github.com/saveksme/multitest/raw/master/multitest.sh'
 
 iperf_ensure(){
   command -v iperf3 >/dev/null 2>&1 && return 0
@@ -3488,55 +3484,86 @@ diag_iperf(){
   rm -f -- "$res"
 }
 
-# run_external TITLE URL [ARGS…] — download an original script and run it in
-# the terminal; the TUI steps aside meanwhile.
-run_external(){
-  local title=$1 url=$2 tmp rc=0; shift 2
-  tmp=$(mktemp "${UI_DIR:-${TMPDIR:-/tmp}}/ext.XXXXXXXX")
-  if ! with_progress "$title" 'Скачиваем скрипт с GitHub' \
-       run curl -fsSL --retry 2 --connect-timeout 10 --max-time 120 -o "$tmp" "$url" ||
-     ! bash -n "$tmp" 2>/dev/null; then
-    rm -f -- "$tmp"
-    tui_msg "$title" "{red}✗ Не удалось скачать скрипт:{/} $url"
-    return 0
+# run_capture OUT command… — like run(), but stdout goes to OUT.
+run_capture(){
+  local out=$1; shift
+  if [[ $UI_MODE == tui ]]; then
+    "$@" </dev/null >"$out" 2>>"$LOG" {TUI_REQ}>&- {TUI_RESP}>&- {UI_OUT_FD}>&- {UI_ERR_FD}>&-
+  else
+    "$@" </dev/null >"$out" 2>>"$LOG"
   fi
-  tui_suspend
-  {
-    printf '\033[H\033[2J'
-    printf '\033[1;36m◆ %s\033[0m\n\033[2m%s\033[0m\n\033[2mCtrl+C — прервать тест\033[0m\n\n' "$title" "$url"
-  } >/dev/tty
-  # A handler (not an ignore) for INT: Ctrl+C stops the test, not this menu.
-  trap ':' INT
-  bash "$tmp" "$@" </dev/tty >/dev/tty 2>&1 {TUI_REQ}>&- {TUI_RESP}>&- || rc=$?
-  trap 'exit 130' INT
-  printf '\n\033[2m%s — Enter, чтобы вернуться в 3x-ui_reverse\033[0m' \
-    "$( ((rc == 0)) && echo 'Готово' || echo "Завершено с кодом $rc")" >/dev/tty
-  read -r _ </dev/tty || :
-  tui_resume
-  rm -f -- "$tmp"
 }
-diag_multitest(){
-  tui_yesno 'Multitest by @saveksme' "Интерактивный набор тестов сервера: IP Region, Censorcheck,
-iPerf3, YABS, bench.sh, IPQuality и другие ({accent}github.com/saveksme/multitest{/}).
-
-{yellow}⚠ Это сторонний скрипт:{/} он сам ставит нужные пакеты, а в конце загружает картинку
-с результатами (IP замаскированы, есть строка спонсора) на imgdb.io.
-Перед запуском он будет скачан с GitHub." 'Запустить' 'Отмена' yes || return 0
-  run_external 'Multitest by @saveksme' "$MULTITEST_URL"
+# IP Region: the original Davoyan/ipregion runs in the background (JSON mode)
+# while the gauge spins; its results are shown as our own table.
+ipregion_deps(){
+  local -a pkgs=()
+  command -v curl >/dev/null 2>&1 || pkgs+=(curl)
+  command -v jq >/dev/null 2>&1 || pkgs+=(jq)
+  if ((${#pkgs[@]})) || ! command -v column >/dev/null 2>&1; then
+    run apt-get update || :
+    ((${#pkgs[@]})) && { run env DEBIAN_FRONTEND=noninteractive apt-get install -y "${pkgs[@]}" || return 1; }
+    if ! command -v column >/dev/null 2>&1; then
+      run env DEBIAN_FRONTEND=noninteractive apt-get install -y bsdextrautils ||
+        run env DEBIAN_FRONTEND=noninteractive apt-get install -y util-linux || return 1
+    fi
+  fi
+  # ipregion would otherwise ask on /dev/tty to install them itself.
+  command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1 && command -v column >/dev/null 2>&1
+}
+# ipregion_run JSONFILE — 0 when the file holds the script's JSON result.
+ipregion_run(){
+  local out=$1 script rc=0
+  script=$(mktemp "${UI_DIR:-${TMPDIR:-/tmp}}/ipregion.XXXXXXXX")
+  ui_start 'IP Region · Davoyan/ipregion' \
+    'Скачиваем ipregion с GitHub' \
+    'Проверяем зависимости: curl, jq, column' \
+    'Опрашиваем GeoIP-базы и сервисы — около минуты' \
+    'Готовим таблицу'
+  msg 'Скачиваем ipregion с GitHub'
+  if ! run curl -fsSL --retry 2 --connect-timeout 10 --max-time 120 -o "$script" "$DIAG_IPREGION_URL" ||
+     ! bash -n "$script" 2>/dev/null; then
+    ui_stop failed; rm -f -- "$script"
+    warn "Не удалось скачать ipregion: $DIAG_IPREGION_URL"
+    return 1
+  fi
+  step 10 'Скрипт скачан'
+  msg 'Проверяем зависимости: curl, jq, column'
+  if ! ipregion_deps; then
+    ui_stop failed; rm -f -- "$script"
+    warn 'Не удалось установить зависимости ipregion (curl, jq, bsdextrautils).'
+    return 1
+  fi
+  step 20 'Зависимости на месте'
+  msg 'Опрашиваем GeoIP-базы и сервисы — около минуты'
+  # setsid: no controlling terminal, so the script can never prompt over the TUI.
+  run_capture "$out" setsid -w timeout 300 bash "$script" --json || rc=$?
+  rm -f -- "$script"
+  msg 'Готовим таблицу'
+  if ! helper ipregion-check "$out" >/dev/null 2>>"$LOG"; then
+    ui_stop failed
+    warn "ipregion не вернул результат (код $rc). Подробности: $LOG"
+    return 1
+  fi
+  step 100 'Готово'
+  ui_stop
+}
+diag_ipregion(){
+  local res
+  res=$(mktemp "${UI_DIR:-${TMPDIR:-/tmp}}/ipregion-res.XXXXXXXX")
+  if ipregion_run "$res"; then
+    tui_show 'IP Region — как сервисы видят этот IP' helper ipregion-table "$res" "$(ui_width)"
+  fi
+  rm -f -- "$res"
 }
 menu_diag(){
   local ch
   while :; do
-    ch=$(tui_menu 'Диагностика сервера' 'Скорость до России, видимость IP и блокировки.' \
-         iperf $'iPerf3 до РФ\t{dim}скорость до 5 городов России · встроенный тест{/}' \
-         ipregion $'IP Region\t{dim}страна IP для сервисов · оригинал Davoyan/ipregion{/}' \
-         dpi $'Censorcheck DPI\t{dim}сайты, блокируемые в РФ · оригинал vernette/censorcheck{/}' \
-         multitest $'Multitest by @saveksme\t{dim}все тесты разом · оригинал{/}') || return 0
+    ch=$(tui_menu 'Диагностика сервера' 'Скорость до России и то, какой страной сервисы считают этот IP.' \
+         iperf $'iPerf3 до РФ\t{dim}скорость до 5 городов России{/}' \
+         ipregion $'IP Region\t{dim}страна IP в GeoIP-базах и сервисах · Davoyan/ipregion{/}') || return 0
     case "$ch" in
       iperf) diag_iperf ;;
-      ipregion) run_external 'IP Region (Davoyan/ipregion)' "$DIAG_IPREGION_URL" ;;
-      dpi) run_external 'Censorcheck DPI (vernette/censorcheck)' "$DIAG_CENSOR_URL" --mode dpi ;;
-      multitest) diag_multitest ;;
+      ipregion) diag_ipregion ;;
     esac
     flush_notes
   done
@@ -5987,6 +6014,152 @@ def cmd_iperf_table(args):
     out(c('dim', '  Серверы: github.com/itdoginfo/russian-iperf3-servers'))
 
 
+# ------------------------------------------------------------------ IP Region
+# Renders the JSON of github.com/Davoyan/ipregion (`ipregion.sh --json`).
+COUNTRY_RU = {
+    'AE': 'ОАЭ', 'AL': 'Албания', 'AM': 'Армения', 'AR': 'Аргентина', 'AT': 'Австрия', 'AU': 'Австралия',
+    'AZ': 'Азербайджан', 'BA': 'Босния', 'BD': 'Бангладеш', 'BE': 'Бельгия', 'BG': 'Болгария',
+    'BH': 'Бахрейн', 'BR': 'Бразилия', 'BY': 'Беларусь', 'CA': 'Канада', 'CH': 'Швейцария', 'CL': 'Чили',
+    'CN': 'Китай', 'CO': 'Колумбия', 'CY': 'Кипр', 'CZ': 'Чехия', 'DE': 'Германия', 'DK': 'Дания',
+    'EE': 'Эстония', 'EG': 'Египет', 'ES': 'Испания', 'FI': 'Финляндия', 'FR': 'Франция',
+    'GB': 'Великобритания', 'GE': 'Грузия', 'GR': 'Греция', 'HK': 'Гонконг', 'HR': 'Хорватия',
+    'HU': 'Венгрия', 'ID': 'Индонезия', 'IE': 'Ирландия', 'IL': 'Израиль', 'IN': 'Индия', 'IR': 'Иран',
+    'IS': 'Исландия', 'IT': 'Италия', 'JP': 'Япония', 'KE': 'Кения', 'KG': 'Киргизия', 'KR': 'Южная Корея',
+    'KZ': 'Казахстан', 'LT': 'Литва', 'LU': 'Люксембург', 'LV': 'Латвия', 'MA': 'Марокко', 'MD': 'Молдова',
+    'ME': 'Черногория', 'MK': 'Сев. Македония', 'MN': 'Монголия', 'MT': 'Мальта', 'MX': 'Мексика',
+    'MY': 'Малайзия', 'NG': 'Нигерия', 'NL': 'Нидерланды', 'NO': 'Норвегия', 'NZ': 'Новая Зеландия',
+    'PE': 'Перу', 'PH': 'Филиппины', 'PK': 'Пакистан', 'PL': 'Польша', 'PT': 'Португалия', 'QA': 'Катар',
+    'RO': 'Румыния', 'RS': 'Сербия', 'RU': 'Россия', 'SA': 'Саудовская Аравия', 'SC': 'Сейшелы',
+    'SE': 'Швеция', 'SG': 'Сингапур', 'SI': 'Словения', 'SK': 'Словакия', 'TH': 'Таиланд',
+    'TJ': 'Таджикистан', 'TM': 'Туркмения', 'TR': 'Турция', 'TW': 'Тайвань', 'UA': 'Украина', 'US': 'США',
+    'UZ': 'Узбекистан', 'VN': 'Вьетнам', 'ZA': 'ЮАР',
+}
+# Services that answer Yes/No: True if "Yes" is the good answer.
+IPREGION_YESNO_GOOD = {'Google Search Captcha': False}
+
+
+def _ipr_load(path):
+    try:
+        with open(path, encoding='utf-8', errors='replace') as fh:
+            raw = fh.read()
+        data = json.loads(raw[raw.index('{'):])
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get('results'), dict):
+        return None
+    return data
+
+
+def cmd_ipregion_check(args):
+    data = _ipr_load(args[0])
+    res = (data or {}).get('results') or {}
+    sys.exit(0 if any(res.get(g) for g in ('primary', 'custom', 'cdn')) else 1)
+
+
+def _country(code):
+    return COUNTRY_RU.get(code) or COUNTRY_EN.get(code) or code
+
+
+def _ipr_cell(service, value, main):
+    """(mark, text) for one result."""
+    v = (value or '').strip()
+    if not v or v in ('N/A', 'null'):
+        return c('dim', '○'), c('dim', 'нет данных')
+    if v in ('Yes', 'No'):
+        good = (v == 'Yes') == IPREGION_YESNO_GOOD.get(service, True)
+        if service == 'Google Search Captcha':
+            label = 'есть капча' if v == 'Yes' else 'без капчи'
+        else:
+            label = 'доступен' if v == 'Yes' else 'недоступен'
+        return (c('green', '✓'), c('green', label)) if good else (c('red', '✗'), c('red', label))
+    code = v.upper()
+    if re.fullmatch(r'[A-Z]{2}', code):
+        style = 'green' if code == main else 'yellow'
+        return c(style, '●'), c(style, code) + ' ' + c('dim', _country(code))
+    return c('dim', '·'), v[:18]
+
+
+def cmd_ipregion_table(args):
+    data = _ipr_load(args[0])
+    if not data:
+        die('нет результатов ipregion')
+    width = int(args[1]) if len(args) > 1 and args[1].isdigit() else 100
+    res = data['results']
+    groups = [('ПОПУЛЯРНЫЕ СЕРВИСЫ', res.get('custom') or []), ('GEOIP-БАЗЫ', res.get('primary') or []),
+              ('CDN', res.get('cdn') or [])]
+    has_v6 = bool(data.get('ipv6')) and any(r.get('ipv6') for _, rows in groups for r in rows)
+    # Majority country over all IPv4 answers.
+    counts = {}
+    total = 0
+    for _, rows in groups:
+        for r in rows:
+            raw = (r.get('ipv4') or '').strip()
+            v = raw.upper()
+            if raw not in ('Yes', 'No') and re.fullmatch(r'[A-Z]{2}', v):
+                counts[v] = counts.get(v, 0) + 1
+                total += 1
+    ranking = sorted(counts.items(), key=lambda kv: -kv[1])
+    main = ranking[0][0] if ranking else ''
+
+    ips = []
+    if data.get('ipv4'):
+        ips.append('IPv4 ' + c('bold', data['ipv4']))
+    if data.get('ipv6'):
+        ips.append('IPv6 ' + c('bold', data['ipv6']))
+    out('  ' + ('   '.join(ips) or c('dim', 'IP не определён')))
+    out('')
+    if ranking:
+        share = 100 * ranking[0][1] / total
+        verdict = c('green', '✓ Почти все сервисы видят один регион') if share >= 85 else (
+            c('yellow', '⚠ Сервисы расходятся во мнениях о стране') if share >= 50 else
+            c('red', '✗ Регион IP определяется по-разному'))
+        out('  ' + verdict)
+        out('')
+        out(c('dim', '  КАК СЕРВИСЫ ВИДЯТ СТРАНУ IP'))
+        bar_w = 24
+        for code, n in ranking[:4]:
+            pct = 100 * n / total
+            filled = max(1, round(bar_w * n / total))
+            style = 'green' if code == main else 'yellow'
+            out('  %s  %s  %s%s %s' % (c(style, code), _vpad(c('white', _country(code)), 18),
+                                      c('accent', '━' * filled), c('track', '─' * (bar_w - filled)),
+                                      c('bold', '%3.0f%%' % pct) + c('dim', '  %d из %d' % (n, total))))
+        if len(ranking) > 4:
+            rest = sum(n for _, n in ranking[4:])
+            out(c('dim', '      и ещё %d стран(ы): %d ответ(ов)' % (len(ranking) - 4, rest)))
+
+    name_w = 22
+    cell_w = 2 + name_w + 21 + (14 if has_v6 else 0)
+    cols = 2 if width >= cell_w * 2 + 2 else 1
+    for title, rows in groups:
+        if not rows:
+            continue
+        out('')
+        out(c('dim', '  ' + title + ('   (IPv4 · IPv6)' if has_v6 else '')))
+        cells = []
+        for r in rows:
+            svc = r.get('service', '')
+            mark, txt = _ipr_cell(svc, r.get('ipv4'), main)
+            if has_v6:
+                _, t6 = _ipr_cell(svc, r.get('ipv6'), main)
+                txt = _vpad(txt, 22) + c('dim', '· ') + t6
+            name = svc if len(svc) <= name_w - 1 else svc[:name_w - 2] + '…'
+            cells.append('%s %s %s' % (mark, _vpad(name, name_w), txt))
+        if cols == 1:
+            for cell in cells:
+                out('  ' + cell)
+        else:
+            half = (len(cells) + 1) // 2
+            for i in range(half):
+                left = cells[i]
+                right = cells[i + half] if i + half < len(cells) else ''
+                out('  ' + _vpad(left, cell_w) + '  ' + right)
+    out('')
+    out('  ' + c('green', '●') + c('dim', ' основная страна   ') + c('yellow', '●') + c('dim', ' другая страна   ') +
+        c('green', '✓') + c('dim', '/') + c('red', '✗') + c('dim', ' доступность   ○ сервис не ответил'))
+    out(c('dim', '  Данные: github.com/Davoyan/ipregion'))
+
+
 # ------------------------------------------------------------ self-update
 REPO_RE = re.compile(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+')
 TAG_VER_RE = re.compile(r'v?\d+(\.\d+){0,3}')
@@ -6069,6 +6242,7 @@ COMMANDS = {
     'menu-nodes': cmd_menu_nodes, 'node-card': cmd_node_card, 'node-del': cmd_node_del,
     'node-enable': cmd_node_enable, 'node-probe': cmd_node_probe, 'pdf': cmd_pdf,
     'iperf-cities': cmd_iperf_cities, 'iperf-city': cmd_iperf_city, 'iperf-table': cmd_iperf_table,
+    'ipregion-check': cmd_ipregion_check, 'ipregion-table': cmd_ipregion_table,
 }
 
 if __name__ == '__main__':
@@ -7420,8 +7594,7 @@ manager(){
          inbounds $'Inbound-ы\t{dim}VLESS, Trojan, Hysteria2, AmneziaWG, MTProto{/}' \
          nodes $'Подключить узел\t{dim}другие серверы 3x-ui под управлением этой панели{/}' \
          '#Диагностика' '' \
-         diag $'Диагностика сервера\t{dim}iPerf3 до РФ, IP Region, Censorcheck DPI{/}' \
-         multitest $'Multitest by @saveksme\t{dim}полный набор тестов сервера{/}' \
+         diag $'Диагностика сервера\t{dim}iPerf3 до РФ, IP Region{/}' \
          '#Система' '' \
          settings $'Настройки панели\t{dim}порты, пути, логин{/}' \
          service $'Обслуживание\t{dim}перезапуск, переустановка{/}' \
@@ -7437,7 +7610,6 @@ manager(){
       inbounds) menu_inbounds ;;
       nodes) menu_nodes ;;
       diag) menu_diag ;;
-      multitest) diag_multitest ;;
       settings) menu_settings ;;
       service) menu_service ;;
       version) menu_version ;;
@@ -7488,8 +7660,7 @@ usage(){
   pdf                                   (пере)создать PDF с параметрами
   bbr [on|off]                          TCP BBR + CAKE: состояние | включить | выключить
   diag iperf [--full]                   скорость до 5 городов России (iPerf3)
-  diag ipregion | diag dpi              IP Region / Censorcheck DPI (оригинальные скрипты)
-  multitest                             Multitest by @saveksme (оригинальный скрипт)
+  diag ipregion                         IP Region: страна IP в GeoIP-базах и сервисах
   users [list]                          пользователи: группа, inbound-ы, трафик, активность
   users show NAME                       карточка и ссылки подписки
   users add NAME [--gb N] [--days N] [--group G] [--inbounds 1,2,3]
@@ -7545,7 +7716,7 @@ cli_cmd(){
       pdf_ready || pdf_install_deps || die 'Не удалось установить python3-reportlab и fonts-dejavu-core.'
       write_pdf || die "Не удалось сформировать PDF (см. $LOG)."
       printf 'PDF: %s\nСкачать: %s\n' "$PDF_FILE" "$(pdf_download_hint)" ;;
-    diag|multitest)
+    diag)
       [[ $EUID -eq 0 ]] || die 'Запусти через sudo.'
       [[ -r "$STATE" ]] && load_state
       if [[ ! -d "$BASE" ]]; then      # not installed: work from a temporary dir
@@ -7553,15 +7724,16 @@ cli_cmd(){
         HELPER=$d/xr_helper.py; HELPER_STATE=$d; LOG=$d/diag.log
       fi
       write_helper
-      if [[ "$cmd" == multitest ]]; then run_external 'Multitest by @saveksme' "$MULTITEST_URL"; return; fi
       case "$sub" in
         iperf)
           local res secs=3; [[ "${3:-}" == --full ]] && secs=10
           res=$(mktemp); iperf_run "$secs" "$res" || die 'iPerf3: тест не выполнен.'
           helper iperf-table "$res"; rm -f -- "$res" ;;
-        ipregion) run_external 'IP Region (Davoyan/ipregion)' "$DIAG_IPREGION_URL" ;;
-        dpi) run_external 'Censorcheck DPI (vernette/censorcheck)' "$DIAG_CENSOR_URL" --mode dpi ;;
-        *) die 'diag iperf [--full] | diag ipregion | diag dpi' ;;
+        ipregion)
+          local res; res=$(mktemp)
+          ipregion_run "$res" || { flush_notes; rm -f -- "$res"; exit 1; }
+          helper ipregion-table "$res" "$(tput cols 2>/dev/null || echo 100)"; rm -f -- "$res" ;;
+        *) die 'diag iperf [--full] | diag ipregion' ;;
       esac ;;
     bbr)
       [[ $EUID -eq 0 ]] || die 'Запусти через sudo.'; load_state
@@ -7743,7 +7915,7 @@ if [[ "${XUI_REVERSE_LIB_ONLY:-0}" != 1 ]]; then
     --remove-command) remove_manager_command || : ;;
     --restore-command) restore_manager_command ;;
     --help|-h|help) usage ;;
-    info|status|pdf|bbr|diag|multitest|users|groups|inbounds|node|nodes|version|update) cli_cmd "$@" ;;
+    info|status|pdf|bbr|diag|users|groups|inbounds|node|nodes|version|update) cli_cmd "$@" ;;
     '') main_interactive ;;
     *) die "Неизвестный параметр: $1 (см. --help)" ;;
   esac
