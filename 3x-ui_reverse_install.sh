@@ -6,7 +6,7 @@ set -Eeuo pipefail
 umask 077
 
 # Release version = the git tag of the commit this file comes from.
-VERSION=v2.4.0
+VERSION=v2.4.1
 # GitHub repository (owner/name) that publishes tagged releases of this script.
 # Can also be set from the "Версия" screen or with XR_REPO=owner/name.
 DEFAULT_REPO='dohuyanevezuch/3x-ui_reverse'
@@ -3699,9 +3699,9 @@ def pad(s, w):
 
 # Output may carry markup ({green}…{/}): kept for the script's dialogs
 # (XR_MARKUP=1), turned into ANSI on a terminal, stripped otherwise.
-MARK_RE = re.compile(r'\{(/|green|red|yellow|accent|cyan|blue|magenta|dim|bold|white)\}')
+MARK_RE = re.compile(r'\{(/|green|red|yellow|accent|cyan|blue|magenta|dim|bold|white|track)\}')
 ANSI_CODES = {'green': '32', 'red': '31', 'yellow': '33', 'accent': '36;1', 'cyan': '36', 'blue': '34',
-              'magenta': '35', 'dim': '90', 'bold': '1', 'white': '97;1', '/': '0'}
+              'magenta': '35', 'dim': '90', 'bold': '1', 'white': '97;1', 'track': '38;5;238', '/': '0'}
 
 
 def render(text):
@@ -5973,7 +5973,8 @@ def cmd_iperf_table(args):
             continue
         up = r.get('up') or 0
         filled = max(1, round(bar_w * up / peak)) if up else 0
-        bar = c('green' if up >= 300 else ('yellow' if up >= 50 else 'red'), '█' * filled) + c('dim', '░' * (bar_w - filled))
+        # Same look as the progress bar of the install screens: ━━━━────
+        bar = c('accent', '━' * filled) + c('track', '─' * (bar_w - filled))
         rtt = ('%.0f мс' % r['rtt']) if r.get('rtt') else '—'
         out('  %s  %s %s %s %s' % (_vpad(name, 18), bar, _vpad(_speed(r.get('up')), 13),
                                    _vpad(_speed(r.get('down')), 13), rtt))
@@ -6102,7 +6103,7 @@ except locale.Error:
     pass
 
 APP = '3x-ui_reverse'
-TAG_RE = re.compile(r'\{(/|green|red|yellow|accent|cyan|blue|magenta|dim|bold|white)\}')
+TAG_RE = re.compile(r'\{(/|green|red|yellow|accent|cyan|blue|magenta|dim|bold|white|track)\}')
 ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
 GLYPHS = {'●': 'green', '✓': 'green', '✗': 'red', '⚠': 'yellow', '○': 'dim', '➜': 'accent'}
 SPIN = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
@@ -7059,7 +7060,7 @@ def serve(path):
 
 # =================================================================== CLI
 ANSI = {'green': '32', 'red': '31', 'yellow': '33', 'accent': '36;1', 'cyan': '36', 'blue': '34',
-        'magenta': '35', 'dim': '90', 'bold': '1', 'white': '97;1'}
+        'magenta': '35', 'dim': '90', 'bold': '1', 'white': '97;1', 'track': '38;5;238'}
 
 
 def to_ansi(text, color=True):
