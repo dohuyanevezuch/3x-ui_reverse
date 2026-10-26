@@ -6,7 +6,7 @@ set -Eeuo pipefail
 umask 077
 
 # Release version = the git tag of the commit this file comes from.
-VERSION=v2.2.2
+VERSION=v2.3.0
 # GitHub repository (owner/name) that publishes tagged releases of this script.
 # Can also be set from the "Версия" screen or with XR_REPO=owner/name.
 DEFAULT_REPO='dohuyanevezuch/3x-ui_reverse'
@@ -25,6 +25,7 @@ XUI_INSTALL_URL=https://raw.githubusercontent.com/MHSanaei/3x-ui/main/install.sh
 HELPER=$BASE/xr_helper.py
 SUPPORTED_OS='Debian 12/13 и Ubuntu 22.04/24.04/26.04'
 HELPER_STATE=''   # overrides XR_STATE_DIR before $BASE exists
+PDF_FILE=$BASE/panel.pdf         # the same parameters as a styled PDF
 NODE_TOKEN=$BASE/node.token     # node-sync API token handed to a master panel
 PAIR_ACTIVE=$BASE/pair.active   # pairing files currently published on the stub site
 HELPER_ENV=$BASE/helper.env
@@ -595,6 +596,9 @@ Mihomo/Clash:          $clash_url
 ВАЖНО: этот файл содержит учётные данные. Храни его конфиденциально (chmod 600).
 EOF
   chmod 600 "$INFO"
+  # Keep an existing PDF in step with the new parameters (best effort).
+  if [[ -f "$PDF_FILE" ]] && declare -F write_pdf >/dev/null; then write_pdf || :; fi
+  return 0
 }
 
 site_html(){
@@ -1066,31 +1070,32 @@ PYBACK
 }
 
 install_fresh(){
-  tui_init || die 'Установка ведётся в интерактивном терминале (нужен python3).'
-  check_environment
-  # $BASE must not exist until the user confirms the install, so until then the
-  # helper, its cache and the diagnostic log live in the temporary UI dir.
-  local helper_final=$HELPER log_final=$LOG
-  HELPER=$UI_DIR/xr_helper.py
-  HELPER_STATE=$UI_DIR
-  LOG=$UI_DIR/install.log
-  : >"$LOG"
-  write_helper
-  local ch want_inbounds=0 inbound_text
+  first_run_prepare
+  local ch want_inbounds=0 want_bbr=0 inbound_text bbr_text
+  # Network tuning goes first: it is independent of everything else.
+  if bbr_active; then
+    bbr_text='Сеть:        BBR + CAKE (уже включены)'
+  else
+    if TUI_LOGO=1 tui_yesno 'Ускорение сети' "$(bbr_question_text)" 'Да, включить' 'Нет, оставить как есть' yes; then
+      want_bbr=1; bbr_text='Сеть:        включить TCP BBR + CAKE'
+    else
+      bbr_text="Сеть:        без изменений ($(bbr_label))"
+    fi
+  fi
   ch=$(TUI_LOGO=1 tui_radiolist 'Установка на чистый VPS' \
         'Веб-сервер обслуживает сайт-заглушку, выпускает HTTPS и скрывает за собой панель и подписки.' \
         caddy 'Caddy — автоматический HTTPS' ON \
-        nginx 'Nginx + Certbot' OFF) || exit 0
-  case "$ch" in caddy|nginx) PROXY=$ch;; *) exit 0;; esac
+        nginx 'Nginx + Certbot' OFF) || return 1
+  case "$ch" in caddy|nginx) PROXY=$ch;; *) return 1;; esac
   local entered=''
   while :; do
-    entered=$(TUI_LOGO=1 tui_input 'Домен' 'Домен, A-запись которого указывает на этот VPS (например, panel.example.com):' "$entered") || exit 0
+    entered=$(TUI_LOGO=1 tui_input 'Домен' 'Домен, A-запись которого указывает на этот VPS (например, panel.example.com):' "$entered") || return 1
     entered=${entered,,}; entered=${entered%.}
     valid_domain "$entered" && break
     tui_msg 'Неверный домен' 'Введи корректное DNS-имя: не IP-адрес, не URL и без порта.'
   done
   DOMAIN=$entered
-  dns_check_screen || exit 0
+  dns_check_screen || return 1
   # The certificate path is only known after the proxy has started.
   PROXY_INSTALLED=1; TLS_MODE=proxy
   if TUI_LOGO=1 tui_yesno 'Inbound-ы' "Создать inbound-ы для подключения клиентов сразу после установки?
@@ -1107,14 +1112,13 @@ install_fresh(){
   TUI_LOGO=1 tui_yesno 'Подтверждение' "Домен:       $DOMAIN
 Веб-сервер:  $PROXY
 $inbound_text
+$bbr_text
 
 Будут установлены веб-сервер с сайтом-заглушкой и HTTPS и панель 3x-ui (только на 127.0.0.1).
-Требования: TCP 80/443 доступны извне." 'Установить' 'Отмена' yes || exit 0
+После установки параметры сохранятся в текстовый файл и в PDF.
+Требования: TCP 80/443 доступны извне." 'Установить' 'Отмена' yes || return 1
   install -d -m 755 "$BASE"
-  install -m 600 /dev/null "$log_final"
-  cat "$LOG" >>"$log_final" 2>/dev/null || :
-  [[ -s "$UI_DIR/country.txt" ]] && install -m 600 "$UI_DIR/country.txt" "$BASE/country.txt"
-  LOG=$log_final; HELPER=$helper_final; HELPER_STATE=''
+  preinstall_commit
   local proxy_install_stage proxy_https_stage inbounds_ok=0 inbound_stage='Inbound-ы не создаются'
   ((want_inbounds)) && inbound_stage="Создаём inbound-ы: $(selected_labels)"
   if [[ $PROXY == caddy ]]; then
@@ -1124,8 +1128,11 @@ $inbound_text
     proxy_install_stage='Устанавливаем Nginx и Certbot'
     proxy_https_stage='Настраиваем Nginx и сертификат HTTPS'
   fi
+  local -a bbr_stage=()
+  ((want_bbr)) && bbr_stage=('Включаем TCP BBR + CAKE')
   ui_start "Установка • $DOMAIN • $PROXY" \
     'Проверяем окружение' \
+    "${bbr_stage[@]}" \
     'Подготавливаем компоненты' \
     "$proxy_install_stage" \
     'Создаём страницу-заглушку' \
@@ -1133,14 +1140,21 @@ $inbound_text
     'Устанавливаем 3x-ui' \
     'Привязываем веб-панель и подписки к 127.0.0.1' \
     "$inbound_stage" \
-    'Записываем параметры входа' \
+    'Записываем параметры входа и PDF' \
     'Проверяем доступность HTTPS'
   msg 'Проверяем окружение'
   step 1 'Проверяем окружение'
+  if ((want_bbr)); then
+    msg 'Включаем TCP BBR + CAKE'
+    bbr_enable || :
+  fi
   msg 'Подготавливаем компоненты'
   run apt-get update
   step 12 'Обновили списки пакетов'
   run env DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl openssl python3 iproute2 coreutils
+  # For the PDF with the parameters; not fatal.
+  run env DEBIAN_FRONTEND=noninteractive apt-get install -y python3-reportlab fonts-dejavu-core ||
+    warn 'Не удалось установить python3-reportlab — PDF не будет создан (можно позже: «PDF с параметрами»).'
   step 18 'Установили базовые пакеты'
   if [[ "$PROXY" == caddy ]]; then
     msg 'Устанавливаем Caddy'
@@ -1237,8 +1251,9 @@ $inbound_text
     fi
     step 93 'Inbound-ы не создавались'
   fi
-  msg 'Записываем параметры входа'
+  msg 'Записываем параметры входа и PDF'
   save_state; write_info
+  write_pdf || warn "PDF с параметрами не создан (подробности в $LOG). Повтори в меню «PDF с параметрами»."
   install_self || warn "Не удалось установить команду $SELF (запусти скрипт из файла или проверь доступ к GitHub)."
   step 98 'Создали команду 3x-ui_reverse'
   msg 'Проверяем доступность HTTPS'
@@ -1256,12 +1271,19 @@ $inbound_text
   fi
   tui_show 'Установка завершена' install_summary
   flush_notes 'Обрати внимание'
+  return 0
 }
 install_summary(){
   show_info_color
   if helper sub-id user1 >/dev/null 2>&1; then
     printf '  ● ПОЛЬЗОВАТЕЛЬ user1\n'
     print_user_links user1 || :
+  fi
+  if [[ -f "$PDF_FILE" ]]; then
+    printf '\n%s  ● PDF С ПАРАМЕТРАМИ%s\n' "$C_BLUE" "$C_RESET"
+    color_value 'Файл' "$PDF_FILE" "$C_GREEN"
+    color_value 'Скачать' "$(pdf_download_hint)" "$C_YELLOW"
+    copy_item 'команда scp' "$(pdf_download_hint)"
   fi
 }
 
@@ -1390,6 +1412,8 @@ show_status_color(){
   else
     status_line "$PROXY" '○ удалён'
   fi
+  if bbr_active; then status_line 'Сеть' '● TCP BBR + CAKE'
+  else status_line 'Сеть' "○ $(bbr_label) (BBR + CAKE — в «Обслуживание»)"; fi
   if [[ "${PROXY_INSTALLED:-1}" == 1 || "${TLS_MODE:-none}" == direct ]]; then
     if verify_remote; then status_line 'Домен' "✓ https://$DOMAIN отвечает"
     else status_line 'Домен' "⚠ https://$DOMAIN не отвечает"; fi
@@ -2059,6 +2083,21 @@ ensure_api_token(){
   done
   return 1
 }
+sub_base(){
+  if [[ "${PROXY_INSTALLED:-1}" == 1 ]]; then printf 'https://%s' "$DOMAIN"
+  elif [[ "${TLS_MODE:-none}" == direct ]]; then printf 'https://%s:%s' "$DOMAIN" "$SUB_PORT"
+  fi
+}
+print_user_links(){
+  local email=$1 sid base
+  sid=$(helper sub-id "$email" 2>>"$LOG") || return 1
+  base=$(sub_base)
+  if [[ -z "$base" ]]; then warn 'Подписки недоступны: прокси удалён.'; return 0; fi
+  # Label and URL on separate lines: long links must not wrap inside dialogs.
+  printf '  Обычная (VLESS, MTProto):\n    %s\n' "$base/$SUB_PATH/$sid"
+  printf '  JSON:\n    %s\n' "$base/$JSON_PATH/$sid"
+  printf '  Mihomo / Clash:\n    %s\n' "$base/$CLASH_PATH/$sid"
+}
 setup_activity_timer(){
   [[ -f "$HELPER" ]] || write_helper
   write_helper_env
@@ -2280,6 +2319,12 @@ dns_check_screen(){
     esac
     if [[ "$aaaa" == wrong ]]; then
       head+=$'\n'"{yellow}⚠ У домена есть AAAA-запись (IPv6) на другой адрес: Let's Encrypt может проверить её и не выдать сертификат. Удали её или укажи IPv6 этого сервера.{/}"
+    fi
+    if [[ "${DNS_MODE:-}" == standalone ]]; then
+      ch=$(TUI_LOGO=1 TUI_DEFAULT=again TUI_CANCEL='Назад' tui_menu 'Проверка DNS' "$head"$'\n\n'"$table" \
+           again 'Проверить снова' finish 'Готово') || return 0
+      [[ "$ch" == again ]] && continue
+      return 0
     fi
     if [[ "$first" == go ]]; then
       ch=$(TUI_LOGO=1 TUI_DEFAULT=go TUI_CANCEL='Отмена' tui_menu 'Проверка DNS' "$head"$'\n\n'"$table" \
@@ -2840,12 +2885,14 @@ menu_service(){
          1 'Перезапустить службы' \
          2 'Редактировать конфигурацию прокси' \
          3 'Переустановить 3x-ui (данные сохраняются)' \
-         4 "Переустановить прокси ($PROXY)") || return 0
+         4 "Переустановить прокси ($PROXY)" \
+         bbr "BBR + CAKE"$'\t'"$(bbr_active && echo '{green}● включено{/}' || echo "{dim}○ $(bbr_label){/}")") || return 0
     case "$ch" in
       1) restart_services || : ;;
       2) edit_proxy_config ;;
       3) reinstall_panel || warn 'Переустановка панели не завершена.'; load_state ;;
       4) reinstall_proxy || warn 'Переустановка прокси не завершена.'; load_state ;;
+      bbr) menu_bbr ;;
     esac
     flush_notes 'Обслуживание'
   done
@@ -3152,6 +3199,242 @@ menu_nodes(){
         fi ;;
     esac
     flush_notes
+  done
+}
+
+# ---- Network tuning: TCP BBR + CAKE
+BBR_SYSCTL=/etc/sysctl.d/90-3x-ui_reverse-bbr.conf
+BBR_MODULES=/etc/modules-load.d/3x-ui_reverse-bbr.conf
+
+bbr_now(){       # "congestion_control qdisc"
+  printf '%s %s' "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo '?')" \
+                  "$(sysctl -n net.core.default_qdisc 2>/dev/null || echo '?')"
+}
+bbr_active(){
+  local cc q
+  read -r cc q <<< "$(bbr_now)"
+  [[ "$cc" == bbr && "$q" == cake ]]
+}
+bbr_label(){
+  local cc q
+  read -r cc q <<< "$(bbr_now)"
+  if [[ "$cc" == bbr && "$q" == cake ]]; then printf 'BBR + CAKE'
+  elif [[ "$cc" == bbr ]]; then printf 'BBR + %s' "$q"
+  else printf '%s + %s' "$cc" "$q"; fi
+}
+default_iface(){
+  ip -o -4 route show default 2>/dev/null |
+    awk '{for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit }}'
+}
+bbr_enable(){
+  local qdisc=cake iface
+  modprobe tcp_bbr >>"$LOG" 2>&1 || :
+  modprobe sch_cake >>"$LOG" 2>&1 || :
+  if ! grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+    warn 'Ядро не поддерживает TCP BBR — ускорение сети не включено.'
+    return 1
+  fi
+  if ! sysctl -w net.core.default_qdisc=cake >>"$LOG" 2>&1; then
+    qdisc=fq                    # kernel without sch_cake: fq is BBR's classic pair
+    sysctl -w net.core.default_qdisc=fq >>"$LOG" 2>&1 || :
+  fi
+  if ! sysctl -w net.ipv4.tcp_congestion_control=bbr >>"$LOG" 2>&1; then
+    warn 'Не удалось включить BBR: ядро VPS недоступно для настройки (контейнерная виртуализация?).'
+    return 1
+  fi
+  printf 'tcp_bbr\n%s\n' "$([[ $qdisc == cake ]] && echo sch_cake || echo sch_fq)" > "$BBR_MODULES"
+  cat > "$BBR_SYSCTL" <<EOF
+# Managed by 3x-ui_reverse: TCP BBR congestion control + $qdisc queueing.
+net.core.default_qdisc = $qdisc
+net.ipv4.tcp_congestion_control = bbr
+EOF
+  chmod 644 "$BBR_MODULES" "$BBR_SYSCTL"
+  # default_qdisc only affects new queues: replace the running one too.
+  iface=$(default_iface)
+  if [[ -n "$iface" ]]; then
+    tc qdisc replace dev "$iface" root "$qdisc" >>"$LOG" 2>&1 ||
+      printf 'tc: %s остался на прежней очереди (применится после перезагрузки)\n' "$iface" >>"$LOG"
+  fi
+  [[ $qdisc == cake ]] || warn 'CAKE недоступен в ядре — включены BBR + fq.'
+  return 0
+}
+bbr_disable(){
+  local iface
+  rm -f -- "$BBR_SYSCTL" "$BBR_MODULES"
+  sysctl -w net.ipv4.tcp_congestion_control=cubic >>"$LOG" 2>&1 || :
+  sysctl -w net.core.default_qdisc=fq_codel >>"$LOG" 2>&1 || :
+  iface=$(default_iface)
+  # Deleting the root qdisc makes the kernel recreate its default (fq_codel/mq).
+  [[ -n "$iface" ]] && { tc qdisc del dev "$iface" root >>"$LOG" 2>&1 || :; }
+  return 0
+}
+bbr_question_text(){
+  printf '%s' "Включить TCP BBR + CAKE?
+
+{bold}BBR{/} — алгоритм управления перегрузкой от Google: выше скорость и ниже задержки
+на каналах с потерями пакетов (типично для подключений из России).
+{bold}CAKE{/} — умная очередь пакетов: убирает «раздувание буфера» и лаги под нагрузкой.
+
+Сейчас: {accent}$(bbr_label){/}"
+}
+menu_bbr(){
+  if bbr_active; then
+    tui_yesno 'BBR + CAKE' "{green}● Включены TCP BBR + CAKE.{/}
+
+Выключить и вернуть стандартные cubic + fq_codel?" 'Выключить' 'Назад' no || return 0
+    bbr_disable
+    note "○ BBR + CAKE выключены: сейчас $(bbr_label)."
+  else
+    tui_yesno 'BBR + CAKE' "$(bbr_question_text)" 'Включить' 'Назад' yes || return 0
+    if bbr_enable; then note "{green}✓ Включено: $(bbr_label).{/}"; fi
+  fi
+}
+
+# ---- PDF with the server parameters
+pdf_ready(){ python3 -c 'import reportlab' >/dev/null 2>&1; }
+pdf_install_deps(){
+  pdf_ready && return 0
+  run env DEBIAN_FRONTEND=noninteractive apt-get install -y python3-reportlab fonts-dejavu-core
+}
+server_ip_label(){
+  local ip
+  ip=$(ip -4 -o route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p')
+  case "$ip" in ''|10.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*|100.6[4-9].*|100.[7-9][0-9].*|100.1[01][0-9].*|100.12[0-7].*) ip='' ;; esac
+  printf '%s' "$ip"
+}
+# write_pdf [quiet] — $PDF_FILE from the current state; returns 1 if impossible.
+write_pdf(){
+  [[ -d "$BASE" ]] || return 1
+  pdf_ready || return 1
+  local data panel_url='' certpath proxy_line proxy_label tls_label country ip sid ntoken sbase rc=0
+  data=$(mktemp "${UI_DIR:-${TMPDIR:-/tmp}}/pdf.XXXXXXXX")
+  chmod 600 "$data"
+  if [[ "${PROXY_INSTALLED:-1}" == 1 ]]; then
+    certpath=$(certdir); proxy_line="${PROXY^} (установлен)"; proxy_label="${PROXY^} · HTTPS :443"
+    tls_label="Let's Encrypt"
+  elif [[ "${TLS_MODE:-none}" == direct ]]; then
+    certpath="/root/cert/$DOMAIN"; proxy_line='не используется — HTTPS у 3x-ui'; proxy_label='Прямой HTTPS'
+    tls_label='acme.sh'
+  else
+    certpath='нет'; proxy_line='удалён'; proxy_label='Без прокси'; tls_label=''
+  fi
+  [[ "${PANEL_INSTALLED:-1}" == 1 && ( "${PROXY_INSTALLED:-1}" == 1 || "${TLS_MODE:-none}" == direct ) ]] &&
+    panel_url="https://$DOMAIN/$PANEL_PATH/"
+  country=$(helper country 2>/dev/null || :)
+  ip=$(server_ip_label)
+  {
+    printf 'domain\t%s\nversion\t%s\ndate\t%s\n' "$DOMAIN" "$VERSION" "$(date '+%d.%m.%Y %H:%M')"
+    printf 'proxy_label\t%s\ntls_label\t%s\nproxy_line\t%s\ncertpath\t%s\n' \
+      "$proxy_label" "$tls_label" "$proxy_line" "$certpath"
+    [[ -n "$country$ip" ]] && printf 'server_label\t%s\n' "${country}${country:+${ip:+ · }}${ip}"
+    [[ "$(bbr_now)" == bbr\ * ]] && printf 'bbr_label\t%s\n' "$(bbr_label)"
+    if [[ -n "$panel_url" ]]; then
+      printf 'panel_url\t%s\nuser\t%s\npass\t%s\nport\t%s\n' "$panel_url" "$PANEL_USER" "$PANEL_PASS" "$PANEL_PORT"
+      ntoken=$(node_api_token 2>>"$LOG") && printf 'node_token\t%s\n' "$ntoken"
+      printf 'sub\t/%s/\njson\t/%s/\nclash\t/%s/\n' "$SUB_PATH" "$JSON_PATH" "$CLASH_PATH"
+      sbase=$(sub_base)
+      if [[ -n "$sbase" ]] && sid=$(helper sub-id user1 2>/dev/null) && [[ -n "$sid" ]]; then
+        printf 'user1_sub\t%s\nuser1_json\t%s\nuser1_clash\t%s\n' \
+          "$sbase/$SUB_PATH/$sid" "$sbase/$JSON_PATH/$sid" "$sbase/$CLASH_PATH/$sid"
+      fi
+    fi
+  } > "$data"
+  helper pdf "$PDF_FILE" "$data" >>"$LOG" 2>&1 || rc=1
+  rm -f -- "$data"
+  return "$rc"
+}
+pdf_download_hint(){
+  local host=${DOMAIN:-IP_СЕРВЕРА}
+  printf 'scp root@%s:%s .' "$host" "$PDF_FILE"
+}
+pdf_screen(){
+  if ! pdf_ready; then
+    tui_yesno 'PDF с параметрами' 'Для PDF нужны пакеты python3-reportlab и fonts-dejavu-core (≈10 МБ). Установить?' \
+      'Установить' 'Отмена' yes || return 0
+    with_progress 'PDF' 'Устанавливаем python3-reportlab и шрифты' pdf_install_deps ||
+      { tui_msg 'PDF' '{red}Не удалось установить пакеты.{/} Подробности в журнале.'; return 0; }
+  fi
+  if ! with_progress 'PDF' 'Формируем PDF' write_pdf; then
+    tui_msg 'PDF' "{red}Не удалось сформировать PDF.{/} Подробности: $LOG"
+    return 0
+  fi
+  local tmp
+  tmp=$(mktemp "${UI_DIR:-${TMPDIR:-/tmp}}/pdfmsg.XXXXXXXX")
+  cat > "$tmp" <<EOF
+{green}✓ PDF обновлён{/}
+
+  Файл        {accent}$PDF_FILE{/}  (chmod 600)
+
+Скачать на свой компьютер (команда для терминала компьютера):
+  {yellow}$(pdf_download_hint){/}
+
+{dim}В файле пароль и токены — не пересылай его посторонним.
+PDF обновляется сам при смене логина, пароля, портов и путей.{/}
+EOF
+  copy_item 'путь к PDF' "$PDF_FILE"
+  copy_item 'команда scp' "$(pdf_download_hint)"
+  tui_textfile 'PDF с параметрами' "$tmp"
+  rm -f -- "$tmp"
+}
+
+# ---- First run: nothing installed yet
+# $BASE must not exist until the user confirms the install, so until then the
+# helper, its cache and the diagnostic log live in the temporary UI dir.
+PRE_ENV=0 HELPER_FINAL='' LOG_FINAL=''
+preinstall_env(){
+  ((PRE_ENV)) && return 0
+  HELPER_FINAL=$HELPER; LOG_FINAL=$LOG
+  HELPER=$UI_DIR/xr_helper.py
+  HELPER_STATE=$UI_DIR
+  LOG=$UI_DIR/install.log
+  : >"$LOG"
+  write_helper
+  PRE_ENV=1
+}
+preinstall_commit(){        # $BASE now exists: move log and cache there
+  ((PRE_ENV)) || return 0
+  install -m 600 /dev/null "$LOG_FINAL"
+  cat "$LOG" >>"$LOG_FINAL" 2>/dev/null || :
+  [[ -s "$UI_DIR/country.txt" ]] && install -m 600 "$UI_DIR/country.txt" "$BASE/country.txt"
+  LOG=$LOG_FINAL; HELPER=$HELPER_FINAL; HELPER_STATE=''
+  PRE_ENV=0
+}
+ENV_CHECKED=0
+first_run_prepare(){
+  ((ENV_CHECKED)) && return 0
+  tui_init || die 'Нужен интерактивный терминал (и python3).'
+  check_environment
+  preinstall_env
+  ENV_CHECKED=1
+}
+dns_standalone(){
+  local entered=${DOMAIN:-}
+  while :; do
+    entered=$(TUI_LOGO=1 tui_input 'Проверка DNS' 'Домен для проверки (например, panel.example.com):' "$entered") || return 0
+    entered=${entered,,}; entered=${entered%.}; entered=${entered#http://}; entered=${entered#https://}; entered=${entered%%/*}
+    valid_domain "$entered" && break
+    tui_msg 'Неверный домен' 'Введи корректное DNS-имя: не IP-адрес, не URL и без порта.'
+  done
+  DOMAIN=$entered DNS_MODE=standalone dns_check_screen || :
+  DOMAIN=''
+}
+start_menu(){
+  first_run_prepare
+  local ch os
+  os=$(. /etc/os-release 2>/dev/null && printf '%s' "${PRETTY_NAME:-Linux}")
+  while :; do
+    ch=$(TUI_LOGO=1 TUI_CANCEL='Выход' tui_menu '3x-ui_reverse' "Сервер ещё не настроен.
+{dim}$os · $(hostname 2>/dev/null || echo VPS){/}" \
+         install $'Установить 3x-ui + прокси\t{dim}Caddy или Nginx, HTTPS, сайт-заглушка{/}' \
+         dns $'Проверить DNS-записи\t{dim}куда указывает домен в 16 DNS мира{/}' \
+         quit '{dim}Выход{/}') || return 0
+    case "$ch" in
+      install)
+        if install_fresh && [[ -f "$STATE" ]]; then manager; return 0; fi
+        DOMAIN='' ;;
+      dns) dns_standalone ;;
+      quit) return 0 ;;
+    esac
   done
 }
 
@@ -5056,6 +5339,248 @@ def cmd_node_probe(args):
     print('status=%s\nerror=%s\nlatency=%s' % (v.get('status', ''), v.get('error', ''), v.get('latencyMs', '')))
 
 
+# ------------------------------------------------------------------ PDF
+# A one-page (two if needed) A4 summary of the server: what «Параметры и
+# ссылки» shows, plus QR codes. Needs python3-reportlab and fonts-dejavu-core.
+PDF_FONTS = {
+    'Sans': ('DejaVuSans.ttf',), 'Sans-Bold': ('DejaVuSans-Bold.ttf',),
+    'Mono': ('DejaVuSansMono.ttf',), 'Mono-Bold': ('DejaVuSansMono-Bold.ttf',),
+}
+PDF_FONT_DIRS = ('/usr/share/fonts/truetype/dejavu', '/usr/share/fonts/dejavu', '/usr/share/fonts/TTF',
+                 '/usr/share/fonts/truetype')
+
+
+def _pdf_fonts():
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    for name, files in PDF_FONTS.items():
+        path = None
+        for d in PDF_FONT_DIRS:
+            for f in files:
+                if os.path.isfile(os.path.join(d, f)):
+                    path = os.path.join(d, f)
+                    break
+            if path:
+                break
+        if not path:
+            die('не найден шрифт %s — установи fonts-dejavu-core' % files[0])
+        pdfmetrics.registerFont(TTFont('XR-' + name, path))
+
+
+def cmd_pdf(args):
+    """pdf OUT DATAFILE — DATAFILE has "key<TAB>value" lines."""
+    out_path, data_file = args[:2]
+    try:
+        from reportlab.pdfgen import canvas
+        from reportlab.lib.colors import HexColor, white
+        from reportlab.lib.pagesizes import A4
+        from reportlab.graphics.barcode.qr import QrCodeWidget
+        from reportlab.graphics.shapes import Drawing
+        from reportlab.graphics import renderPDF
+        from reportlab.pdfbase.pdfmetrics import stringWidth
+    except ImportError:
+        die('нет python3-reportlab: apt-get install python3-reportlab fonts-dejavu-core')
+    _pdf_fonts()
+    d = {}
+    with open(data_file, encoding='utf-8') as fh:
+        for line in fh:
+            k, _, v = line.rstrip('\n').partition('\t')
+            if k:
+                d[k] = v
+
+    W, H = A4
+    M = 40                                         # page margin
+    INK, MUTED, FAINT = HexColor('#0F172A'), HexColor('#64748B'), HexColor('#94A3B8')
+    CARD, LINE = HexColor('#F5F7FB'), HexColor('#E3E8F0')
+    ACCENT, VIOLET, AMBER = HexColor('#0EA5E9'), HexColor('#7C3AED'), HexColor('#B45309')
+    GREEN = HexColor('#059669')
+    GRAD = ['#22D3EE', '#38BDF8', '#3B82F6', '#6366F1', '#8B5CF6', '#A855F7']
+
+    tmp_path = out_path + '.tmp'
+    c = canvas.Canvas(tmp_path, pagesize=A4)
+    c.setTitle('3x-ui_reverse — %s' % d.get('domain', ''))
+    c.setAuthor('3x-ui_reverse')
+    c.setSubject('Параметры сервера')
+    state = {'y': 0, 'page': 1}
+
+    def text(x, y, s, font='Sans', size=10, color=INK):
+        c.setFont('XR-' + font, size)
+        c.setFillColor(color)
+        c.drawString(x, y, s)
+
+    def wrap(s, font, size, width):
+        """Lines that fit width: by words, long words (URLs, tokens) by characters."""
+        fn = 'XR-' + font
+        lines, cur = [], ''
+        for word in re.findall(r'\S+\s*', s) or ['']:
+            if stringWidth(cur + word.rstrip(), fn, size) <= width:
+                cur += word
+                continue
+            if cur:
+                lines.append(cur.rstrip())
+                cur = ''
+            for ch in word:
+                if stringWidth(cur + ch, fn, size) > width and cur.strip():
+                    lines.append(cur.rstrip())
+                    cur = ''
+                cur += ch
+        lines.append(cur.rstrip())
+        return lines
+
+    def qr(value, x, y, size):
+        w = QrCodeWidget(value, barLevel='M')
+        b = w.getBounds()
+        bw, bh = b[2] - b[0], b[3] - b[1]
+        dr = Drawing(size, size, transform=[size / bw, 0, 0, size / bh, 0, 0])
+        dr.add(w)
+        c.setFillColor(white)
+        c.roundRect(x - 6, y - 6, size + 12, size + 12, 8, stroke=0, fill=1)
+        renderPDF.draw(dr, c, x, y)
+
+    def footer():
+        c.setStrokeColor(LINE)
+        c.setLineWidth(0.6)
+        c.line(M, 34, W - M, 34)
+        text(M, 22, '3x-ui_reverse %s  ·  создано %s' % (d.get('version', ''), d.get('date', '')),
+             size=7.5, color=FAINT)
+        s = 'стр. %d' % state['page']
+        text(W - M - stringWidth(s, 'XR-Sans', 7.5), 22, s, size=7.5, color=FAINT)
+
+    def new_page():
+        footer()
+        c.showPage()
+        state['page'] += 1
+        state['y'] = H - M
+
+    def hero():
+        top = 156
+        c.setFillColor(HexColor('#0B1220'))
+        c.rect(0, H - top, W, top, stroke=0, fill=1)
+        # soft glow circles, clipped to the hero band
+        c.saveState()
+        clip = c.beginPath()
+        clip.rect(0, H - top, W, top)
+        c.clipPath(clip, stroke=0, fill=0)
+        for cx, cy, r, col, alpha in ((W - 60, H - 30, 150, '#0EA5E9', 0.18), (W - 200, H - 150, 105, '#8B5CF6', 0.20)):
+            c.setFillColor(HexColor(col))
+            c.setFillAlpha(alpha)
+            c.circle(cx, cy, r, stroke=0, fill=1)
+        c.restoreState()
+        # gradient stripe under the hero
+        seg = W / len(GRAD)
+        for i, col in enumerate(GRAD):
+            c.setFillColor(HexColor(col))
+            c.rect(i * seg, H - top - 4, seg + 1, 4, stroke=0, fill=1)
+        text(M, H - 52, '◆', 'Sans-Bold', 16, HexColor('#38BDF8'))
+        text(M + 22, H - 52, '3x-ui_reverse', 'Sans-Bold', 24, white)
+        text(M, H - 74, 'Параметры сервера и доступ к панели', 'Sans', 11, HexColor('#CBD5E1'))
+        text(M, H - 108, d.get('domain', ''), 'Sans-Bold', 20, HexColor('#7DD3FC'))
+        chips = [x for x in (d.get('proxy_label'), d.get('tls_label'), d.get('server_label'), d.get('bbr_label')) if x]
+        x = M
+        for chip in chips:
+            w = stringWidth(chip, 'XR-Sans', 8.5) + 18
+            c.saveState()
+            c.setFillColor(white)
+            c.setFillAlpha(0.10)
+            c.roundRect(x, H - 140, w, 18, 9, stroke=0, fill=1)
+            c.restoreState()
+            text(x + 9, H - 134, chip, 'Sans', 8.5, HexColor('#E2E8F0'))
+            x += w + 8
+        state['y'] = H - top - 22
+
+    def card(title, rows, accent=ACCENT, qr_value=None, qr_caption=None, note=None):
+        """rows: (label, value, kind) with kind in mono|text|path|secret."""
+        inner = W - 2 * M - 32
+        qr_size = 80 if qr_value else 0
+        val_w = inner - 118 - (qr_size + 22 if qr_value else 0)
+        laid = []
+        for label, value, kind in rows:
+            font = 'Mono-Bold' if kind == 'secret' else ('Mono' if kind in ('mono', 'path') else 'Sans')
+            size = 9.5
+            # Tokens and URLs: shrink a little before wrapping onto a 2nd line.
+            while size > 8 and ' ' not in (value or '') and \
+                    stringWidth(value or '', 'XR-' + font, size) > val_w:
+                size -= 0.25
+            lines = wrap(value or '—', font, size, val_w)
+            laid.append((label, lines, font, size, kind))
+        body_h = sum(max(1, len(l[1])) * 12.5 + 6.5 for l in laid)
+        note_h = 0
+        if note:
+            note_lines = wrap(note, 'Sans', 8, inner - (qr_size + 22 if qr_value else 0))
+            note_h = len(note_lines) * 11 + 6
+        h = 26 + max(body_h + note_h, qr_size + 26 if qr_value else 0) + 10
+        if state['y'] - h < 50:
+            new_page()
+        top = state['y']
+        c.setFillColor(CARD)
+        c.roundRect(M, top - h, W - 2 * M, h, 12, stroke=0, fill=1)
+        c.setFillColor(accent)
+        c.roundRect(M, top - h, 4, h, 2, stroke=0, fill=1)
+        text(M + 16, top - 20, title.upper(), 'Sans-Bold', 8.5, accent)
+        y = top - 39
+        for label, lines, font, size, kind in laid:
+            text(M + 16, y, label, 'Sans', 9, MUTED)
+            color = AMBER if kind == 'path' else (VIOLET if kind == 'secret' else INK)
+            for i, ln in enumerate(lines):
+                text(M + 16 + 118, y - i * 12.5, ln, font, size, color)
+            y -= max(1, len(lines)) * 12.5 + 6.5
+        if note:
+            for i, ln in enumerate(note_lines):
+                text(M + 16, y - 2 - i * 11, ln, 'Sans', 8, MUTED)
+        if qr_value:
+            qx, qy = W - M - 16 - qr_size, top - 30 - qr_size
+            qr(qr_value, qx, qy, qr_size)
+            if qr_caption:
+                cw = stringWidth(qr_caption, 'XR-Sans', 7.5)
+                text(qx + (qr_size - cw) / 2, qy - 18, qr_caption, 'Sans', 7.5, MUTED)
+        state['y'] = top - h - 11
+
+    hero()
+    card('Сайт и HTTPS', [
+        ('Домен', 'https://%s' % d.get('domain', ''), 'text'),
+        ('Веб-сервер', d.get('proxy_line', ''), 'text'),
+        ('TLS-сертификаты', d.get('certpath', ''), 'mono'),
+    ])
+    if d.get('panel_url'):
+        rows = [('Адрес панели', d['panel_url'], 'mono'),
+                ('Логин', d.get('user', ''), 'secret'),
+                ('Пароль', d.get('pass', ''), 'secret'),
+                ('Порт (127.0.0.1)', d.get('port', ''), 'mono')]
+        if d.get('node_token'):
+            rows.append(('API-токен узла', d['node_token'], 'mono'))
+        card('Панель 3x-ui', rows, accent=VIOLET, qr_value=d['panel_url'], qr_caption='адрес панели',
+             note='API-токен узла нужен, чтобы подключить эту панель к мастер-панели как узел.'
+             if d.get('node_token') else None)
+        card('Подписки', [
+            ('Обычная / VLESS', d.get('sub', ''), 'path'),
+            ('JSON', d.get('json', ''), 'path'),
+            ('Mihomo / Clash', d.get('clash', ''), 'path'),
+        ], accent=AMBER, note='Полный адрес: https://%s<путь>SUB_ID, где SUB_ID — Sub ID пользователя '
+                             '(карточка пользователя в меню «Пользователи»).' % d.get('domain', ''))
+    if d.get('user1_sub'):
+        card('Пользователь user1', [
+            ('Подписка', d['user1_sub'], 'mono'),
+            ('JSON', d.get('user1_json', ''), 'mono'),
+            ('Mihomo / Clash', d.get('user1_clash', ''), 'mono'),
+        ], accent=GREEN, qr_value=d['user1_sub'], qr_caption='подписка user1',
+            note='Отсканируй QR в Happ, v2rayNG, Streisand или Hiddify.')
+    # warning strip
+    msg = 'Документ содержит пароль и токены доступа. Не пересылай его посторонним и храни в защищённом месте.'
+    lines = wrap(msg, 'Sans', 8.5, W - 2 * M - 44)
+    h = 18 + len(lines) * 12
+    if state['y'] - h < 50:
+        new_page()
+    c.setFillColor(HexColor('#FFF7ED'))
+    c.roundRect(M, state['y'] - h, W - 2 * M, h, 10, stroke=0, fill=1)
+    text(M + 14, state['y'] - 18, '⚠', 'Sans-Bold', 11, HexColor('#EA580C'))
+    for i, ln in enumerate(lines):
+        text(M + 32, state['y'] - 17 - i * 12, ln, 'Sans', 8.5, HexColor('#9A3412'))
+    footer()
+    c.save()
+    os.chmod(tmp_path, 0o600)
+    os.replace(tmp_path, out_path)
+
+
 # ------------------------------------------------------------ self-update
 REPO_RE = re.compile(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+')
 TAG_VER_RE = re.compile(r'v?\d+(\.\d+){0,3}')
@@ -5136,7 +5661,7 @@ COMMANDS = {
     'pair-publish': cmd_pair_publish, 'pair-fetch': cmd_pair_fetch, 'node-name': cmd_node_name,
     'parse-url': cmd_parse_url, 'node-add': cmd_node_add, 'nodes': cmd_nodes, 'nodes-count': cmd_nodes_count,
     'menu-nodes': cmd_menu_nodes, 'node-card': cmd_node_card, 'node-del': cmd_node_del,
-    'node-enable': cmd_node_enable, 'node-probe': cmd_node_probe,
+    'node-enable': cmd_node_enable, 'node-probe': cmd_node_probe, 'pdf': cmd_pdf,
 }
 
 if __name__ == '__main__':
@@ -6475,6 +7000,7 @@ manager(){
     ch=$(TUI_LOGO=1 TUI_CANCEL='Выход' tui_menu '3x-ui_reverse' "$(main_header)" \
          '#Обзор' '' \
          info $'Параметры и ссылки\t{dim}панель, подписки, файлы{/}' \
+         pdf $'PDF с параметрами\t{dim}красивая сводка для печати и хранения{/}' \
          status $'Состояние служб\t{dim}3x-ui, прокси, порты, HTTPS{/}' \
          '#Управление' '' \
          users $'Пользователи\t{dim}трафик, активность, inbound-ы{/}' \
@@ -6489,6 +7015,7 @@ manager(){
          "${quit_item[@]}") || return 0
     case "$ch" in
       info) tui_show 'Параметры и ссылки' show_info_color ;;
+      pdf) pdf_screen ;;
       status) tui_show 'Состояние служб' show_status_color ;;
       users) menu_users ;;
       groups) menu_groups ;;
@@ -6541,6 +7068,8 @@ usage(){
 
 Команды:
   info | status                         параметры и ссылки | состояние служб
+  pdf                                   (пере)создать PDF с параметрами
+  bbr [on|off]                          TCP BBR + CAKE: состояние | включить | выключить
   users [list]                          пользователи: группа, inbound-ы, трафик, активность
   users show NAME                       карточка и ссылки подписки
   users add NAME [--gb N] [--days N] [--group G] [--inbounds 1,2,3]
@@ -6591,6 +7120,18 @@ cli_cmd(){
   case "$cmd" in
     info) [[ $EUID -eq 0 ]] || die 'Запусти через sudo.'; load_state; write_helper; show_info_color ;;
     status) [[ $EUID -eq 0 ]] || die 'Запусти через sudo.'; load_state; write_helper; show_status_color ;;
+    pdf)
+      [[ $EUID -eq 0 ]] || die 'Запусти через sudo.'; load_state; write_helper
+      pdf_ready || pdf_install_deps || die 'Не удалось установить python3-reportlab и fonts-dejavu-core.'
+      write_pdf || die "Не удалось сформировать PDF (см. $LOG)."
+      printf 'PDF: %s\nСкачать: %s\n' "$PDF_FILE" "$(pdf_download_hint)" ;;
+    bbr)
+      [[ $EUID -eq 0 ]] || die 'Запусти через sudo.'; load_state
+      case "$sub" in
+        on) bbr_enable || exit 1; printf 'Включено: %s\n' "$(bbr_label)" ;;
+        off) bbr_disable; printf 'Сейчас: %s\n' "$(bbr_label)" ;;
+        *) printf '%s\n' "$(bbr_label)" ;;
+      esac ;;
     users)
       cli_need_panel
       case "$sub" in
@@ -6750,7 +7291,7 @@ cli_inbounds_edit(){
   helper inbound-info "$id"
 }
 main_interactive(){
-  if [[ -f "$STATE" ]]; then manager; else install_fresh; manager; fi
+  if [[ -f "$STATE" ]]; then manager; else start_menu; fi
 }
 
 if [[ "${XUI_REVERSE_LIB_ONLY:-0}" != 1 ]]; then
@@ -6764,7 +7305,7 @@ if [[ "${XUI_REVERSE_LIB_ONLY:-0}" != 1 ]]; then
     --remove-command) remove_manager_command || : ;;
     --restore-command) restore_manager_command ;;
     --help|-h|help) usage ;;
-    info|status|users|groups|inbounds|node|nodes|version|update) cli_cmd "$@" ;;
+    info|status|pdf|bbr|users|groups|inbounds|node|nodes|version|update) cli_cmd "$@" ;;
     '') main_interactive ;;
     *) die "Неизвестный параметр: $1 (см. --help)" ;;
   esac
