@@ -6,7 +6,7 @@ set -Eeuo pipefail
 umask 077
 
 # Release version = the git tag of the commit this file comes from.
-VERSION=v2.6.0
+VERSION=v2.7.0
 # GitHub repository (owner/name) that publishes tagged releases of this script.
 # Can also be set from the "Версия" screen or with XR_REPO=owner/name.
 DEFAULT_REPO='dohuyanevezuch/3x-ui_reverse'
@@ -3657,12 +3657,13 @@ menu_diag(){
   done
 }
 
-# ---- Routing in this panel's Xray (server side, not client apps)
+# ---- Routing on the clients' devices, delivered by this panel's subscriptions
 ROUTING_UNIT=3x-ui_reverse-routing
 
 routing_timer_sync(){
   # Daily refresh of URL lists — only while such lists exist.
-  if [[ -f "$BASE/routing.json" ]] && grep -q '"type": "url"' "$BASE/routing.json" 2>/dev/null; then
+  if [[ -f "$BASE/routing.json" ]] && { grep -q '"type": "url"' "$BASE/routing.json" ||
+       grep -Eq '"mode": "(ru-direct|blocked-proxy)"' "$BASE/routing.json"; } 2>/dev/null; then
     [[ -f "/etc/systemd/system/$ROUTING_UNIT.timer" ]] && return 0
     write_helper_env
     cat > "/etc/systemd/system/$ROUTING_UNIT.service" <<EOF
@@ -3710,55 +3711,47 @@ routing_do(){
   tui_msg "$title" "{red}✗ ${out#Ошибка: }{/}"
   return 1
 }
+routing_apps_text(){
+  printf '%s\n' "Правила приходят в приложение вместе с подпиской — настраивать на устройстве ничего не нужно:
+
+  {green}●{/} Happ, INCY — любая подписка (обычная или JSON)
+  {green}●{/} v2rayN, v2rayNG и др. на Xray — {bold}JSON-подписка{/} (/$JSON_PATH/…)
+  {green}●{/} Clash Verge, FlClash, Mihomo — {bold}Clash-подписка{/} (/$CLASH_PATH/…)
+  {dim}○ Hiddify, Streisand, Shadowrocket и v2rayNG с обычной подпиской правила не получают —
+    там маршрутизация настраивается в самом приложении.{/}
+
+{dim}Приложение подхватит правила при следующем обновлении подписки.{/}"
+}
+routing_after_note(){
+  local dropped
+  dropped=$(sed -n 's/^happ_dropped=//p' <<< "$ROUTING_OUT")
+  if [[ -n "$dropped" && "$dropped" != 0 ]]; then
+    note "{yellow}⚠ В Happ/INCY не поместились $dropped своих записей (заголовок подписки до 8 КБ); в JSON- и Clash-подписках они есть.{/}"
+  fi
+  if grep -q '^lists_missing=1' <<< "$ROUTING_OUT"; then
+    note '{yellow}⚠ Список заблокированного (itdoginfo) не скачался — JSON-подписка получит его при следующем обновлении (раз в сутки). Happ и Clash берут списки сами.{/}'
+  fi
+  note '{dim}Клиенты получат правила при следующем обновлении подписки. Подключения через сервер не прерывались.{/}'
+}
 routing_mode_screen(){
   local cur ch
   cur=$(helper routing-show 2>>"$LOG" | sed -n 's/^mode=//p')
-  ch=$(tui_radiolist 'Режим маршрутизации' "Правила работают внутри Xray этого сервера для всех его клиентов.
-{bold}Напрямую{/} — трафик выходит с IP этого сервера.
-{bold}Через VPN{/} — трафик уходит через выбранный VPN-выход (другой сервер).
+  ch=$(tui_radiolist 'Режим маршрутизации' "Маршрутизация на устройствах клиентов — её раздаёт подписка этой панели.
+{bold}Напрямую{/} — сайт открывается с IP самого устройства (домашний интернет, мобильная сеть).
+{bold}Через сервер{/} — через inbound этой панели (сервер за границей).
 
-{dim}Удобно на входном сервере в России: заблокированное — через зарубежный узел,
-остальное — быстро и без смены IP. Списки: runetfreedom (geosite_RU / geoip_RU).
-Если узлов несколько, маршрутизация настраивается на каждом отдельно.{/}" \
-       off 'Выключена — всё как настроено в панели' "$([[ $cur == off ]] && echo ON || echo OFF)" \
-       ru-direct 'Российские сервисы напрямую, остальное через VPN' "$([[ $cur == ru-direct ]] && echo ON || echo OFF)" \
-       blocked-vpn 'Заблокированное в РФ через VPN, остальное напрямую' "$([[ $cur == blocked-vpn ]] && echo ON || echo OFF)") || return 0
+{dim}Списки: runetfreedom (geosite/geoip: ru-blocked, category-ru) и itdoginfo/allow-domains.{/}" \
+       off 'Выключена — весь трафик через сервер' "$([[ $cur == off ]] && echo ON || echo OFF)" \
+       ru-direct 'Российские сайты напрямую, остальное через сервер' "$([[ $cur == ru-direct ]] && echo ON || echo OFF)" \
+       blocked-proxy 'Через сервер только заблокированное в РФ, остальное напрямую' "$([[ $cur == blocked-proxy ]] && echo ON || echo OFF)") || return 0
   [[ "$ch" == "$cur" ]] && return 0
-  if [[ "$ch" != off ]] && [[ "$(helper routing-show 2>>"$LOG" | sed -n 's/^vpn_ok=//p')" != 1 ]]; then
-    tui_msg 'VPN-выход' 'Для этого режима нужен VPN-выход — сервер, через который пойдёт трафик «через VPN». Выбери его на следующем шаге.'
-    routing_vpn_screen || return 0
-    [[ "$(helper routing-show 2>>"$LOG" | sed -n 's/^vpn_ok=//p')" == 1 ]] || return 0
-  fi
-  routing_do 'Маршрутизация' 'Применяем правила и перезапускаем Xray' routing-mode "$ch" &&
-    note "{green}✓ Режим: $(case $ch in off) echo 'выключена';; ru-direct) echo 'российские сервисы напрямую, остальное через VPN';; *) echo 'заблокированное в РФ через VPN, остальное напрямую';; esac){/}"
-}
-routing_vpn_screen(){
-  local ch link test info
-  local -a items=('#Добавить' '' link $'По ссылке\t{dim}vless:// vmess:// trojan:// ss:// hysteria2:// wireguard://{/}')
-  read_menu routing-outbounds
-  ((${#TSV_ITEMS[@]})) && items+=('#Outbound-ы панели' '' "${TSV_ITEMS[@]}")
-  ch=$(tui_menu 'VPN-выход' "Куда отправлять трафик «через VPN». Можно выбрать outbound, уже созданный
-в панели (Xray → Outbounds, в т.ч. WARP), или добавить сервер по ссылке." "${items[@]}") || return 1
-  if [[ "$ch" == link ]]; then
-    link=$(tui_input 'VPN-выход по ссылке' 'Ссылка на сервер (как в клиентском приложении). Её разберёт сама панель 3x-ui:' '') || return 1
-    link=${link//[[:space:]]/}
-    [[ -n "$link" ]] || return 1
-    routing_do 'VPN-выход' 'Разбираем ссылку и проверяем соединение' routing-vpn --link "$link" || return 1
-  else
-    routing_do 'VPN-выход' 'Проверяем соединение через выход' routing-vpn "$ch" || return 1
-  fi
-  test=$(sed -n 's/^test=//p' <<< "$ROUTING_OUT"); info=$(sed -n 's/^info=//p' <<< "$ROUTING_OUT")
-  if [[ "$test" == ok ]]; then
-    tui_msg 'VPN-выход' "{green}✓ Выход работает{/} — задержка $info.
-
-$(sed -n 's/^desc=//p' <<< "$ROUTING_OUT")"
-  else
-    tui_msg 'VPN-выход' "{yellow}⚠ Выход сохранён, но проверка не прошла:{/}
-$info
-
-Проверь ссылку или сервер; до исправления трафик «через VPN» не пройдёт."
-  fi
-  return 0
+  routing_do 'Маршрутизация' 'Записываем правила в подписки' routing-mode "$ch" || return 0
+  case "$ch" in
+    off) note '○ Маршрутизация выключена: клиенты снова пускают весь трафик через сервер.' ;;
+    ru-direct) note '{green}✓ Российские сайты — напрямую с устройства, остальное — через сервер.{/}' ;;
+    *) note '{green}✓ Через сервер — только заблокированное в РФ, остальное — напрямую.{/}' ;;
+  esac
+  [[ "$ch" == off ]] || routing_after_note
 }
 routing_add_screen(){
   local kind=$1 val action out
@@ -3772,19 +3765,16 @@ routing_add_screen(){
 {dim}Поддомены входят автоматически (youtube.com → www.youtube.com, m.youtube.com).{/}" '') || return 0
   fi
   [[ -n "${val// /}" ]] || return 0
-  action=$(tui_radiolist 'Куда направлять' 'Как пускать трафик к этим адресам:' \
-           vpn 'Через VPN' ON direct 'Напрямую' OFF) || return 0
-  if [[ "$action" == vpn ]] && [[ "$(helper routing-show 2>>"$LOG" | sed -n 's/^vpn_ok=//p')" != 1 ]]; then
-    tui_msg 'VPN-выход' 'Чтобы отправлять трафик через VPN, сначала выбери VPN-выход.'
-    routing_vpn_screen || return 0
-  fi
+  action=$(tui_radiolist 'Куда направлять' 'Как устройства клиентов будут открывать эти адреса:' \
+           proxy 'Через сервер' ON direct 'Напрямую' OFF) || return 0
   if [[ "$kind" == url ]]; then
-    routing_do 'Маршрутизация' 'Скачиваем список и применяем правила' routing-add "$action" url "$val" || return 0
+    routing_do 'Маршрутизация' 'Скачиваем список и обновляем подписки' routing-add "$action" url "$val" || return 0
   else
-    routing_do 'Маршрутизация' 'Применяем правила' routing-add "$action" domains "$val" || return 0
+    routing_do 'Маршрутизация' 'Обновляем подписки' routing-add "$action" domains "$val" || return 0
   fi
   out=$(sed -n 's/^count=//p' <<< "$ROUTING_OUT")
-  note "{green}✓ Добавлено записей: ${out:-?} — $([[ $action == vpn ]] && echo 'через VPN' || echo 'напрямую').{/}"
+  note "{green}✓ Добавлено записей: ${out:-?} — $([[ $action == proxy ]] && echo 'через сервер' || echo 'напрямую').{/}"
+  routing_after_note
 }
 routing_rules_screen(){
   local id ch first=1
@@ -3795,58 +3785,32 @@ routing_rules_screen(){
       return 0
     fi
     first=0
-    id=$(tui_menu 'Свои правила' 'Правила проверяются по порядку, раньше режима маршрутизации.' "${TSV_ITEMS[@]}") || return 0
+    id=$(tui_menu 'Свои правила' 'Свои правила важнее режима: «через сервер» — раньше всего остального.' "${TSV_ITEMS[@]}") || return 0
     ch=$(tui_menu 'Правило' "$(helper routing-rules 2>>"$LOG" | awk -F'\t' -v i="$id" '$1==i {print $2"  "$3}')" \
-         vpn 'Через VPN' direct 'Напрямую' refresh 'Обновить список сейчас' del '{red}Удалить правило{/}') || continue
-    routing_do 'Маршрутизация' 'Применяем правила' routing-rule "$id" "$ch" || :
+         proxy 'Через сервер' direct 'Напрямую' refresh 'Обновить список сейчас' del '{red}Удалить правило{/}') || continue
+    routing_do 'Маршрутизация' 'Обновляем подписки' routing-rule "$id" "$ch" || :
   done
-}
-routing_test_screen(){
-  local d r kind tag how
-  d=$(tui_input 'Проверить маршрут' 'Домен или IP — куда его отправит Xray этого сервера:' '') || return 0
-  [[ -n "$d" ]] || return 0
-  if ! r=$(helper routing-test "$d" 2>&1); then tui_msg 'Проверка' "{red}✗ ${r#Ошибка: }{/}"; return 0; fi
-  IFS=$'\t' read -r kind tag how <<< "$r"
-  case "$kind" in
-    vpn) r="{accent}➜ через VPN{/} (outbound $tag)" ;;
-    direct) r="{green}● напрямую{/} (outbound $tag)" ;;
-    block) r="{red}✗ блокируется{/} (outbound $tag)" ;;
-    *) r="outbound {bold}$tag{/}" ;;
-  esac
-  tui_msg 'Проверка маршрута' "$d → $r
-{dim}$([[ $how == rule ]] && echo 'Сработало правило маршрутизации.' || echo 'Ни одно правило не сработало — используется outbound по умолчанию.'){/}"
 }
 menu_routing(){
   need_panel_api || return 0
-  local ch head nosniff
-  local -a sniff_item=()
+  local ch head
   while :; do
     head=$(helper routing-text 2>>"$LOG") || head='{red}API 3x-ui недоступен{/}'
-    nosniff=$(helper routing-show 2>>"$LOG" | sed -n 's/^nosniff=//p')
-    sniff_item=()
-    if [[ "${nosniff:-0}" != 0 ]]; then
-      head+=$'\n'"{yellow}⚠ У $nosniff inbound-ов выключен сниффинг — доменные правила для них не сработают.{/}"
-      sniff_item=(sniff $'Включить сниффинг\t{dim}на всех inbound-ах без него{/}')
-    fi
-    ch=$(tui_menu 'Маршрутизация' "$head" \
-         mode $'Режим\t{dim}РФ напрямую / заблокированное через VPN{/}' \
-         vpn $'VPN-выход\t{dim}сервер для трафика «через VPN»{/}' \
+    ch=$(tui_menu 'Маршрутизация' "$head
+{dim}Сайты открываются напрямую с устройства клиента или через этот сервер.{/}" \
+         mode $'Режим\t{dim}РФ напрямую / только заблокированное через сервер{/}' \
          '#Свои правила' '' \
-         domains $'Добавить домены или IP\t{dim}напрямую или через VPN{/}' \
+         domains $'Добавить домены или IP\t{dim}напрямую или через сервер{/}' \
          url $'Добавить список по ссылке\t{dim}обновляется раз в сутки{/}' \
          rules $'Свои правила\t{dim}изменить, обновить, удалить{/}' \
-         '#Проверка' '' \
-         test $'Проверить домен\t{dim}куда Xray отправит трафик{/}' \
-         "${sniff_item[@]}") || return 0
+         '#Справка' '' \
+         apps $'Какие приложения поддерживают\t{dim}Happ, v2rayN, Clash…{/}') || return 0
     case "$ch" in
       mode) routing_mode_screen ;;
-      vpn) routing_vpn_screen || : ;;
       domains) routing_add_screen domains ;;
       url) routing_add_screen url ;;
       rules) routing_rules_screen ;;
-      test) routing_test_screen ;;
-      sniff) routing_do 'Сниффинг' 'Включаем сниффинг на inbound-ах' sniff-enable-all &&
-               note "{green}✓ Сниффинг включён на inbound-ах: $ROUTING_OUT{/}" ;;
+      apps) tui_msg 'Маршрутизация в приложениях' "$(routing_apps_text)" ;;
     esac
     flush_notes
   done
@@ -4463,12 +4427,78 @@ def cmd_country(_args):
     print(country_name())
 
 
+FLAG_RE = re.compile('^[\U0001F1E6-\U0001F1FF]{2}\\s*')
+
+
+def flag_emoji(code):
+    """🇳🇱 for 'NL' (two regional indicator symbols); '' for anything else."""
+    code = (code or '').upper()
+    if not re.fullmatch(r'[A-Z]{2}', code):
+        return ''
+    return ''.join(chr(0x1F1E6 + ord(ch) - ord('A')) for ch in code)
+
+
+def country_iso():
+    """ISO code behind country_name(): XR_COUNTRY if it is a code, else the VPS's."""
+    forced = os.environ.get('XR_COUNTRY', '').strip()
+    if forced:
+        if forced.upper() in COUNTRY_EN:
+            return forced.upper()
+        rev = {v.lower(): k for k, v in COUNTRY_EN.items()}
+        return rev.get(forced.lower(), '')
+    return country_code()
+
+
+def country_prefix():
+    """'🇳🇱 Netherlands' — the start of auto inbound names ('' with XR_COUNTRY=none)."""
+    name = country_name()
+    if not name:
+        return ''
+    flag = flag_emoji(country_iso())
+    return ('%s %s' % (flag, name)).strip()
+
+
 def short_name(remark):
-    """Inbound name without the country prefix (for compact tables)."""
+    """Inbound name without the flag and country prefix (for compact tables)."""
+    remark = FLAG_RE.sub('', remark or '', count=1)
     for prefix in list(COUNTRY_EN.values()) + list(LEGACY_COUNTRY_RU):
         if remark.startswith(prefix + ' ') and len(remark) > len(prefix) + 1:
             return remark[len(prefix) + 1:]
     return remark
+
+
+def flagged_remark(remark):
+    """Add the country flag to an auto name of an older version; None if nothing to do.
+    'Netherlands VLESS…' → '🇳🇱 Netherlands VLESS…'; 'Нидерланды VLESS…' → '🇳🇱 Netherlands VLESS…'."""
+    if not remark or FLAG_RE.match(remark):
+        return None
+    for code, name in sorted(COUNTRY_EN.items(), key=lambda kv: -len(kv[1])):
+        if remark.startswith(name + ' '):
+            return '%s %s' % (flag_emoji(code), remark)
+    try:
+        ru = COUNTRY_RU                     # defined in the IP Region part
+    except NameError:
+        ru = {}
+    for code, name in sorted(ru.items(), key=lambda kv: -len(kv[1])):
+        if remark.startswith(name + ' ') and code in COUNTRY_EN:
+            return '%s %s %s' % (flag_emoji(code), COUNTRY_EN[code], remark[len(name) + 1:])
+    return None
+
+
+def cmd_inbound_flags(_args):
+    """Prefix the flag to auto-named inbounds created by older versions; prints the count."""
+    n = 0
+    for ib in inbounds():
+        new = flagged_remark(ib.get('remark') or '')
+        if not new:
+            continue
+        names = {x.get('remark') for x in inbounds() if x['id'] != ib['id']}
+        if new in names:
+            continue
+        ib['remark'] = new
+        save_inbound(ib)
+        n += 1
+    print(n)
 
 
 # ------------------------------------------------------------ catalog
@@ -4855,7 +4885,7 @@ def cmd_create_inbounds(args):
             sni = snis.get(k) or (auto_snis.pop(0) if k in REALITY_KINDS or k == 'mtproto' else '')
         plan.append((k, port, sni, cert, key))
     created = []
-    country = country_name()
+    country = country_prefix()
     for k, port, sni, cert, key in plan:
         base = names.get(k) or ('%s %s' % (country, KIND[k]['label'])).strip()
         payload = build(k, port, sni, cert, key, sniff)
@@ -5051,11 +5081,13 @@ def cmd_inbounds(args):
         out('{yellow}⚠ В панели нет inbound-ов.{/}')
         return
     if '--compact' in args:
-        w = max(len(ib.get('remark') or '') for ib in ibs)
+        w = min(max(len(ib.get('remark') or '') for ib in ibs), 36)
         for ib in ibs:
             dot = '{green}●{/}' if ib.get('enable') else '{red}○{/}'
             sni = inbound_sni(ib)
-            out('%s %s  %-10s {dim}%s{/}' % (dot, (ib.get('remark') or ib.get('tag') or '').ljust(min(w, 34)),
+            name = ib.get('remark') or ib.get('tag') or ''
+            name = name if len(name) <= w else name[:w - 1] + '…'
+            out('%s %s  %-10s {dim}%s{/}' % (dot, name.ljust(w),
                                           '%s/%s' % (ib.get('port'), inbound_transport(ib)), sni))
         out('{dim}%d inbound-ов · изменить порт, название, SNI или TLS — «Изменить inbound»{/}' % len(ibs))
         return
@@ -5872,7 +5904,7 @@ def cmd_pair_publish(args):
     d, f = _pair_paths(secret)
     exp = int(time.time()) + PAIR_TTL
     bundle = {'v': 1, 'scheme': 'https', 'address': domain, 'port': int(port), 'basePath': base_path,
-              'apiToken': api_token, 'country': country_name(), 'name': country_name() or domain, 'exp': exp}
+              'apiToken': api_token, 'country': country_name(), 'name': country_prefix() or domain, 'exp': exp}
     blob = _seal(secret, json.dumps(bundle).encode())
     path = os.path.join(site, d)
     os.makedirs(path, mode=0o755, exist_ok=True)
@@ -6802,28 +6834,32 @@ def cmd_ipregion_table(args):
 
 
 # ------------------------------------------------------------------ routing
-# Server-side routing in this panel's Xray template (not client routing).
+# Split tunnelling ON THE CLIENTS, delivered by this panel's subscriptions:
+# Russian sites go straight from the user's device, blocked ones through the
+# server (or the reverse). 3x-ui sends the rules with the subscription:
+#   Happ / INCY  — "Routing" header (happ://routing/onadd/… deeplink),
+#   JSON         — rules baked into each Xray config (v2rayN, v2rayNG…),
+#   Clash/Mihomo — rules in the YAML profile.
 # State: STATE_DIR/routing.json; downloaded lists: STATE_DIR/routing-lists/.
-# Our rules carry ruleTag "3xr-…" and are rebuilt on every apply; rules made
-# by hand in the panel stay untouched and keep priority (they come first).
 import hashlib
 import ipaddress as _ipa
 
 ROUTING_FILE = os.path.join(STATE_DIR, 'routing.json')
 ROUTING_LISTS = os.path.join(STATE_DIR, 'routing-lists')
-VPN_TAG = '3xr-vpn'
-DIRECT_TAG = 'direct'
 ROUTING_MODES = {
-    'off': 'выключена',
-    'ru-direct': 'российские сервисы напрямую, остальное через VPN',
-    'blocked-vpn': 'заблокированное в РФ через VPN, остальное напрямую',
+    'off': 'выключена — весь трафик через сервер',
+    'ru-direct': 'российские сайты напрямую, остальное через сервер',
+    'blocked-proxy': 'через сервер только заблокированное в РФ, остальное напрямую',
 }
-# runetfreedom/russia-v2ray-rules-dat (shipped with 3x-ui as geosite_RU.dat/geoip_RU.dat)
-RU_DOMAINS = ['ext:geosite_RU.dat:category-ru', 'ext:geosite_RU.dat:ru-available-only-inside',
-              'regexp:\\.(ru|su|xn--p1ai)$']
-RU_IPS = ['ext:geoip_RU.dat:ru']
-BLOCKED_DOMAINS = ['ext:geosite_RU.dat:ru-blocked']
-BLOCKED_IPS = ['ext:geoip_RU.dat:ru-blocked']
+RUNET = 'https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/'
+ITDOG = 'https://raw.githubusercontent.com/itdoginfo/allow-domains/main/'
+BLOCKED_DOMAINS_URL = ITDOG + 'Russia/inside-raw.lst'
+BLOCKED_SUBNET_URLS = [ITDOG + 'Subnets/IPv4/%s.lst' % n for n in ('telegram', 'meta', 'twitter', 'discord')]
+PRIVATE_IP = ['10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16', '127.0.0.0/8', '169.254.0.0/16', '100.64.0.0/10']
+RU_SUFFIXES = ['ru', 'su', 'xn--p1ai']
+HAPP_MAX = 7000                       # 3x-ui sends at most 8 KiB in the Routing header
+SUB_KEYS = ('subEnableRouting', 'subRoutingRules', 'subJsonRoutingRules', 'subClashEnableRouting',
+            'subClashRules', 'subIncyEnableRouting', 'subIncyRoutingRules')
 DOMAIN_RE = re.compile(r'^(\*\.)?([a-z0-9_]([a-z0-9_-]{0,61}[a-z0-9_])?\.)+[a-z0-9-]{2,63}\.?$', re.I)
 PREFIXES = ('domain:', 'full:', 'regexp:', 'keyword:', 'geosite:', 'ext:')
 
@@ -6834,8 +6870,10 @@ def routing_load():
             st = json.load(fh)
     except (OSError, ValueError):
         st = {}
-    st.setdefault('mode', 'off')
-    st.setdefault('vpn', '')
+    if st.get('mode') == 'blocked-vpn':          # v2.6.0 server-side names
+        st['mode'] = 'blocked-proxy'
+    if st.get('mode') not in ROUTING_MODES:
+        st['mode'] = 'off'
     st.setdefault('custom', [])
     return st
 
@@ -6883,6 +6921,9 @@ def parse_entries(text):
                 tok = tok[2:]
             if tok.startswith('.'):
                 tok = tok[1:]
+                if re.fullmatch(r'[a-z0-9-]{2,63}', tok):     # ".ua" = the whole zone
+                    domains.append('domain:' + tok)
+                    continue
             if DOMAIN_RE.match(tok):
                 domains.append('domain:' + tok.rstrip('.'))
     return domains, ips
@@ -6924,224 +6965,220 @@ def cached_list(url):
         return [], []
 
 
-def _outbound_tags(tpl):
-    return [o.get('tag') for o in tpl.get('outbounds') or [] if o.get('tag')]
 
-
-def _ensure_direct(tpl):
-    for o in tpl.get('outbounds') or []:
-        if o.get('protocol') == 'freedom' and o.get('tag') == DIRECT_TAG:
-            return DIRECT_TAG
-    for o in tpl.get('outbounds') or []:
-        if o.get('protocol') == 'freedom' and not (o.get('settings') or {}).get('redirect'):
-            return o.get('tag')
-    tpl.setdefault('outbounds', []).append({'tag': DIRECT_TAG, 'protocol': 'freedom', 'settings': {}})
-    return DIRECT_TAG
-
-
-def build_rules(st, tpl):
-    """Our rules for the template; dies if a needed outbound is missing."""
-    direct = _ensure_direct(tpl)
-    vpn = st.get('vpn') or ''
-    tags = _outbound_tags(tpl)
-    needs_vpn = st['mode'] != 'off' or any(r.get('action') == 'vpn' for r in st['custom'])
-    if needs_vpn and vpn not in tags:
-        die('не выбран VPN-выход (или он удалён из панели) — выбери его в «Маршрутизация → VPN-выход»')
-    target = {'direct': direct, 'vpn': vpn}
-    rules = []
-    for i, r in enumerate(st['custom']):
+def _custom(st):
+    """Custom rules -> {'direct': (domains, ips), 'proxy': (domains, ips)}."""
+    acc = {'direct': ([], []), 'proxy': ([], [])}
+    for r in st['custom']:
         if r.get('type') == 'url':
             domains, ips = cached_list(r['url'])
         else:
             domains, ips = parse_entries('\n'.join(r.get('items') or []))
-        out = target[r.get('action', 'vpn')]
-        if domains:
-            rules.append({'type': 'field', 'domain': domains, 'outboundTag': out, 'ruleTag': '3xr-c%d-d' % i})
-        if ips:
-            rules.append({'type': 'field', 'ip': ips, 'outboundTag': out, 'ruleTag': '3xr-c%d-i' % i})
-    if st['mode'] == 'ru-direct':
-        rules += [{'type': 'field', 'domain': RU_DOMAINS, 'outboundTag': direct, 'ruleTag': '3xr-ru-d'},
-                  {'type': 'field', 'ip': RU_IPS, 'outboundTag': direct, 'ruleTag': '3xr-ru-i'},
-                  {'type': 'field', 'network': 'tcp,udp', 'outboundTag': vpn, 'ruleTag': '3xr-default'}]
-    elif st['mode'] == 'blocked-vpn':
-        rules += [{'type': 'field', 'domain': BLOCKED_DOMAINS, 'outboundTag': vpn, 'ruleTag': '3xr-blk-d'},
-                  {'type': 'field', 'ip': BLOCKED_IPS, 'outboundTag': vpn, 'ruleTag': '3xr-blk-i'},
-                  {'type': 'field', 'network': 'tcp,udp', 'outboundTag': direct, 'ruleTag': '3xr-default'}]
-    return rules
+        side = 'direct' if r.get('action') == 'direct' else 'proxy'
+        acc[side][0].extend(d for d in domains if d not in acc[side][0])
+        acc[side][1].extend(i for i in ips if i not in acc[side][1])
+    return acc
 
 
-def _validate_tokens(rules):
-    toks_d = sorted({t for r in rules for t in r.get('domain', []) if t.startswith(('geosite:', 'ext:'))})
-    toks_i = sorted({t for r in rules for t in r.get('ip', []) if t.startswith(('geoip:', 'ext:'))})
-    for kind, toks in (('domain', toks_d), ('ip', toks_i)):
-        if not toks:
-            continue
-        reply = call('/xray/geodata/validate', {'tokens': ','.join(toks), 'kind': kind}, form=True)
-        if reply.get('success') and reply.get('obj'):
-            bad = ', '.join('%s (%s)' % (x.get('token', '?'), x.get('reason', '?')) for x in reply['obj'][:5])
-            die('в Xray нет нужных geo-баз: %s — обнови geo-файлы панели (geosite_RU.dat, geoip_RU.dat)' % bad)
+def _builtin_blocked():
+    """Inline list of blocked domains/subnets (for JSON configs without runetfreedom geo files)."""
+    domains, ips = cached_list(BLOCKED_DOMAINS_URL)
+    for u in BLOCKED_SUBNET_URLS:
+        ips += cached_list(u)[1]
+    return domains, ips
+
+
+def refresh_builtin():
+    """Re-download the built-in lists; a failure keeps the cached copy. True if all loaded."""
+    good = True
+    for u in [BLOCKED_DOMAINS_URL] + BLOCKED_SUBNET_URLS:
+        try:
+            fetch_list(u)
+        except (Exception, SystemExit) as e:
+            good = False
+            sys.stderr.write('routing: не удалось скачать %s: %s\n' % (u, e))
+    return good
+
+
+def _happ_profile(st, custom):
+    """Happ/INCY profile; geo files from runetfreedom (have ru-blocked, category-ru…)."""
+    mode = st['mode']
+    cd, ci = custom['direct']
+    pd, pi = custom['proxy']
+    prof = {'Name': '3x-ui_reverse', 'GlobalProxy': 'false' if mode == 'blocked-proxy' else 'true',
+            'RouteOrder': 'block-proxy-direct', 'Geoipurl': RUNET + 'geoip.dat', 'Geositeurl': RUNET + 'geosite.dat',
+            'LastUpdated': str(int(time.time())), 'DomainStrategy': 'IPIfNonMatch', 'FakeDNS': 'false',
+            'BlockSites': [], 'BlockIp': [], 'ProxySites': [], 'ProxyIp': [],
+            'DirectSites': ['geosite:private'], 'DirectIp': ['geoip:private']}
+    if mode != 'off':
+        prof['ProxySites'].append('geosite:ru-blocked')
+        prof['ProxyIp'].append('geoip:ru-blocked')
+    if mode == 'ru-direct':
+        prof['DirectSites'] += ['geosite:category-ru', 'geosite:ru-available-only-inside'] + \
+            ['domain:' + t for t in RU_SUFFIXES]
+        prof['DirectIp'].append('geoip:ru')
+    # Custom entries go in while the deeplink stays under the header limit.
+    dropped = 0
+    for key, items in (('ProxySites', pd), ('ProxyIp', pi), ('DirectSites', cd), ('DirectIp', ci)):
+        for it in items:
+            if it.startswith('ext:'):
+                continue
+            prof[key].append(it)
+            if len(_happ_link(prof)) > HAPP_MAX:
+                prof[key].pop()
+                dropped += 1
+    return prof, dropped
+
+
+def _happ_link(prof):
+    import base64
+    return 'happ://routing/onadd/' + base64.b64encode(json.dumps(prof, ensure_ascii=False,
+                                                                   separators=(',', ':')).encode()).decode()
+
+
+def _json_spec(st, custom):
+    """Rules baked into JSON-subscription configs. Only categories present in the
+    stock geo files of v2rayN/v2rayNG; blocked domains/subnets are inlined."""
+    mode = st['mode']
+    plain = lambda xs: [x for x in xs if not x.startswith('ext:')]
+    cd, ci = plain(custom['direct'][0]), plain(custom['direct'][1])
+    pd, pi = plain(custom['proxy'][0]), plain(custom['proxy'][1])
+    spec = {'DomainStrategy': 'IPIfNonMatch', 'RouteOrder': 'block-proxy-direct', 'BlockSites': [], 'BlockIp': [],
+            'ProxySites': pd, 'ProxyIp': pi, 'DirectSites': ['geosite:private'] + cd, 'DirectIp': ['geoip:private'] + ci}
+    if mode != 'off':
+        bd, bi = _builtin_blocked()
+        spec['ProxySites'] = pd + bd
+        spec['ProxyIp'] = pi + bi
+    if mode == 'ru-direct':
+        spec['DirectSites'] += ['geosite:category-ru'] + ['domain:' + t for t in RU_SUFFIXES]
+        spec['DirectIp'].append('geoip:ru')
+    elif mode == 'blocked-proxy':
+        spec['DirectIp'] += ['0.0.0.0/0', '::/0']        # everything not listed above: direct
+    return spec
+
+
+def _clash_rule(entry, target):
+    if entry.startswith('domain:'):
+        return 'DOMAIN-SUFFIX,%s,%s' % (entry[7:], target)
+    if entry.startswith('full:'):
+        return 'DOMAIN,%s,%s' % (entry[5:], target)
+    if entry.startswith('keyword:'):
+        return 'DOMAIN-KEYWORD,%s,%s' % (entry[8:], target)
+    if entry.startswith('regexp:'):
+        return 'DOMAIN-REGEX,%s,%s' % (entry[7:], target)
+    if entry.startswith('geosite:'):
+        return 'GEOSITE,%s,%s' % (entry[8:], target)
+    try:
+        net = _ipa.ip_network(entry, strict=False)
+        return '%s,%s,%s,no-resolve' % ('IP-CIDR6' if net.version == 6 else 'IP-CIDR', entry, target)
+    except ValueError:
+        return None
+
+
+def _clash_yaml(st, custom):
+    """Mihomo profile part (JSON is valid YAML); geo files from runetfreedom."""
+    mode = st['mode']
+    rules = ['IP-CIDR,%s,DIRECT,no-resolve' % n for n in PRIVATE_IP]
+    for side, target in (('proxy', 'PROXY'), ('direct', 'DIRECT')):
+        for e in custom[side][0] + custom[side][1]:
+            r = _clash_rule(e, target)
+            if r:
+                rules.append(r)
+    if mode != 'off':
+        rules += ['GEOSITE,ru-blocked,PROXY', 'GEOIP,ru-blocked,PROXY,no-resolve']
+    if mode == 'ru-direct':
+        rules += ['GEOSITE,category-ru,DIRECT', 'GEOSITE,ru-available-only-inside,DIRECT'] + \
+            ['DOMAIN-SUFFIX,%s,DIRECT' % t for t in RU_SUFFIXES] + ['GEOIP,ru,DIRECT']
+    rules.append('MATCH,DIRECT' if mode == 'blocked-proxy' else 'MATCH,PROXY')
+    doc = {'geodata-mode': True, 'geox-url': {'geosite': RUNET + 'geosite.dat', 'geoip': RUNET + 'geoip.dat'},
+           'rules': rules}
+    return json.dumps(doc, ensure_ascii=False, indent=1)
+
+
+def _settings():
+    return jload(ok(call('/setting/all', {}), 'настройки панели'), {})
+
+
+def _save_settings(allset):
+    ok(call('/setting/update', allset), 'сохранение настроек панели')
+    # SIGHUP inside 3x-ui: only the web and subscription servers restart — Xray
+    # and the users' connections keep running.
+    ok(call('/setting/restartPanel', {}), 'перезапуск подписок')
+    time.sleep(4)
+    for _ in range(30):
+        try:
+            if call('/inbounds/list', timeout=5).get('success'):
+                return
+        except SystemExit:
+            pass
+        time.sleep(1)
+    die('панель не вернулась после перезапуска')
 
 
 def routing_apply(st):
-    tpl = get_template()
-    prev = json.loads(json.dumps(tpl))
-    rules = build_rules(st, tpl)
-    _validate_tokens(rules)
-    routing = tpl.setdefault('routing', {})
-    kept = [r for r in routing.get('rules') or [] if not str(r.get('ruleTag', '')).startswith('3xr-')]
-    routing['rules'] = kept + rules
-    routing.setdefault('domainStrategy', 'AsIs')
-    if routing['domainStrategy'] == 'AsIs' and any('ip' in r for r in rules):
-        routing['domainStrategy'] = 'IPIfNonMatch'      # domain-only connections still hit IP rules
-    put_template(tpl, prev)
-
-
-def _outbound_desc(o):
-    s = o.get('settings') or {}
-    addr = s.get('address') or ''
-    port = s.get('port') or ''
-    if not addr:
-        vn = (s.get('vnext') or s.get('servers') or [{}])[0]
-        addr, port = vn.get('address', ''), vn.get('port', '')
-    if not addr and s.get('peers'):
-        addr = (s['peers'][0] or {}).get('endpoint', '')
-    proto = o.get('protocol', '')
-    sec = (o.get('streamSettings') or {}).get('security') or ''
-    return '%s%s%s' % (proto, (' · ' + sec) if sec and sec != 'none' else '',
-                       (' · %s%s' % (addr, (':%s' % port) if port else '')) if addr else '')
+    allset = _settings()
+    if 'prev' not in st:                              # what the panel had before us
+        st['prev'] = {k: allset.get(k) for k in SUB_KEYS}
+    info = {}
+    if st['mode'] == 'off' and not st['custom']:
+        prev = st.get('prev') or {}
+        for k in SUB_KEYS:
+            allset[k] = prev.get(k, allset.get(k))
+        if not (prev.get('subRoutingRules') or '').strip():
+            allset['subRoutingRules'] = 'happ://routing/off'      # Happ drops the profile it got from us
+    else:
+        if st['mode'] != 'off' and not cached_list(BLOCKED_DOMAINS_URL)[0]:
+            refresh_builtin()
+            if not cached_list(BLOCKED_DOMAINS_URL)[0]:
+                info['lists_missing'] = 1   # JSON subscription works without them until the next refresh
+        custom = _custom(st)
+        prof, info['happ_dropped'] = _happ_profile(st, custom)
+        link = _happ_link(prof)
+        allset.update(subEnableRouting=True, subRoutingRules=link, subIncyEnableRouting=True, subIncyRoutingRules=link,
+                      subJsonRoutingRules=json.dumps(_json_spec(st, custom), ensure_ascii=False, separators=(',', ':')),
+                      subClashEnableRouting=True, subClashRules=_clash_yaml(st, custom))
+    _save_settings(allset)
+    return info
 
 
 def cmd_routing_show(args):
     st = routing_load()
-    tpl = get_template()
-    outs = {o.get('tag'): o for o in tpl.get('outbounds') or []}
-    mode = st['mode']
-    print('mode=%s' % mode)
-    print('vpn=%s' % st['vpn'])
-    print('vpn_ok=%d' % (1 if st['vpn'] in outs else 0))
-    print('vpn_desc=%s' % (_outbound_desc(outs[st['vpn']]) if st['vpn'] in outs else ''))
+    print('mode=%s' % st['mode'])
     print('custom=%d' % len(st['custom']))
-    nosniff = [ib for ib in inbounds() if ib.get('enable') and ib.get('protocol') not in ('mtproto', 'wireguard', 'amneziawg')
-               and not jload(ib.get('sniffing'), {}).get('enabled')]
-    print('nosniff=%d' % len(nosniff))
 
 
 def cmd_routing_text(args):
-    """Header text for the routing screen (markup)."""
     st = routing_load()
-    tpl = get_template()
-    outs = {o.get('tag'): o for o in tpl.get('outbounds') or []}
     mode = st['mode']
-    col = 'dim' if mode == 'off' else 'green'
-    out('Режим:       ' + c(col, ROUTING_MODES[mode]))
-    if st['vpn'] in outs:
-        out('VPN-выход:   ' + c('accent', st['vpn']) + c('dim', '  ' + _outbound_desc(outs[st['vpn']])))
-    elif st['vpn']:
-        out('VPN-выход:   ' + c('red', '✗ «%s» больше нет в панели' % st['vpn']))
-    else:
-        out('VPN-выход:   ' + c('dim', 'не выбран'))
+    out('Режим:        ' + c('dim' if mode == 'off' else 'green', ROUTING_MODES[mode]))
     n = len(st['custom'])
     out('Свои правила: %s' % (c('bold', str(n)) if n else c('dim', 'нет')))
 
 
-def cmd_routing_outbounds(args):
-    """Menu rows of outbounds usable as the VPN exit."""
-    tpl = get_template()
-    for o in tpl.get('outbounds') or []:
-        if o.get('protocol') in ('freedom', 'blackhole', 'dns', 'loopback') or not o.get('tag') or o.get('tag') == 'api':
-            continue
-        out('%s\t%s\t%s' % (o['tag'], o['tag'], c('dim', _outbound_desc(o))))
-
-
-def _parse_link_via_panel(link):
-    """3x-ui's own share-link parser, fed through a one-shot local URL."""
-    import http.server
-    import threading
-    body = (link.strip() + '\n').encode()
-
-    class H(http.server.BaseHTTPRequestHandler):
-        def do_GET(self):
-            self.send_response(200)
-            self.send_header('Content-Type', 'text/plain')
-            self.end_headers()
-            self.wfile.write(body)
-
-        def log_message(self, *a):
-            pass
-    srv = http.server.HTTPServer(('127.0.0.1', 0), H)
-    th = threading.Thread(target=srv.serve_forever, daemon=True)
-    th.start()
-    try:
-        reply = call('/xray/outbound-subs/parse',
-                     {'url': 'http://127.0.0.1:%d/' % srv.server_port, 'allowPrivate': 'true'}, form=True, timeout=30)
-    finally:
-        srv.shutdown()
-    obs = ok(reply, 'разбор ссылки') or []
-    if not obs:
-        die('ссылка не распознана (поддерживаются vless://, vmess://, trojan://, ss://, hysteria2://, wireguard://)')
-    return obs[0]
-
-
-def _test_outbound(ob, outbounds):
-    reply = call('/xray/testOutbound', {'outbound': json.dumps(ob), 'allOutbounds': json.dumps(outbounds),
-                                        'mode': 'real'}, form=True, timeout=60)
-    obj = reply.get('obj') if reply.get('success') else None
-    if isinstance(obj, dict):
-        if obj.get('success') or obj.get('delay'):
-            return True, '%s мс' % obj.get('delay', '?')
-        return False, (obj.get('error') or reply.get('msg') or 'нет ответа')[:120]
-    return False, (reply.get('msg') or 'нет ответа')[:120]
-
-
-def cmd_routing_vpn(args):
-    """routing-vpn TAG | routing-vpn --link LINK  → prints test result."""
-    st = routing_load()
-    tpl = get_template()
-    prev = json.loads(json.dumps(tpl))
-    if args and args[0] == '--link':
-        ob = _parse_link_via_panel(args[1])
-        ob['tag'] = VPN_TAG
-        outs = [o for o in tpl.get('outbounds') or [] if o.get('tag') != VPN_TAG]
-        if not outs:
-            outs = [{'tag': DIRECT_TAG, 'protocol': 'freedom', 'settings': {}}]
-        outs.append(ob)                                   # never first: first = default outbound
-        tpl['outbounds'] = outs
-        good, info = _test_outbound(ob, outs)
-        st['vpn'] = VPN_TAG
-        put_template(tpl, prev)
-    else:
-        tag = args[0]
-        outs = {o.get('tag'): o for o in tpl.get('outbounds') or []}
-        if tag not in outs:
-            die('нет outbound «%s»' % tag)
-        good, info = _test_outbound(outs[tag], tpl.get('outbounds') or [])
-        st['vpn'] = tag
-    routing_save(st)
-    if st['mode'] != 'off' or st['custom']:
-        routing_apply(st)
-    print('test=%s\ninfo=%s\ndesc=%s' % ('ok' if good else 'fail', info,
-                                         _outbound_desc(next(o for o in get_template().get('outbounds', [])
-                                                             if o.get('tag') == st['vpn']))))
-
-
 def cmd_routing_mode(args):
     mode = args[0]
+    if mode == 'blocked-vpn':
+        mode = 'blocked-proxy'
     if mode not in ROUTING_MODES:
-        die('режим: off | ru-direct | blocked-vpn')
+        die('режим: off | ru-direct | blocked-proxy')
     st = routing_load()
-    old = st['mode']
     st['mode'] = mode
-    routing_apply(st)          # dies before saving if something is wrong
+    info = routing_apply(st)
     routing_save(st)
-    if old != mode:
-        print('ok')
+    print('ok')
+    if info.get('happ_dropped'):
+        print('happ_dropped=%d' % info['happ_dropped'])
+    if info.get('lists_missing'):
+        print('lists_missing=1')
 
 
 def cmd_routing_add(args):
-    """routing-add direct|vpn domains ITEMS… | routing-add direct|vpn url URL"""
+    """routing-add direct|proxy domains ITEMS… | routing-add direct|proxy url URL"""
     action, kind = args[0], args[1]
-    if action not in ('direct', 'vpn'):
-        die('действие: direct | vpn')
+    if action == 'vpn':
+        action = 'proxy'
+    if action not in ('direct', 'proxy'):
+        die('действие: direct | proxy')
     st = routing_load()
     if kind == 'url':
         url = args[2].strip()
@@ -7160,16 +7197,19 @@ def cmd_routing_add(args):
         rule = {'type': 'domains', 'items': [d[len('domain:'):] if d.startswith('domain:') else d for d in domains] + ips,
                 'action': action}
     st['custom'].append(rule)
-    routing_apply(st)
+    info = routing_apply(st)
     routing_save(st)
     print('count=%d' % (len(domains) + len(ips)))
+    if info.get('happ_dropped'):
+        print('happ_dropped=%d' % info['happ_dropped'])
+    if info.get('lists_missing'):
+        print('lists_missing=1')
 
 
 def cmd_routing_rules(args):
-    """Menu rows (index, label…) of custom rules."""
     st = routing_load()
     for i, r in enumerate(st['custom']):
-        act = c('green', 'напрямую') if r.get('action') == 'direct' else c('accent', 'через VPN')
+        act = c('green', 'напрямую') if r.get('action') == 'direct' else c('accent', 'через сервер')
         if r.get('type') == 'url':
             what = r['url']
             if len(what) > 52:
@@ -7182,8 +7222,10 @@ def cmd_routing_rules(args):
 
 
 def cmd_routing_rule(args):
-    """routing-rule N del|direct|vpn|refresh"""
+    """routing-rule N del|direct|proxy|refresh"""
     i, op = int(args[0]), args[1]
+    if op == 'vpn':
+        op = 'proxy'
     st = routing_load()
     if not 0 <= i < len(st['custom']):
         die('нет правила %d' % i)
@@ -7195,7 +7237,7 @@ def cmd_routing_rule(args):
                 os.remove(_list_path(r['url']))
             except OSError:
                 pass
-    elif op in ('direct', 'vpn'):
+    elif op in ('direct', 'proxy'):
         r['action'] = op
     elif op == 'refresh' and r.get('type') == 'url':
         domains, ips = fetch_list(r['url'])
@@ -7206,63 +7248,59 @@ def cmd_routing_rule(args):
 
 
 def cmd_routing_refresh(args):
-    """Timer: re-download URL lists; apply only when something changed."""
+    """Timer: re-download lists; re-apply only when something changed."""
     st = routing_load()
+    if st['mode'] == 'off' and not st['custom']:
+        return
+    urls = [r['url'] for r in st['custom'] if r.get('type') == 'url']
+    if st['mode'] != 'off':
+        urls += [BLOCKED_DOMAINS_URL] + BLOCKED_SUBNET_URLS
     changed = False
-    for r in st['custom']:
-        if r.get('type') != 'url':
-            continue
-        before = cached_list(r['url'])
+    for u in urls:
+        before = cached_list(u)
         try:
-            domains, ips = fetch_list(r['url'])
-        except SystemExit:
+            after = fetch_list(u)
+        except (Exception, SystemExit) as e:
+            sys.stderr.write('routing: не удалось скачать %s: %s\n' % (u, e))
             continue
-        r['count'] = len(domains) + len(ips)
-        r['updated'] = int(time.time())
-        changed = changed or (domains, ips) != before
+        changed = changed or after != before
+        for r in st['custom']:
+            if r.get('url') == u:
+                r['count'] = len(after[0]) + len(after[1])
+                r['updated'] = int(time.time())
     routing_save(st)
     if changed:
         routing_apply(st)
+        routing_save(st)
         print('обновлено')
 
 
-def cmd_routing_test(args):
-    target = args[0].strip().lower()
-    target = re.sub(r'^https?://', '', target).split('/')[0]
+def cmd_routing_legacy_cleanup(args):
+    """v2.6.0 put routing into the server's Xray (rules "3xr-…", outbound 3xr-vpn): remove it."""
     try:
-        _ipa.ip_address(target)
-        data = {'ip': target}
-    except ValueError:
-        data = {'domain': target}
-    data['port'] = 443
-    reply = call('/xray/routeTest', data, form=True)
-    obj = ok(reply, 'проверка маршрута') or {}
-    tag = obj.get('outboundTag') or ''
+        with open(ROUTING_FILE) as fh:
+            raw = json.load(fh)
+    except (OSError, ValueError):
+        return
+    if 'vpn' not in raw:
+        return
     tpl = get_template()
+    prev = json.loads(json.dumps(tpl))
+    routing = tpl.get('routing') or {}
+    rules = [r for r in routing.get('rules') or [] if not str(r.get('ruleTag', '')).startswith('3xr-')]
+    changed = len(rules) != len(routing.get('rules') or [])
+    routing['rules'] = rules
+    used = {r.get('outboundTag') for r in rules}
     outs = tpl.get('outbounds') or []
-    if not tag and outs:                       # no rule matched: the first outbound is used
-        tag = outs[0].get('tag', '')
-    st = routing_load()
-    proto = next((o.get('protocol') for o in outs if o.get('tag') == tag), '')
-    kind = 'vpn' if tag and tag == st.get('vpn') else (
-        'direct' if proto == 'freedom' else ('block' if proto == 'blackhole' else 'other'))
-    print('%s\t%s\t%s' % (kind, tag, 'rule' if obj.get('matched') else 'default'))
-
-
-def cmd_sniff_enable_all(args):
-    """Turn on sniffing (routeOnly) on inbounds without it: domain rules need it."""
-    n = 0
-    for ib in inbounds():
-        if ib.get('protocol') in ('mtproto', 'wireguard', 'amneziawg'):
-            continue
-        sn = jload(ib.get('sniffing'), {})
-        if sn.get('enabled'):
-            continue
-        sn.update({'enabled': True, 'destOverride': ['http', 'tls', 'quic'], 'metadataOnly': False, 'routeOnly': True})
-        ib['sniffing'] = sn
-        save_inbound(ib)
-        n += 1
-    print(n)
+    if any(o.get('tag') == '3xr-vpn' for o in outs) and '3xr-vpn' not in used:
+        tpl['outbounds'] = [o for o in outs if o.get('tag') != '3xr-vpn']
+        changed = True
+    if changed:
+        put_template(tpl, prev)
+    raw.pop('vpn', None)
+    raw['mode'] = 'off'                     # the server-side mode has no client equivalent to assume
+    routing_save(raw)
+    print('cleaned' if changed else 'ok')
 
 
 # ------------------------------------------------------------------ migration
@@ -7431,7 +7469,7 @@ COMMANDS = {
     'group-create': cmd_group_create, 'group-rename': cmd_group_rename, 'group-delete': cmd_group_delete,
     'group-add-users': cmd_group_add_users, 'group-inbounds': cmd_group_inbounds,
     'groups': cmd_groups, 'menu-members': cmd_menu_members, 'group-set-members': cmd_group_set_members,
-    'country': cmd_country, 'update-check': cmd_update_check, 'update-fetch': cmd_update_fetch,
+    'country': cmd_country, 'inbound-flags': cmd_inbound_flags, 'update-check': cmd_update_check, 'update-fetch': cmd_update_fetch,
     'dns-check': cmd_dns_check, 'public-ip': cmd_public_ip,
     'track-activity': cmd_track_activity, 'enable-access-log': cmd_enable_access_log,
     'node-token-create': cmd_node_token_create, 'node-token-check': cmd_node_token_check,
@@ -7441,10 +7479,9 @@ COMMANDS = {
     'node-enable': cmd_node_enable, 'node-probe': cmd_node_probe, 'pdf': cmd_pdf,
     'iperf-cities': cmd_iperf_cities, 'iperf-city': cmd_iperf_city, 'iperf-table': cmd_iperf_table,
     'ipregion-check': cmd_ipregion_check, 'ipregion-table': cmd_ipregion_table,
-    'routing-show': cmd_routing_show, 'routing-text': cmd_routing_text, 'routing-outbounds': cmd_routing_outbounds,
-    'routing-vpn': cmd_routing_vpn, 'routing-mode': cmd_routing_mode, 'routing-add': cmd_routing_add,
-    'routing-rules': cmd_routing_rules, 'routing-rule': cmd_routing_rule, 'routing-refresh': cmd_routing_refresh,
-    'routing-test': cmd_routing_test, 'sniff-enable-all': cmd_sniff_enable_all,
+    'routing-show': cmd_routing_show, 'routing-text': cmd_routing_text, 'routing-mode': cmd_routing_mode,
+    'routing-add': cmd_routing_add, 'routing-rules': cmd_routing_rules, 'routing-rule': cmd_routing_rule,
+    'routing-refresh': cmd_routing_refresh, 'routing-legacy-cleanup': cmd_routing_legacy_cleanup,
     'migrate-scan': cmd_migrate_scan, 'panel-login': cmd_panel_login, 'tls-inbounds-for': cmd_tls_inbounds_for,
 }
 
@@ -8779,6 +8816,7 @@ manager(){
   # Keep the API helper in sync with this version of the script.
   write_helper; write_helper_env
   pair_revoke                     # pairing files left by a killed session
+  upgrade_panel_data
   update_check_background
   flush_notes 'Обновление'
   local ch
@@ -8795,7 +8833,7 @@ manager(){
          users $'Пользователи\t{dim}трафик, активность, inbound-ы{/}' \
          groups $'Группы\t{dim}массовые действия{/}' \
          inbounds $'Inbound-ы\t{dim}VLESS, Trojan, Hysteria2, AmneziaWG, MTProto{/}' \
-         routing $'Маршрутизация\t{dim}РФ напрямую или заблокированное через VPN{/}' \
+         routing $'Маршрутизация\t{dim}РФ напрямую, заблокированное через сервер{/}' \
          nodes $'Подключить узел\t{dim}другие серверы 3x-ui под управлением этой панели{/}' \
          '#Диагностика' '' \
          diag $'Диагностика сервера\t{dim}iPerf3 до РФ, IP Region{/}' \
@@ -8881,11 +8919,10 @@ usage(){
   inbounds add KIND[,KIND…] [--tls CERT:KEY:SNI] [--port N] [--sni HOST] [--name NAME]
   inbounds edit ID [--port N] [--name NAME] [--sni HOST] [--tls domain|CERT:KEY:SNI] [--enable 0|1]
   inbounds del ID
-  routing [list]                        маршрутизация Xray этого сервера: режим, VPN-выход, правила
-  routing mode off|ru-direct|blocked-vpn  РФ напрямую / заблокированное через VPN
-  routing vpn TAG|ССЫЛКА                VPN-выход: outbound панели или vless://, trojan://…
-  routing add ДОМЕНЫ… [--direct|--vpn]  свои домены/IP;  routing add-url URL [--direct|--vpn]
-  routing del N | routing test ДОМЕН | routing refresh | routing sniff
+  routing [list]                        маршрутизация на устройствах клиентов (через подписку)
+  routing mode off|ru-direct|blocked-proxy   РФ напрямую / только заблокированное через сервер
+  routing add ДОМЕНЫ… [--direct|--proxy]  свои домены/IP;  routing add-url URL [--direct|--proxy]
+  routing del N | routing refresh
   node [list]                           подключённые узлы (другие панели 3x-ui)
   node add DOMAIN TOKEN [--name NAME]   подключить узел по одноразовому токену с узла
   node add https://узел/путь/ --api-token T [--name NAME]   подключить вручную
@@ -8900,12 +8937,35 @@ usage(){
             XR_COUNTRY=NL|none  XR_REPO=owner/name  NO_COLOR=1
 EOF
 }
+upgrade_panel_data(){
+  # One-time data upgrades from older versions; need the panel API.
+  [[ "${PANEL_INSTALLED:-1}" == 1 && -d "$BASE" ]] || return 0
+  local need=0 nflag
+  [[ -f "$BASE/.flags-v27" ]] || need=1
+  [[ -f "$BASE/routing.json" ]] && grep -q '"vpn"' "$BASE/routing.json" 2>/dev/null && need=1
+  ((need)) || return 0
+  ensure_api_token 3 >/dev/null 2>&1 || return 0
+  # v2.6.0 routed inside the server's Xray; v2.7 routes on the clients instead.
+  if [[ -f "$BASE/routing.json" ]] && grep -q '"vpn"' "$BASE/routing.json" 2>/dev/null; then
+    helper routing-legacy-cleanup >>"$LOG" 2>&1 &&
+      note '○ Маршрутизация v2.6.0 (на сервере) убрана — теперь правила раздаются клиентам через подписку: «Маршрутизация».'
+  fi
+  # v2.7: auto names start with the country flag — add it to inbounds of older versions.
+  if [[ ! -f "$BASE/.flags-v27" ]] && nflag=$(helper inbound-flags 2>>"$LOG"); then
+    touch "$BASE/.flags-v27"
+    [[ "$nflag" =~ ^[1-9][0-9]*$ ]] && note "✓ К названиям inbound'ов добавлен флаг страны: $nflag шт."
+  fi
+  return 0
+}
 cli_need_panel(){
   [[ $EUID -eq 0 ]] || die 'Запусти через sudo.'
   load_state
   write_helper                    # always the helper of this script version
   [[ "${PANEL_INSTALLED:-1}" == 1 ]] || die 'Панель 3x-ui удалена.'
   ensure_api_token 5 || die 'API 3x-ui недоступен (служба x-ui запущена?).'
+  upgrade_panel_data
+  ((${#NOTES[@]})) && printf '%s\n' "${NOTES[@]}" | sed 's/{[a-z/]*}//g' >&2
+  NOTES=()
 }
 cli_opt(){
   # cli_opt NAME ARGS… — value of --NAME in ARGS
@@ -8995,26 +9055,23 @@ cli_cmd(){
       local r act
       case "$sub" in
         list|show) helper routing-text; printf '\n'; helper routing-rules | sed 's/\t/  /g' ;;
-        mode) [[ -n "${3:-}" ]] || die 'routing mode off|ru-direct|blocked-vpn'
-              helper routing-mode "$3" >/dev/null; routing_timer_sync; helper routing-text ;;
-        vpn) [[ -n "${3:-}" ]] || die 'routing vpn TAG|ССЫЛКА'
-             if [[ "$3" == *://* ]]; then r=$(helper routing-vpn --link "$3"); else r=$(helper routing-vpn "$3"); fi
-             printf 'VPN-выход: %s\nПроверка: %s (%s)\n' "$(sed -n 's/^desc=//p' <<< "$r")" \
-               "$(sed -n 's/^test=//p' <<< "$r")" "$(sed -n 's/^info=//p' <<< "$r")" ;;
+        mode) [[ -n "${3:-}" ]] || die 'routing mode off|ru-direct|blocked-proxy'
+              r=$(helper routing-mode "$3"); routing_timer_sync; helper routing-text
+              grep -q '^lists_missing=1' <<< "$r" && warn 'Список заблокированного не скачался — JSON-подписка получит его при следующем обновлении.'
+              grep -q '^happ_dropped=' <<< "$r" && warn "В Happ/INCY не поместились свои записи: $(sed -n 's/^happ_dropped=//p' <<< "$r")"
+              : ;;
         add|add-url)
-          act=vpn; [[ " $* " == *' --direct '* ]] && act=direct
+          act=proxy; [[ " $* " == *' --direct '* ]] && act=direct
           local -a vals=()
-          for r in "${@:3}"; do [[ "$r" == --direct || "$r" == --vpn ]] || vals+=("$r"); done
-          ((${#vals[@]})) || die 'routing add ДОМЕНЫ… [--direct|--vpn] | routing add-url URL [--direct|--vpn]'
+          for r in "${@:3}"; do [[ "$r" == --direct || "$r" == --proxy || "$r" == --vpn ]] || vals+=("$r"); done
+          ((${#vals[@]})) || die 'routing add ДОМЕНЫ… [--direct|--proxy] | routing add-url URL [--direct|--proxy]'
           if [[ "$sub" == add-url ]]; then r=$(helper routing-add "$act" url "${vals[0]}")
           else r=$(helper routing-add "$act" domains "${vals[@]}"); fi
-          printf 'Добавлено записей: %s (%s)\n' "${r#count=}" "$([[ $act == vpn ]] && echo 'через VPN' || echo 'напрямую')"
+          printf 'Добавлено записей: %s (%s)\n' "$(sed -n 's/^count=//p' <<< "$r")" "$([[ $act == proxy ]] && echo 'через сервер' || echo 'напрямую')"
           routing_timer_sync ;;
         del) [[ -n "${3:-}" ]] || die 'routing del N (номер из routing list)'
              helper routing-rule "$3" del; routing_timer_sync ;;
         refresh) helper routing-refresh ;;
-        test) [[ -n "${3:-}" ]] || die 'routing test ДОМЕН|IP'; helper routing-test "$3" | sed 's/\t/  /g' ;;
-        sniff) printf 'Сниффинг включён на inbound-ах: %s\n' "$(helper sniff-enable-all)" ;;
         *) die "Неизвестная подкоманда routing $sub" ;;
       esac ;;
     node|nodes)
