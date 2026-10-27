@@ -6,7 +6,7 @@ set -Eeuo pipefail
 umask 077
 
 # Release version = the git tag of the commit this file comes from.
-VERSION=v2.5.0
+VERSION=v2.6.0
 # GitHub repository (owner/name) that publishes tagged releases of this script.
 # Can also be set from the "Версия" screen or with XR_REPO=owner/name.
 DEFAULT_REPO='dohuyanevezuch/3x-ui_reverse'
@@ -24,6 +24,7 @@ XUI_INSTALL_URL=https://raw.githubusercontent.com/MHSanaei/3x-ui/main/install.sh
 # API helper, its token and the short-lived Xray access log used for "last inbound".
 HELPER=$BASE/xr_helper.py
 SUPPORTED_OS='Debian 12/13 и Ubuntu 22.04/24.04/26.04'
+OLD_SUB_PORT='' OLD_SUB_SCHEME=''   # subscription port of a migrated panel (redirected)
 HELPER_STATE=''   # overrides XR_STATE_DIR before $BASE exists
 PDF_FILE=$BASE/panel.pdf         # the same parameters as a styled PDF
 NODE_TOKEN=$BASE/node.token     # node-sync API token handed to a master panel
@@ -402,6 +403,14 @@ warn(){
 }
 die(){
   ui_stop failed
+  local undo=''
+  # A failed migration must not leave the panel hidden behind a broken proxy.
+  if [[ ${MIGRATING:-0} == 1 ]] && declare -F migrate_restore >/dev/null && migrate_restore; then
+    undo=$'\n\n'"Миграция отменена: прежняя база 3x-ui восстановлена, панель работает как раньше."
+    [[ -n "${MIGRATE_KEPT:-}" ]] && undo+=$'\n'"Журнал и копия базы: $MIGRATE_KEPT"
+    NOTES=()
+  fi
+  set -- "$*$undo"
   if [[ $TUI_OK == 1 ]]; then
     local extra=''
     ((${#NOTES[@]})) && extra=$'\n\n'"$(printf '%s\n' "${NOTES[@]}")"
@@ -492,6 +501,9 @@ check_environment(){
   fi
   if [[ -e "$SELF" && "$0" != "$SELF" && ! -e "$STATE" ]]; then die 'Обнаружен старый 3x-ui_reverse без состояния: проверь установку вручную.'; fi
   command -v ss >/dev/null || true
+}
+# Only a fresh install needs a clean VPS; a migration takes over what is there.
+check_clean_vps(){
   # Do not change someone else's web services, even if not 80/443.
   if command -v nginx >/dev/null || command -v caddy >/dev/null || [[ -e /etc/nginx/sites-enabled/3x-ui_reverse.conf ]]; then
     die 'Обнаружены Nginx/Caddy. Скрипт требует чистый VPS, чтобы не повредить сайты.'
@@ -519,6 +531,8 @@ save_state(){
     printf 'PROXY_INSTALLED=%q\n' "${PROXY_INSTALLED:-1}"
     printf 'TLS_MODE=%q\n' "${TLS_MODE:-proxy}"
     printf 'UPDATE_REPO=%q\n' "${UPDATE_REPO:-}"
+    printf 'OLD_SUB_PORT=%q\n' "${OLD_SUB_PORT:-}"
+    printf 'OLD_SUB_SCHEME=%q\n' "${OLD_SUB_SCHEME:-}"
   } > "$tmp"
   chmod 600 "$tmp"; mv -f "$tmp" "$STATE"
   # Panel port/path may have changed: keep the activity timer's API address current.
@@ -538,7 +552,12 @@ load_state(){
   valid_domain "$DOMAIN" || die 'Неверный домен в состоянии.'
   [[ $PROXY == caddy || $PROXY == nginx ]] || die 'Неверный тип прокси в состоянии.'
   valid_panel_port "$PANEL_PORT" && valid_port "$SUB_PORT" || die 'Неверный порт в состоянии.'
-  for p in "$PANEL_PATH" "$SUB_PATH" "$JSON_PATH" "$CLASH_PATH"; do valid_path "$p" || die 'Неверный путь в состоянии.'; done
+  # Paths kept from a migrated panel may be short (e.g. /sub/): only the charset is checked.
+  for p in "$PANEL_PATH" "$SUB_PATH" "$JSON_PATH" "$CLASH_PATH"; do
+    [[ "$p" =~ ^[A-Za-z0-9._~-]{1,64}$ ]] || die 'Неверный путь в состоянии.'
+  done
+  OLD_SUB_PORT=${OLD_SUB_PORT:-}; OLD_SUB_SCHEME=${OLD_SUB_SCHEME:-}
+  [[ -z "$OLD_SUB_PORT" || ( "$OLD_SUB_PORT" =~ ^[0-9]{1,5}$ && "$OLD_SUB_SCHEME" =~ ^https?$ ) ]] || OLD_SUB_PORT=''
   UPDATE_REPO=${UPDATE_REPO:-}
   [[ -z "$UPDATE_REPO" || "$UPDATE_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || UPDATE_REPO=''
 }
@@ -656,6 +675,17 @@ EOF
     }
 }
 EOF
+  # Subscription links from before the migration (domain:OLD_PORT/…) -> 443.
+  if [[ -n "${OLD_SUB_PORT:-}" && "${PANEL_INSTALLED:-1}" == 1 ]]; then
+    local addr="https://$DOMAIN:$OLD_SUB_PORT"
+    [[ "${OLD_SUB_SCHEME:-https}" == http ]] && addr="http://:$OLD_SUB_PORT"
+    cat >> "$target" <<EOF
+
+$addr {
+    redir https://$DOMAIN{uri} 308
+}
+EOF
+  fi
   chmod 644 "$target"
 }
 
@@ -725,6 +755,30 @@ EOF
     location / { try_files $uri $uri/ /index.html; }
 }
 EOF
+  fi
+  # Subscription links from before the migration (domain:OLD_PORT/…) -> 443.
+  if [[ -n "${OLD_SUB_PORT:-}" && "${PANEL_INSTALLED:-1}" == 1 ]]; then
+    if [[ "${OLD_SUB_SCHEME:-https}" == https && "$mode" == full ]]; then
+      cat >> "$target" <<EOF
+server {
+    listen $OLD_SUB_PORT ssl;
+    listen [::]:$OLD_SUB_PORT ssl;
+    server_name $DOMAIN;
+    ssl_certificate $(certdir)/live/$DOMAIN/fullchain.pem;
+    ssl_certificate_key $(certdir)/live/$DOMAIN/privkey.pem;
+    return 308 https://$DOMAIN\$request_uri;
+}
+EOF
+    elif [[ "${OLD_SUB_SCHEME:-https}" == http ]]; then
+      cat >> "$target" <<EOF
+server {
+    listen $OLD_SUB_PORT;
+    listen [::]:$OLD_SUB_PORT;
+    server_name _;
+    return 308 https://$DOMAIN\$request_uri;
+}
+EOF
+    fi
   fi
   chmod 644 "$target"
 }
@@ -847,7 +901,7 @@ PYBACK
   else
      warn 'Проверка после смены пароля не прошла. Возвращаю прежние учётные данные.'
      run systemctl stop x-ui || true
-     cp -a "$before_db" "$DB"
+     restore_db "$before_db"
      cp -a "$before_state" "$STATE"
      load_state
      run systemctl start x-ui || true
@@ -871,7 +925,7 @@ src=sqlite3.connect(sys.argv[1]); dst=sqlite3.connect(sys.argv[2]); src.backup(d
 PY
   if ! ( apply_panel && set_subscriptions >>"$LOG" 2>&1 && update_proxy_safe ); then
     warn 'Ошибка обновления, возвращаю предыдущую конфигурацию.'
-    cp -a "$dbbackup" "$DB"
+    restore_db "$dbbackup"
     cp -a "$previous_proxy" "$(proxy_conf)"
     cp -a "$previous_state" "$STATE"
     load_state
@@ -882,7 +936,7 @@ PY
   if ! run systemctl start x-ui || ! verify_local "$PANEL_PORT" || ! verify_local "$SUB_PORT" || ! verify_panel_http; then
     warn '3x-ui не прошла проверку. Выполняю откат.'
     run systemctl stop x-ui || true
-    cp -a "$dbbackup" "$DB"
+    restore_db "$dbbackup"
     cp -a "$previous_proxy" "$(proxy_conf)"
     cp -a "$previous_state" "$STATE"
     load_state
@@ -1069,8 +1123,52 @@ PYBACK
   fi
 }
 
+# Proxy packages and configuration (fresh install and migration).
+proxy_install_pkgs(){
+  if [[ "$PROXY" == caddy ]]; then
+    command -v caddy >/dev/null 2>&1 || run env DEBIAN_FRONTEND=noninteractive apt-get install -y caddy
+  else
+    { command -v nginx >/dev/null 2>&1 && command -v certbot >/dev/null 2>&1; } ||
+      run env DEBIAN_FRONTEND=noninteractive apt-get install -y nginx certbot
+  fi
+}
+proxy_configure(){
+  mkdir -p "$(certdir)"
+  chmod 755 "$BASE/sertificates"
+  if [[ "$PROXY" == caddy ]]; then
+    # Stock package places a demo Caddyfile; back it up before replacing.
+    [[ -f /etc/caddy/Caddyfile && ! -L /etc/caddy/Caddyfile ]] &&
+      cp -a /etc/caddy/Caddyfile "$BASE/Caddyfile.$([[ ${MIGRATING:-0} == 1 ]] && echo before-migration || echo package-default)"
+    write_caddy
+    ln -sfn "$BASE/Caddyfile" /etc/caddy/Caddyfile
+    chown -R caddy:caddy "$(certdir)"
+    chmod 750 "$(certdir)"
+    validate_proxy || die 'Ошибка конфигурации Caddy.'
+    run systemctl enable --now caddy
+    run systemctl restart caddy
+  else
+    # Only on a fresh nginx install: disable the packaged default site.
+    if [[ ${MIGRATING:-0} != 1 && -L /etc/nginx/sites-enabled/default ]]; then rm -f /etc/nginx/sites-enabled/default; fi
+    write_nginx bootstrap
+    ln -sfn /etc/nginx/sites-available/3x-ui_reverse.conf /etc/nginx/sites-enabled/3x-ui_reverse.conf
+    validate_proxy || die 'Ошибка Nginx (HTTP challenge).'
+    run systemctl enable --now nginx
+    run systemctl restart nginx
+    install -d -m 755 "$SITE/.well-known/acme-challenge"
+    run certbot certonly --non-interactive --agree-tos --register-unsafely-without-email \
+       --webroot -w "$SITE" -d "$DOMAIN" --cert-name "$DOMAIN" \
+       --config-dir "$(certdir)" --work-dir "$BASE/certbot-work" --logs-dir "$BASE/certbot-logs" \
+       || die 'Certbot не получил сертификат. Проверь A-запись и доступность порта 80.'
+    write_nginx full
+    validate_proxy || die 'Ошибка Nginx (HTTPS).'
+    reload_proxy || die 'Не удалось перезагрузить Nginx.'
+    setup_renew_timer
+  fi
+}
+
 install_fresh(){
   first_run_prepare
+  check_clean_vps
   local ch want_inbounds=0 want_bbr=0 inbound_text bbr_text
   # Network tuning goes first: it is independent of everything else.
   if bbr_active; then
@@ -1156,13 +1254,8 @@ $bbr_text
   run env DEBIAN_FRONTEND=noninteractive apt-get install -y python3-reportlab fonts-dejavu-core ||
     warn 'Не удалось установить python3-reportlab — PDF не будет создан (можно позже: «PDF с параметрами»).'
   step 18 'Установили базовые пакеты'
-  if [[ "$PROXY" == caddy ]]; then
-    msg 'Устанавливаем Caddy'
-    run env DEBIAN_FRONTEND=noninteractive apt-get install -y caddy
-  else
-    msg 'Устанавливаем Nginx и Certbot'
-    run env DEBIAN_FRONTEND=noninteractive apt-get install -y nginx certbot
-  fi
+  msg "$proxy_install_stage"
+  proxy_install_pkgs
   step 33 'Прокси установлен'
   PANEL_PORT=$(newport) || die 'Не удалось подобрать порт панели.'
   SUB_PORT=$(newport) || die 'Не удалось подобрать порт подписок.'
@@ -1173,36 +1266,7 @@ $bbr_text
   site_html
   step 43 'Сайт создан'
   msg "$proxy_https_stage"
-  mkdir -p "$(certdir)"
-  chmod 755 "$BASE/sertificates"
-  if [[ "$PROXY" == caddy ]]; then
-    # Stock package places a demo Caddyfile; back it up before replacing.
-    [[ -f /etc/caddy/Caddyfile && ! -L /etc/caddy/Caddyfile ]] && cp -a /etc/caddy/Caddyfile "$BASE/Caddyfile.package-default"
-    write_caddy
-    ln -sfn "$BASE/Caddyfile" /etc/caddy/Caddyfile
-    chown -R caddy:caddy "$(certdir)"
-    chmod 750 "$(certdir)"
-    validate_proxy || die 'Ошибка конфигурации Caddy.'
-    run systemctl enable --now caddy
-    run systemctl restart caddy
-  else
-    # Only on a fresh nginx install: disable the packaged default site.
-    if [[ -L /etc/nginx/sites-enabled/default ]]; then rm -f /etc/nginx/sites-enabled/default; fi
-    write_nginx bootstrap
-    ln -sfn /etc/nginx/sites-available/3x-ui_reverse.conf /etc/nginx/sites-enabled/3x-ui_reverse.conf
-    validate_proxy || die 'Ошибка Nginx (HTTP challenge).'
-    run systemctl enable --now nginx
-    run systemctl restart nginx
-    install -d -m 755 "$SITE/.well-known/acme-challenge"
-    run certbot certonly --non-interactive --agree-tos --register-unsafely-without-email \
-       --webroot -w "$SITE" -d "$DOMAIN" --cert-name "$DOMAIN" \
-       --config-dir "$(certdir)" --work-dir "$BASE/certbot-work" --logs-dir "$BASE/certbot-logs" \
-       || die 'Certbot не получил сертификат. Проверь A-запись и доступность порта 80.'
-    write_nginx full
-    validate_proxy || die 'Ошибка Nginx (HTTPS).'
-    reload_proxy || die 'Не удалось перезагрузить Nginx.'
-    setup_renew_timer
-  fi
+  proxy_configure
   step 60 'Прокси и HTTPS подготовлены'
   msg 'Устанавливаем 3x-ui'
   local installer="$BASE/3x-ui-upstream-install.sh"
@@ -1573,6 +1637,18 @@ confirm_yes(){
   [[ $TUI_OK == 1 ]] || { warn 'Операция требует интерактивного терминала.'; return 1; }
   tui_confirm_word 'Подтверждение' "${1:-Выполнить операцию?}" yes
 }
+# Copy a backup INTO the live database with SQLite's backup API: a plain cp
+# would leave a stale -wal journal that SQLite replays over the restored data.
+restore_db(){
+  local src=$1
+  [[ -f "$src" ]] || return 1
+  python3 - "$src" "$DB" <<'PYRESTORE' >>"$LOG" 2>&1
+import sqlite3, sys
+with sqlite3.connect(sys.argv[1]) as src, sqlite3.connect(sys.argv[2]) as dest:
+    src.backup(dest)
+    dest.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+PYRESTORE
+}
 backup_db(){
   [[ -f "$DB" ]] || return 1
   local target=$1
@@ -1708,12 +1784,12 @@ remove_proxy_only(){
     if ! run "$CLI" setting -port 443 -webBasePath "$PANEL_PATH" -listenIP 0.0.0.0 ||
        ! run "$CLI" cert -webCert "/root/cert/$DOMAIN/fullchain.pem" -webCertKey "/root/cert/$DOMAIN/privkey.pem" ||
        ! set_direct_subscriptions || ! run systemctl restart x-ui; then
-      run systemctl stop x-ui || :; cp -a "$backup" "$DB"; PANEL_PORT=$oldport
+      run systemctl stop x-ui || :; restore_db "$backup"; PANEL_PORT=$oldport
       set_local_guard; run systemctl start "$PROXY" || :; run systemctl start x-ui || :
       ui_stop failed; warn 'Перенос HTTPS завершился ошибкой. Восстановлена база и прежний прокси.'; return 1
     fi
     if ! curl -fsS --max-time 15 --resolve "$DOMAIN:443:127.0.0.1" -o /dev/null "https://$DOMAIN/$PANEL_PATH/" || ! ss -H -ltn "sport = :$SUB_PORT" | awk '{print $4}' | grep -Eq "(0\\.0\\.0\\.0|\\[::\\]):$SUB_PORT$"; then
-      run systemctl stop x-ui || :; cp -a "$backup" "$DB"; PANEL_PORT=$oldport
+      run systemctl stop x-ui || :; restore_db "$backup"; PANEL_PORT=$oldport
       set_local_guard; run systemctl start "$PROXY" || :; run systemctl start x-ui || :
       ui_stop failed; warn 'Проверка прямого HTTPS не прошла. Восстановлена прежняя конфигурация.'; return 1
     fi
@@ -1840,7 +1916,7 @@ reinstall_panel(){
   fi
   [[ -f "$DB" && -x "$CLI" ]] || { ui_stop failed; warn 'Отсутствует бинарник или база.'; return 1; }
   run systemctl stop x-ui || :
-  if [[ -n "$backup" ]]; then cp -a "$backup" "$DB"; fi
+  if [[ -n "$backup" ]]; then restore_db "$backup" || { ui_stop failed; warn 'Не удалось вернуть базу из копии.'; return 1; }; fi
   step 66 'Бинарник установлен, база восстановлена'
   msg 'Применяем локальные порты и подписки'
   if ((direct)); then
@@ -1908,7 +1984,7 @@ rollback_direct_proxy(){
     run env DEBIAN_FRONTEND=noninteractive apt-get purge -y nginx nginx-common certbot || :
   fi
   run systemctl stop x-ui || :
-  if [[ -s "$backup" ]]; then cp -a "$backup" "$DB"; fi
+  if [[ -s "$backup" ]]; then restore_db "$backup"; fi
   rm -f /etc/systemd/system/x-ui.service.d/20-reverse-localhost.conf
   run systemctl daemon-reload || :
   PANEL_PORT=$oldport
@@ -3422,10 +3498,19 @@ start_menu(){
   first_run_prepare
   local ch os
   os=$(. /etc/os-release 2>/dev/null && printf '%s' "${PRETTY_NAME:-Linux}")
+  local head_extra='' 
+  local -a mig_item=() inst_item=(install $'Установить 3x-ui + прокси\t{dim}Caddy или Nginx, HTTPS, сайт-заглушка{/}')
+  if xui_present; then
+    head_extra=$'\n\n'"{yellow}⚠ Найдена установленная 3x-ui $(xui_version).{/} Её можно перенести под управление
+скрипта: пути панели и подписок, inbound-ы и пользователи сохранятся."
+    mig_item=(migrate $'Перенести существующую 3x-ui\t{dim}миграция с сохранением путей и inbound-ов{/}')
+    inst_item=(install $'Установить заново\t{dim}поверх: пути и порты панели сменятся{/}')
+  fi
   while :; do
     ch=$(TUI_LOGO=1 TUI_CANCEL='Выход' tui_menu '3x-ui_reverse' "Сервер ещё не настроен.
-{dim}$os · $(hostname 2>/dev/null || echo VPS){/}" \
-         install $'Установить 3x-ui + прокси\t{dim}Caddy или Nginx, HTTPS, сайт-заглушка{/}' \
+{dim}$os · $(hostname 2>/dev/null || echo VPS){/}$head_extra" \
+         "${mig_item[@]}" \
+         "${inst_item[@]}" \
          dns $'Проверить DNS-записи\t{dim}куда указывает домен в 16 DNS мира{/}' \
          diag $'Диагностика сервера\t{dim}iPerf3 до РФ, IP Region{/}' \
          quit '{dim}Выход{/}') || return 0
@@ -3433,6 +3518,9 @@ start_menu(){
       install)
         if install_fresh && [[ -f "$STATE" ]]; then manager; return 0; fi
         DOMAIN='' ;;
+      migrate)
+        if migrate_flow && [[ -f "$STATE" ]]; then manager; return 0; fi
+        MIGRATING=0; DOMAIN='' ;;
       dns) dns_standalone ;;
       diag) menu_diag ;;
       quit) return 0 ;;
@@ -3567,6 +3655,559 @@ menu_diag(){
     esac
     flush_notes
   done
+}
+
+# ---- Routing in this panel's Xray (server side, not client apps)
+ROUTING_UNIT=3x-ui_reverse-routing
+
+routing_timer_sync(){
+  # Daily refresh of URL lists — only while such lists exist.
+  if [[ -f "$BASE/routing.json" ]] && grep -q '"type": "url"' "$BASE/routing.json" 2>/dev/null; then
+    [[ -f "/etc/systemd/system/$ROUTING_UNIT.timer" ]] && return 0
+    write_helper_env
+    cat > "/etc/systemd/system/$ROUTING_UNIT.service" <<EOF
+[Unit]
+Description=3x-ui_reverse: refresh routing lists
+After=x-ui.service network-online.target
+[Service]
+Type=oneshot
+Environment=XR_STATE_DIR=$BASE
+ExecStart=/usr/bin/python3 -I $HELPER routing-refresh
+EOF
+    cat > "/etc/systemd/system/$ROUTING_UNIT.timer" <<'EOF'
+[Unit]
+Description=3x-ui_reverse: refresh routing lists daily
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=1d
+RandomizedDelaySec=30min
+[Install]
+WantedBy=timers.target
+EOF
+    chmod 644 "/etc/systemd/system/$ROUTING_UNIT.service" "/etc/systemd/system/$ROUTING_UNIT.timer"
+    run systemctl daemon-reload && run systemctl enable --now "$ROUTING_UNIT.timer" || :
+  elif [[ -f "/etc/systemd/system/$ROUTING_UNIT.timer" ]]; then
+    run systemctl disable --now "$ROUTING_UNIT.timer" || :
+    rm -f "/etc/systemd/system/$ROUTING_UNIT.service" "/etc/systemd/system/$ROUTING_UNIT.timer"
+    run systemctl daemon-reload || :
+  fi
+  return 0
+}
+# routing_do TITLE PHASE helper-args… — run a routing change with a gauge;
+# the helper rolls Xray back itself if the new config is rejected.
+routing_do(){
+  local title=$1 phase=$2 out; shift 2
+  ui_start "$title" "$phase"
+  msg "$phase"
+  step 40 "$phase"
+  if out=$(helper "$@" 2>&1); then
+    ui_stop
+    ROUTING_OUT=$out
+    routing_timer_sync
+    return 0
+  fi
+  ui_stop failed
+  tui_msg "$title" "{red}✗ ${out#Ошибка: }{/}"
+  return 1
+}
+routing_mode_screen(){
+  local cur ch
+  cur=$(helper routing-show 2>>"$LOG" | sed -n 's/^mode=//p')
+  ch=$(tui_radiolist 'Режим маршрутизации' "Правила работают внутри Xray этого сервера для всех его клиентов.
+{bold}Напрямую{/} — трафик выходит с IP этого сервера.
+{bold}Через VPN{/} — трафик уходит через выбранный VPN-выход (другой сервер).
+
+{dim}Удобно на входном сервере в России: заблокированное — через зарубежный узел,
+остальное — быстро и без смены IP. Списки: runetfreedom (geosite_RU / geoip_RU).
+Если узлов несколько, маршрутизация настраивается на каждом отдельно.{/}" \
+       off 'Выключена — всё как настроено в панели' "$([[ $cur == off ]] && echo ON || echo OFF)" \
+       ru-direct 'Российские сервисы напрямую, остальное через VPN' "$([[ $cur == ru-direct ]] && echo ON || echo OFF)" \
+       blocked-vpn 'Заблокированное в РФ через VPN, остальное напрямую' "$([[ $cur == blocked-vpn ]] && echo ON || echo OFF)") || return 0
+  [[ "$ch" == "$cur" ]] && return 0
+  if [[ "$ch" != off ]] && [[ "$(helper routing-show 2>>"$LOG" | sed -n 's/^vpn_ok=//p')" != 1 ]]; then
+    tui_msg 'VPN-выход' 'Для этого режима нужен VPN-выход — сервер, через который пойдёт трафик «через VPN». Выбери его на следующем шаге.'
+    routing_vpn_screen || return 0
+    [[ "$(helper routing-show 2>>"$LOG" | sed -n 's/^vpn_ok=//p')" == 1 ]] || return 0
+  fi
+  routing_do 'Маршрутизация' 'Применяем правила и перезапускаем Xray' routing-mode "$ch" &&
+    note "{green}✓ Режим: $(case $ch in off) echo 'выключена';; ru-direct) echo 'российские сервисы напрямую, остальное через VPN';; *) echo 'заблокированное в РФ через VPN, остальное напрямую';; esac){/}"
+}
+routing_vpn_screen(){
+  local ch link test info
+  local -a items=('#Добавить' '' link $'По ссылке\t{dim}vless:// vmess:// trojan:// ss:// hysteria2:// wireguard://{/}')
+  read_menu routing-outbounds
+  ((${#TSV_ITEMS[@]})) && items+=('#Outbound-ы панели' '' "${TSV_ITEMS[@]}")
+  ch=$(tui_menu 'VPN-выход' "Куда отправлять трафик «через VPN». Можно выбрать outbound, уже созданный
+в панели (Xray → Outbounds, в т.ч. WARP), или добавить сервер по ссылке." "${items[@]}") || return 1
+  if [[ "$ch" == link ]]; then
+    link=$(tui_input 'VPN-выход по ссылке' 'Ссылка на сервер (как в клиентском приложении). Её разберёт сама панель 3x-ui:' '') || return 1
+    link=${link//[[:space:]]/}
+    [[ -n "$link" ]] || return 1
+    routing_do 'VPN-выход' 'Разбираем ссылку и проверяем соединение' routing-vpn --link "$link" || return 1
+  else
+    routing_do 'VPN-выход' 'Проверяем соединение через выход' routing-vpn "$ch" || return 1
+  fi
+  test=$(sed -n 's/^test=//p' <<< "$ROUTING_OUT"); info=$(sed -n 's/^info=//p' <<< "$ROUTING_OUT")
+  if [[ "$test" == ok ]]; then
+    tui_msg 'VPN-выход' "{green}✓ Выход работает{/} — задержка $info.
+
+$(sed -n 's/^desc=//p' <<< "$ROUTING_OUT")"
+  else
+    tui_msg 'VPN-выход' "{yellow}⚠ Выход сохранён, но проверка не прошла:{/}
+$info
+
+Проверь ссылку или сервер; до исправления трафик «через VPN» не пройдёт."
+  fi
+  return 0
+}
+routing_add_screen(){
+  local kind=$1 val action out
+  if [[ "$kind" == url ]]; then
+    val=$(tui_input 'Список по ссылке' "Ссылка на список доменов или IP (текстовый файл).
+{dim}Понимает строки доменов, domain:/full:/regexp:, IP и подсети, формат hosts и dnsmasq.
+Список обновляется автоматически раз в сутки.{/}" '') || return 0
+  else
+    val=$(tui_input 'Свои домены' "Домены или IP через пробел или запятую, например:
+{accent}youtube.com googlevideo.com 1.2.3.0/24{/}
+{dim}Поддомены входят автоматически (youtube.com → www.youtube.com, m.youtube.com).{/}" '') || return 0
+  fi
+  [[ -n "${val// /}" ]] || return 0
+  action=$(tui_radiolist 'Куда направлять' 'Как пускать трафик к этим адресам:' \
+           vpn 'Через VPN' ON direct 'Напрямую' OFF) || return 0
+  if [[ "$action" == vpn ]] && [[ "$(helper routing-show 2>>"$LOG" | sed -n 's/^vpn_ok=//p')" != 1 ]]; then
+    tui_msg 'VPN-выход' 'Чтобы отправлять трафик через VPN, сначала выбери VPN-выход.'
+    routing_vpn_screen || return 0
+  fi
+  if [[ "$kind" == url ]]; then
+    routing_do 'Маршрутизация' 'Скачиваем список и применяем правила' routing-add "$action" url "$val" || return 0
+  else
+    routing_do 'Маршрутизация' 'Применяем правила' routing-add "$action" domains "$val" || return 0
+  fi
+  out=$(sed -n 's/^count=//p' <<< "$ROUTING_OUT")
+  note "{green}✓ Добавлено записей: ${out:-?} — $([[ $action == vpn ]] && echo 'через VPN' || echo 'напрямую').{/}"
+}
+routing_rules_screen(){
+  local id ch first=1
+  while :; do
+    read_menu routing-rules
+    if ((${#TSV_ITEMS[@]} == 0)); then
+      ((first)) && tui_msg 'Свои правила' 'Своих правил пока нет.'
+      return 0
+    fi
+    first=0
+    id=$(tui_menu 'Свои правила' 'Правила проверяются по порядку, раньше режима маршрутизации.' "${TSV_ITEMS[@]}") || return 0
+    ch=$(tui_menu 'Правило' "$(helper routing-rules 2>>"$LOG" | awk -F'\t' -v i="$id" '$1==i {print $2"  "$3}')" \
+         vpn 'Через VPN' direct 'Напрямую' refresh 'Обновить список сейчас' del '{red}Удалить правило{/}') || continue
+    routing_do 'Маршрутизация' 'Применяем правила' routing-rule "$id" "$ch" || :
+  done
+}
+routing_test_screen(){
+  local d r kind tag how
+  d=$(tui_input 'Проверить маршрут' 'Домен или IP — куда его отправит Xray этого сервера:' '') || return 0
+  [[ -n "$d" ]] || return 0
+  if ! r=$(helper routing-test "$d" 2>&1); then tui_msg 'Проверка' "{red}✗ ${r#Ошибка: }{/}"; return 0; fi
+  IFS=$'\t' read -r kind tag how <<< "$r"
+  case "$kind" in
+    vpn) r="{accent}➜ через VPN{/} (outbound $tag)" ;;
+    direct) r="{green}● напрямую{/} (outbound $tag)" ;;
+    block) r="{red}✗ блокируется{/} (outbound $tag)" ;;
+    *) r="outbound {bold}$tag{/}" ;;
+  esac
+  tui_msg 'Проверка маршрута' "$d → $r
+{dim}$([[ $how == rule ]] && echo 'Сработало правило маршрутизации.' || echo 'Ни одно правило не сработало — используется outbound по умолчанию.'){/}"
+}
+menu_routing(){
+  need_panel_api || return 0
+  local ch head nosniff
+  local -a sniff_item=()
+  while :; do
+    head=$(helper routing-text 2>>"$LOG") || head='{red}API 3x-ui недоступен{/}'
+    nosniff=$(helper routing-show 2>>"$LOG" | sed -n 's/^nosniff=//p')
+    sniff_item=()
+    if [[ "${nosniff:-0}" != 0 ]]; then
+      head+=$'\n'"{yellow}⚠ У $nosniff inbound-ов выключен сниффинг — доменные правила для них не сработают.{/}"
+      sniff_item=(sniff $'Включить сниффинг\t{dim}на всех inbound-ах без него{/}')
+    fi
+    ch=$(tui_menu 'Маршрутизация' "$head" \
+         mode $'Режим\t{dim}РФ напрямую / заблокированное через VPN{/}' \
+         vpn $'VPN-выход\t{dim}сервер для трафика «через VPN»{/}' \
+         '#Свои правила' '' \
+         domains $'Добавить домены или IP\t{dim}напрямую или через VPN{/}' \
+         url $'Добавить список по ссылке\t{dim}обновляется раз в сутки{/}' \
+         rules $'Свои правила\t{dim}изменить, обновить, удалить{/}' \
+         '#Проверка' '' \
+         test $'Проверить домен\t{dim}куда Xray отправит трафик{/}' \
+         "${sniff_item[@]}") || return 0
+    case "$ch" in
+      mode) routing_mode_screen ;;
+      vpn) routing_vpn_screen || : ;;
+      domains) routing_add_screen domains ;;
+      url) routing_add_screen url ;;
+      rules) routing_rules_screen ;;
+      test) routing_test_screen ;;
+      sniff) routing_do 'Сниффинг' 'Включаем сниффинг на inbound-ах' sniff-enable-all &&
+               note "{green}✓ Сниффинг включён на inbound-ах: $ROUTING_OUT{/}" ;;
+    esac
+    flush_notes
+  done
+}
+
+# ---- Migration of an existing 3x-ui (installed without this script)
+# Keeps the panel path, subscription paths, inbounds and users; moves the
+# panel and subscriptions to 127.0.0.1 behind Caddy/Nginx on 443 and
+# redirects the old subscription port (domain:PORT/path) to https://domain/path.
+MIGRATING=0
+declare -A XS=()          # settings of the existing panel (migrate-scan)
+MIG_INB=()                # "id port transport proto listen sec crt sni enable remark"
+
+xui_present(){ [[ -x "$CLI" && -f "$DB" ]]; }
+xui_version(){ local v; v=$("$CLI" -v 2>/dev/null || :); v=${v%%$'\n'*}; printf '%s' "${v//$'\r'/}"; }
+xui_has_tokens(){ local h; h=$("$CLI" setting -h 2>&1 || :); [[ "$h" == *getApiToken* ]]; }
+# Who listens on a TCP port: process names, comma separated.
+port_owner(){
+  ss -H -ltnp "sport = :$1" 2>/dev/null | grep -o 'users:(("[^"]*"' | sed 's/users:(("//;s/"$//' | sort -u | paste -sd, - || :
+}
+strip_slashes(){ local p=${1#/}; p=${p%/}; printf '%s' "$p"; }
+
+migrate_scan(){
+  local line k v
+  XS=(); MIG_INB=()
+  while IFS= read -r line; do
+    if [[ "$line" == INB$'\t'* ]]; then
+      MIG_INB+=("${line#INB$'\t'}")
+    elif [[ "$line" == *=* ]]; then
+      k=${line%%=*}; v=${line#*=}; XS[$k]=$v
+    fi
+  done < <(helper migrate-scan "$DB" 2>>"$LOG")
+  [[ -n "${XS[webPort]:-}" ]]
+}
+# Domain candidates: panel/subscription domain, certificate names, subURI host.
+migrate_domain_guess(){
+  local d f
+  for d in "${XS[subDomain]:-}" "${XS[webDomain]:-}"; do
+    valid_domain "$d" && { printf '%s' "$d"; return; }
+  done
+  d=$(sed -E 's#^[a-z]+://([^/:]+).*#\1#' <<< "${XS[subURI]:-}")
+  valid_domain "$d" && { printf '%s' "$d"; return; }
+  for f in "${XS[webCertFile]:-}" "${XS[subCertFile]:-}"; do
+    [[ -n "$f" && -r "$f" ]] || continue
+    d=$(openssl x509 -in "$f" -noout -ext subjectAltName 2>/dev/null | grep -o 'DNS:[^,]*' | head -n1 | cut -d: -f2)
+    [[ -z "$d" ]] && d=$(openssl x509 -in "$f" -noout -subject 2>/dev/null | sed -n 's/.*CN *= *\([^,/]*\).*/\1/p')
+    valid_domain "$d" && { printf '%s' "$d"; return; }
+  done
+  return 0
+}
+migrate_conflicts(){       # inbounds that hold 80/443 TCP (needed by the proxy)
+  local r id port tr rest
+  for r in "${MIG_INB[@]}"; do
+    IFS=$'\t' read -r id port tr rest <<< "$r"
+    [[ "$tr" == tcp && ( "$port" == 443 || "$port" == 80 ) ]] && printf '%s %s\n' "$id" "$port"
+  done
+  return 0
+}
+migrate_summary_text(){
+  local ver=$1 web sub n o80 o443
+  web="${XS[webCertFile]:+https}"; web=${web:-http}
+  sub="${XS[subCertFile]:+https}"; sub=${sub:-http}
+  n=${#MIG_INB[@]}
+  o80=$(port_owner 80); o443=$(port_owner 443)
+  [[ -n "$o80" ]] || o80='{dim}свободен{/}'
+  [[ -n "$o443" ]] || o443='{dim}свободен{/}'
+  printf '%s\n' "{yellow}⚠ На сервере уже установлена 3x-ui${ver:+ $ver}.{/}" ''
+  printf '  Панель       %s://…:%s%s\n' "$web" "${XS[webPort]}" "${XS[webBasePath]}"
+  if [[ "${XS[subEnable]}" == true ]]; then
+    printf '  Подписки     %s://…:%s%s\n' "$sub" "${XS[subPort]}" "${XS[subPath]}"
+  else
+    printf '  Подписки     {dim}выключены{/}\n'
+  fi
+  printf '  Inbound-ы    %s\n' "$n"
+  printf '  Порт 80      %s\n' "$o80"
+  printf '  Порт 443     %s\n' "$o443"
+  printf '\n%s\n' 'Скрипт может взять её под управление: панель и подписки уйдут за прокси на 443,'
+  printf '%s\n' 'пути панели и подписок, inbound-ы и пользователи сохранятся,'
+  printf '%s\n' 'а старые ссылки подписки domain:порт/… будут перенаправляться на domain/….'
+}
+
+migrate_flow(){
+  first_run_prepare
+  MIGRATING=1
+  local ver mode entered pass_mode pass1 proxy_choice o443 o80 conf
+  local -a conflicts=() blockers=()
+  ver=$(xui_version)
+  if ! migrate_scan; then
+    tui_msg 'Миграция' "{red}✗ Не удалось прочитать базу 3x-ui ($DB).{/} Подробности в журнале."
+    return 1
+  fi
+  # --- 1. what to do with the panel binary
+  if xui_has_tokens; then
+    mode=$(TUI_LOGO=1 tui_radiolist 'Миграция 3x-ui' "$(migrate_summary_text "$ver")" \
+           takeover 'Взять под управление — оставить установленную 3x-ui как есть' ON \
+           reinstall 'Переустановить последнюю 3x-ui — с сохранением базы, путей и inbound-ов' OFF) || return 1
+  else
+    TUI_LOGO=1 tui_yesno 'Миграция 3x-ui' "$(migrate_summary_text "$ver")
+
+{yellow}Эта версия 3x-ui слишком старая для управления скриптом{/} (нет API-токенов).
+Её нужно обновить официальным установщиком — база, пути и inbound-ы сохранятся." \
+      'Обновить и перенести' 'Отмена' yes || return 1
+    mode=reinstall
+  fi
+  # --- 2. domain
+  entered=$(migrate_domain_guess)
+  while :; do
+    entered=$(TUI_LOGO=1 tui_input 'Домен' 'Домен этого сервера — на нём будут панель и подписки (HTTPS на 443):' "$entered") || return 1
+    entered=${entered,,}; entered=${entered%.}
+    valid_domain "$entered" && break
+    tui_msg 'Неверный домен' 'Введи корректное DNS-имя: не IP-адрес, не URL и без порта.'
+  done
+  DOMAIN=$entered
+  dns_check_screen || return 1
+  # --- 3. credentials
+  PANEL_USER=${XS[username]:-}
+  pass_mode=$(tui_radiolist 'Вход в панель' "Логин в панели сейчас: {bold}${PANEL_USER:-?}{/}" \
+              keep 'Оставить текущий логин и пароль' ON \
+              new 'Задать новые случайные логин и пароль' OFF) || return 1
+  if [[ "$pass_mode" == keep ]]; then
+    while :; do
+      pass1=$(tui_input 'Текущий пароль' "Пароль панели для «$PANEL_USER» — скрипт проверит его и сохранит в параметрах (chmod 600):" '') || return 1
+      if migrate_check_password "$pass1"; then PANEL_PASS=$pass1; break; fi
+      tui_yesno 'Пароль не подошёл' 'Панель не приняла этот пароль (или включена двухфакторная защита).' \
+        'Ввести снова' 'Задать новый' yes || { pass_mode=new; break; }
+    done
+  fi
+  if [[ "$pass_mode" == new ]]; then PANEL_USER="u$(rand 12)"; PANEL_PASS=$(rand 28); fi
+  # --- 4. proxy
+  o80=$(port_owner 80); o443=$(port_owner 443)
+  for conf in ${o80//,/ } ${o443//,/ }; do
+    case "$conf" in caddy|nginx|x-ui|xray*|'') ;; *) blockers+=("$conf") ;; esac
+  done
+  if ((${#blockers[@]})); then
+    tui_msg 'Порты 80/443 заняты' "{red}✗ Порты 80/443 занимает: ${blockers[*]}.{/}
+
+Прокси должен слушать 80 и 443. Останови или удали эту программу и запусти миграцию снова."
+    return 1
+  fi
+  local has_c=0 has_n=0 def=caddy lc ln
+  command -v caddy >/dev/null 2>&1 && has_c=1
+  command -v nginx >/dev/null 2>&1 && has_n=1
+  ((has_n && !has_c)) && def=nginx
+  [[ "$o443" == *nginx* ]] && def=nginx
+  [[ "$o443" == *caddy* ]] && def=caddy
+  lc='Установить Caddy — автоматический HTTPS'; ((has_c)) && lc='Взять под управление установленный Caddy'
+  ln='Установить Nginx + Certbot'; ((has_n)) && ln='Взять под управление установленный Nginx (+ Certbot)'
+  local -a pitems=(caddy "$lc" "$([[ $def == caddy ]] && echo ON || echo OFF)"
+                   nginx "$ln" "$([[ $def == nginx ]] && echo ON || echo OFF)")
+  proxy_choice=$(tui_radiolist 'Прокси' "Веб-сервер на 443: сайт-заглушка, HTTPS, панель и подписки по секретным путям.
+{dim}Если Caddy уже обслуживает другие сайты, его прежний Caddyfile сохранится в копию —
+перенеси их вручную. В Nginx свои сайты остаются, отключаются только блоки с этим доменом.{/}" \
+                 "${pitems[@]}") || return 1
+  PROXY=$proxy_choice
+  # --- 5. inbounds on 80/443
+  mapfile -t conflicts < <(migrate_conflicts)
+  if ((${#conflicts[@]})); then
+    tui_yesno 'Порт 443 занят inbound-ом' "Эти inbound-ы слушают TCP 80/443, а эти порты нужны прокси:
+$(for c in "${conflicts[@]}"; do printf '  id %s — порт %s\n' "${c% *}" "${c#* }"; done)
+
+Скрипт перенесёт их на свободные порты (8443, 2053…). Клиенты получат новый порт,
+когда обновят подписку; ссылки, добавленные вручную, придётся обновить." \
+      'Перенести' 'Отмена' yes || return 1
+  fi
+  # --- 6. confirm
+  local panel_path sub_path note_paths=''
+  panel_path=$(strip_slashes "${XS[webBasePath]}"); sub_path=$(strip_slashes "${XS[subPath]}")
+  [[ -z "$panel_path" ]] && note_paths=$'\n'"{yellow}Панель была в корне (/) — ей будет выдан секретный путь.{/}"
+  TUI_LOGO=1 tui_yesno 'Подтверждение миграции' "Домен:       $DOMAIN
+3x-ui:       $([[ $mode == takeover ]] && echo "оставить $ver" || echo 'переустановить последнюю версию')
+Прокси:      $PROXY ($(command -v "$PROXY" >/dev/null 2>&1 && echo 'взять под управление' || echo 'установить'))
+Панель:      https://$DOMAIN/${panel_path:-<новый путь>}/
+Подписки:    https://$DOMAIN/${sub_path:-sub}/…$( [[ "${XS[subEnable]}" == true && "${XS[subPort]}" != 443 ]] && printf '\n             старые %s://%s:%s/… → перенаправление' "${XS[subCertFile]:+https}${XS[subCertFile]:-http}" "$DOMAIN" "${XS[subPort]}")
+Вход:        $([[ $pass_mode == keep ]] && echo "прежний ($PANEL_USER)" || echo 'новые логин и пароль')$note_paths
+
+Перед изменениями база будет сохранена в /opt/3x-ui_reverse/backups/." 'Мигрировать' 'Отмена' yes || return 1
+  migrate_run "$mode" "${conflicts[@]}"
+}
+migrate_check_password(){
+  local scheme=http host=127.0.0.1 url
+  [[ -n "${XS[webCertFile]:-}" ]] && scheme=https
+  case "${XS[webListen]:-}" in ''|0.0.0.0|::|'[::]') ;; *:*) host="[${XS[webListen]}]" ;; *) host=${XS[webListen]} ;; esac
+  url="$scheme://$host:${XS[webPort]}${XS[webBasePath]%/}"
+  printf '%s\n' "$1" | helper panel-login "$url" "$PANEL_USER" >/dev/null 2>>"$LOG"
+}
+
+migrate_run(){
+  local mode=$1; shift
+  local -a conflicts=("$@")
+  local backup c id newp ids crt key cert_paths installer="$BASE/3x-ui-upstream-install.sh" old_port
+  install -d -m 755 "$BASE"
+  preinstall_commit
+  PROXY_INSTALLED=1; PANEL_INSTALLED=1; TLS_MODE=proxy
+  PANEL_PATH=$(strip_slashes "${XS[webBasePath]}"); [[ -n "$PANEL_PATH" ]] || PANEL_PATH="panel$(rand 18)"
+  SUB_PATH=$(strip_slashes "${XS[subPath]}"); [[ -n "$SUB_PATH" ]] || SUB_PATH="sub$(rand 19)"
+  JSON_PATH=$(strip_slashes "${XS[subJsonPath]}"); [[ -n "$JSON_PATH" ]] || JSON_PATH="json$(rand 19)"
+  CLASH_PATH=$(strip_slashes "${XS[subClashPath]}"); [[ -n "$CLASH_PATH" ]] || CLASH_PATH="clash$(rand 19)"
+  # Panel keeps its port (now local only) unless it is 80/443; subscriptions get a
+  # new local port, the old public one becomes the redirect.
+  PANEL_PORT=${XS[webPort]}
+  if [[ "$PANEL_PORT" == 80 || "$PANEL_PORT" == 443 ]] || ! valid_port "$PANEL_PORT"; then
+    PANEL_PORT=''; PANEL_PORT=$(newport) || die 'Не удалось подобрать порт панели.'
+  fi
+  old_port=${XS[subPort]}
+  SUB_PORT=''; SUB_PORT=$(newport) || die 'Не удалось подобрать порт подписок.'
+  OLD_SUB_PORT=''; OLD_SUB_SCHEME=''
+  if [[ "${XS[subEnable]}" == true && "$old_port" =~ ^[0-9]+$ && "$old_port" != 443 && "$old_port" != 80 &&
+        "$old_port" != "$PANEL_PORT" ]]; then
+    OLD_SUB_PORT=$old_port
+    OLD_SUB_SCHEME=http; [[ -n "${XS[subCertFile]:-}" ]] && OLD_SUB_SCHEME=https
+  fi
+  local -a stages=('Сохраняем базу 3x-ui')
+  [[ "$mode" == reinstall ]] && stages+=('Переустанавливаем 3x-ui (официальный установщик)')
+  stages+=('Переводим панель и подписки на 127.0.0.1')
+  ((${#conflicts[@]})) && stages+=('Освобождаем порты 80/443')
+  stages+=("Настраиваем $PROXY и HTTPS" 'Переводим TLS-inbound-ы на сертификат домена'
+           'Записываем параметры и PDF' 'Проверяем доступность HTTPS')
+  ui_start "Миграция • $DOMAIN • $PROXY" "${stages[@]}"
+  msg 'Сохраняем базу 3x-ui'
+  run systemctl stop x-ui || die 'Не удалось остановить x-ui.'
+  backup="$BASE/backups/before-migration-$(date +%Y%m%d-%H%M%S).db"
+  MIGRATE_BACKUP=''
+  backup_db "$backup" || die 'Не удалось сохранить базу 3x-ui — миграция остановлена, ничего не изменено.'
+  MIGRATE_BACKUP=$backup          # from now on any failure restores the old panel
+  step 8 'Копия базы сохранена'
+  if [[ "$mode" == reinstall ]]; then
+    msg 'Переустанавливаем 3x-ui (официальный установщик)'
+    run curl -fsSL --retry 3 -o "$installer" "$XUI_INSTALL_URL" || migrate_fail "$backup" 'Не удалось скачать установщик 3x-ui.'
+    chmod 700 "$installer"
+    prepare_bootstrap_guard
+    XUI_NONINTERACTIVE=1 XUI_SSL_MODE=none XUI_DB_TYPE=sqlite XUI_PANEL_PORT="$PANEL_PORT" \
+      XUI_WEB_BASE_PATH="$PANEL_PATH" XUI_USERNAME="$PANEL_USER" XUI_PASSWORD="$PANEL_PASS" \
+      bash "$installer" >>"$LOG" 2>&1 || migrate_fail "$backup" 'Официальный установщик 3x-ui завершился с ошибкой.'
+    run systemctl stop x-ui || :
+    restore_db "$backup" || migrate_fail "$backup" 'Не удалось вернуть базу после переустановки.'
+    step 30 '3x-ui обновлена, база восстановлена'
+  fi
+  msg 'Переводим панель и подписки на 127.0.0.1'
+  apply_panel || migrate_fail "$backup" 'Не удалось изменить адрес панели.'
+  set_subscriptions >>"$LOG" 2>&1 || migrate_fail "$backup" 'Не удалось изменить настройки подписок.'
+  run "$CLI" setting -username "$PANEL_USER" -password "$PANEL_PASS" || migrate_fail "$backup" 'Не удалось записать логин и пароль.'
+  [[ "$mode" == reinstall ]] && finalize_bootstrap_guard
+  run systemctl start x-ui || migrate_fail "$backup" 'x-ui не запустилась после изменения настроек.'
+  wait_local_stack || migrate_fail "$backup" 'Панель или подписки не поднялись на 127.0.0.1.'
+  write_helper; write_helper_env
+  ensure_api_token || migrate_fail "$backup" 'Не удалось получить API-токен 3x-ui.'
+  step 45 'Панель и подписки на 127.0.0.1'
+  if ((${#conflicts[@]})); then
+    msg 'Освобождаем порты 80/443'
+    local moved
+    for c in "${conflicts[@]}"; do
+      id=${c% *}; moved=0
+      # The helper refuses ports used by other inbounds (also stopped ones): try a few.
+      for _ in 1 2 3 4 5 6; do
+        newp=$(inbound_port) || break
+        TAKEN_PORTS="${TAKEN_PORTS:-} $newp"
+        if helper set-port "$id" "$newp" >>"$LOG" 2>&1; then moved=1; break; fi
+      done
+      ((moved)) || migrate_fail "$backup" "Не удалось перенести inbound $id с порта ${c#* }."
+      note "Inbound $id перенесён с порта ${c#* } на $newp."
+    done
+    sleep 2
+  fi
+  msg "Настраиваем $PROXY и HTTPS"
+  proxy_install_pkgs || migrate_fail "$backup" "Не удалось установить $PROXY."
+  migrate_nginx_conflicts
+  site_html
+  firewall_web_ports
+  proxy_configure
+  step 75 'Прокси и HTTPS готовы'
+  msg 'Переводим TLS-inbound-ы на сертификат домена'
+  ids=$(helper tls-inbounds-for "$DOMAIN" "$(certdir)" 2>>"$LOG" || :)
+  if [[ -n "$ids" ]] && cert_paths=$(wait_domain_cert); then
+    crt=$(sed -n 1p <<< "$cert_paths"); key=$(sed -n 2p <<< "$cert_paths")
+    for id in $ids; do
+      helper set-tls "$id" "$crt" "$key" "$DOMAIN" >>"$LOG" 2>&1 &&
+        note "Inbound $id теперь использует сертификат прокси (продлевается автоматически)." || :
+    done
+  fi
+  step 85 'Inbound-ы проверены'
+  msg 'Записываем параметры и PDF'
+  save_state; write_info
+  pdf_install_deps >/dev/null 2>&1 || :
+  write_pdf || :
+  helper enable-access-log >>"$LOG" 2>&1 || :
+  setup_activity_timer || :
+  install_self || warn "Не удалось установить команду $SELF."
+  step 95 'Параметры записаны'
+  msg 'Проверяем доступность HTTPS'
+  if verify_remote; then step 100 'HTTPS работает'
+  else ui_stop failed; warn 'HTTPS-проверка по localhost не прошла. Проверь DNS, TLS и журнал прокси.'; fi
+  ui_stop
+  note "Копия прежней базы: $backup"
+  [[ -n "$OLD_SUB_PORT" ]] &&
+    note "Старые ссылки подписки ${OLD_SUB_SCHEME}://$DOMAIN:$OLD_SUB_PORT/… перенаправляются на https://$DOMAIN/…"
+  MIGRATE_BACKUP=''
+  tui_show 'Миграция завершена' install_summary
+  flush_notes 'Обрати внимание'
+  MIGRATING=0
+  return 0
+}
+# After a failed step: put the old database (and proxy config) back and start
+# the panel as it was. Called by migrate_fail and, for any other fatal error
+# during a migration, from die().
+MIGRATE_BACKUP=''
+migrate_restore(){
+  local backup=${MIGRATE_BACKUP:-} f
+  [[ -f "$backup" ]] || return 1
+  MIGRATE_BACKUP=''
+  run systemctl stop x-ui || :
+  restore_db "$backup" || :
+  rm -f /etc/systemd/system/x-ui.service.d/20-reverse-localhost.conf
+  run systemctl daemon-reload || :
+  if [[ "$PROXY" == caddy && -f "$BASE/Caddyfile.before-migration" ]]; then
+    rm -f /etc/caddy/Caddyfile && cp -a "$BASE/Caddyfile.before-migration" /etc/caddy/Caddyfile
+    run systemctl restart caddy || :
+  elif [[ "$PROXY" == nginx ]]; then
+    rm -f /etc/nginx/sites-enabled/3x-ui_reverse.conf
+    for f in /etc/nginx/conf.d/*.disabled-by-3x-ui_reverse; do [[ -e "$f" ]] && mv -f -- "$f" "${f%.disabled-by-3x-ui_reverse}"; done
+    run systemctl reload nginx || :
+  fi
+  run systemctl start x-ui || :
+  # Keep the log and the copy of the database, but out of the way of a new attempt.
+  local keep
+  keep="$BASE.failed-$(date +%Y%m%d-%H%M%S)"
+  if mv -f -- "$BASE" "$keep" 2>/dev/null; then
+    LOG=$keep/install.log; MIGRATE_KEPT=$keep
+  fi
+  return 0
+}
+MIGRATE_KEPT=''
+migrate_fail(){
+  local reason=$2
+  if migrate_restore; then
+    reason+=$'\n\n'"Прежняя база 3x-ui восстановлена, панель запущена в старом виде."
+    [[ -n "$MIGRATE_KEPT" ]] && reason+=" Журнал и копия базы: $MIGRATE_KEPT"
+    NOTES=()
+  fi
+  die "$reason"
+}
+# Nginx server blocks of other files with the same server_name would win over ours.
+migrate_nginx_conflicts(){
+  [[ "$PROXY" == nginx ]] || return 0
+  local f
+  for f in /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*.conf; do
+    [[ -e "$f" ]] || continue
+    [[ "$(readlink -f "$f")" == /etc/nginx/sites-available/3x-ui_reverse.conf ]] && continue
+    grep -Eq "server_name[^;]*[[:space:]]$DOMAIN([[:space:];]|$)" "$f" 2>/dev/null || continue
+    if [[ -L "$f" ]]; then rm -f -- "$f"; else mv -f -- "$f" "$f.disabled-by-3x-ui_reverse"; fi
+    note "Nginx: отключён $f (тот же домен $DOMAIN)."
+  done
+}
+firewall_web_ports(){
+  local p
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+    for p in 80 443 ${OLD_SUB_PORT:-}; do run ufw allow "$p/tcp" || :; done
+  elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+    for p in 80 443 ${OLD_SUB_PORT:-}; do run firewall-cmd --permanent --add-port="$p/tcp" || :; done
+    run firewall-cmd --reload || :
+  fi
+  return 0
 }
 
 write_helper(){
@@ -6160,6 +6801,563 @@ def cmd_ipregion_table(args):
     out(c('dim', '  Данные: github.com/Davoyan/ipregion'))
 
 
+# ------------------------------------------------------------------ routing
+# Server-side routing in this panel's Xray template (not client routing).
+# State: STATE_DIR/routing.json; downloaded lists: STATE_DIR/routing-lists/.
+# Our rules carry ruleTag "3xr-…" and are rebuilt on every apply; rules made
+# by hand in the panel stay untouched and keep priority (they come first).
+import hashlib
+import ipaddress as _ipa
+
+ROUTING_FILE = os.path.join(STATE_DIR, 'routing.json')
+ROUTING_LISTS = os.path.join(STATE_DIR, 'routing-lists')
+VPN_TAG = '3xr-vpn'
+DIRECT_TAG = 'direct'
+ROUTING_MODES = {
+    'off': 'выключена',
+    'ru-direct': 'российские сервисы напрямую, остальное через VPN',
+    'blocked-vpn': 'заблокированное в РФ через VPN, остальное напрямую',
+}
+# runetfreedom/russia-v2ray-rules-dat (shipped with 3x-ui as geosite_RU.dat/geoip_RU.dat)
+RU_DOMAINS = ['ext:geosite_RU.dat:category-ru', 'ext:geosite_RU.dat:ru-available-only-inside',
+              'regexp:\\.(ru|su|xn--p1ai)$']
+RU_IPS = ['ext:geoip_RU.dat:ru']
+BLOCKED_DOMAINS = ['ext:geosite_RU.dat:ru-blocked']
+BLOCKED_IPS = ['ext:geoip_RU.dat:ru-blocked']
+DOMAIN_RE = re.compile(r'^(\*\.)?([a-z0-9_]([a-z0-9_-]{0,61}[a-z0-9_])?\.)+[a-z0-9-]{2,63}\.?$', re.I)
+PREFIXES = ('domain:', 'full:', 'regexp:', 'keyword:', 'geosite:', 'ext:')
+
+
+def routing_load():
+    try:
+        with open(ROUTING_FILE) as fh:
+            st = json.load(fh)
+    except (OSError, ValueError):
+        st = {}
+    st.setdefault('mode', 'off')
+    st.setdefault('vpn', '')
+    st.setdefault('custom', [])
+    return st
+
+
+def routing_save(st):
+    tmp = ROUTING_FILE + '.tmp'
+    with open(tmp, 'w') as fh:
+        json.dump(st, fh, ensure_ascii=False, indent=1)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, ROUTING_FILE)
+
+
+def parse_entries(text):
+    """Domains and IPs from a list: plain, prefixed, hosts and dnsmasq formats."""
+    domains, ips = [], []
+    seen = set()
+    for raw in text.splitlines():
+        line = raw.split('#', 1)[0].strip()
+        if not line or line.startswith('//') or line.startswith('!'):
+            continue
+        m = re.match(r'^[a-z_-]+=/(.+)/[^/]*$', line)        # dnsmasq: server=/a.com/b.com/addr
+        tokens = [t for t in m.group(1).split('/') if t] if m else [line.split()[0]]
+        if not m and len(line.split()) >= 2:                 # hosts: 0.0.0.0 domain
+            first, second = line.split()[:2]
+            try:
+                _ipa.ip_address(first)
+                tokens = [second]
+            except ValueError:
+                pass
+        for tok in tokens:
+            tok = tok.strip().strip(',;').lower()
+            if not tok or tok in seen:
+                continue
+            seen.add(tok)
+            if tok.startswith(PREFIXES):
+                domains.append(tok)
+                continue
+            try:
+                _ipa.ip_network(tok, strict=False)
+                ips.append(tok)
+                continue
+            except ValueError:
+                pass
+            if tok.startswith('*.'):
+                tok = tok[2:]
+            if tok.startswith('.'):
+                tok = tok[1:]
+            if DOMAIN_RE.match(tok):
+                domains.append('domain:' + tok.rstrip('.'))
+    return domains, ips
+
+
+def _list_path(url):
+    return os.path.join(ROUTING_LISTS, hashlib.sha256(url.encode()).hexdigest()[:16] + '.txt')
+
+
+def _download(url, limit=32 << 20):
+    import urllib.request
+    req = urllib.request.Request(url, headers={'User-Agent': '3x-ui_reverse', 'Accept': '*/*'})
+    with urllib.request.urlopen(req, timeout=40) as r:
+        data = r.read(limit + 1)
+    if len(data) > limit:
+        die('список больше %d МБ' % (limit >> 20))
+    return data.decode('utf-8', 'replace')
+
+
+def fetch_list(url):
+    """Download URL into the cache; returns (domains, ips)."""
+    text = _download(url)
+    domains, ips = parse_entries(text)
+    if not domains and not ips:
+        die('в списке не найдено ни доменов, ни IP-адресов: %s' % url)
+    os.makedirs(ROUTING_LISTS, mode=0o700, exist_ok=True)
+    tmp = _list_path(url) + '.tmp'
+    with open(tmp, 'w') as fh:
+        fh.write(text)
+    os.replace(tmp, _list_path(url))
+    return domains, ips
+
+
+def cached_list(url):
+    try:
+        with open(_list_path(url), encoding='utf-8', errors='replace') as fh:
+            return parse_entries(fh.read())
+    except OSError:
+        return [], []
+
+
+def _outbound_tags(tpl):
+    return [o.get('tag') for o in tpl.get('outbounds') or [] if o.get('tag')]
+
+
+def _ensure_direct(tpl):
+    for o in tpl.get('outbounds') or []:
+        if o.get('protocol') == 'freedom' and o.get('tag') == DIRECT_TAG:
+            return DIRECT_TAG
+    for o in tpl.get('outbounds') or []:
+        if o.get('protocol') == 'freedom' and not (o.get('settings') or {}).get('redirect'):
+            return o.get('tag')
+    tpl.setdefault('outbounds', []).append({'tag': DIRECT_TAG, 'protocol': 'freedom', 'settings': {}})
+    return DIRECT_TAG
+
+
+def build_rules(st, tpl):
+    """Our rules for the template; dies if a needed outbound is missing."""
+    direct = _ensure_direct(tpl)
+    vpn = st.get('vpn') or ''
+    tags = _outbound_tags(tpl)
+    needs_vpn = st['mode'] != 'off' or any(r.get('action') == 'vpn' for r in st['custom'])
+    if needs_vpn and vpn not in tags:
+        die('не выбран VPN-выход (или он удалён из панели) — выбери его в «Маршрутизация → VPN-выход»')
+    target = {'direct': direct, 'vpn': vpn}
+    rules = []
+    for i, r in enumerate(st['custom']):
+        if r.get('type') == 'url':
+            domains, ips = cached_list(r['url'])
+        else:
+            domains, ips = parse_entries('\n'.join(r.get('items') or []))
+        out = target[r.get('action', 'vpn')]
+        if domains:
+            rules.append({'type': 'field', 'domain': domains, 'outboundTag': out, 'ruleTag': '3xr-c%d-d' % i})
+        if ips:
+            rules.append({'type': 'field', 'ip': ips, 'outboundTag': out, 'ruleTag': '3xr-c%d-i' % i})
+    if st['mode'] == 'ru-direct':
+        rules += [{'type': 'field', 'domain': RU_DOMAINS, 'outboundTag': direct, 'ruleTag': '3xr-ru-d'},
+                  {'type': 'field', 'ip': RU_IPS, 'outboundTag': direct, 'ruleTag': '3xr-ru-i'},
+                  {'type': 'field', 'network': 'tcp,udp', 'outboundTag': vpn, 'ruleTag': '3xr-default'}]
+    elif st['mode'] == 'blocked-vpn':
+        rules += [{'type': 'field', 'domain': BLOCKED_DOMAINS, 'outboundTag': vpn, 'ruleTag': '3xr-blk-d'},
+                  {'type': 'field', 'ip': BLOCKED_IPS, 'outboundTag': vpn, 'ruleTag': '3xr-blk-i'},
+                  {'type': 'field', 'network': 'tcp,udp', 'outboundTag': direct, 'ruleTag': '3xr-default'}]
+    return rules
+
+
+def _validate_tokens(rules):
+    toks_d = sorted({t for r in rules for t in r.get('domain', []) if t.startswith(('geosite:', 'ext:'))})
+    toks_i = sorted({t for r in rules for t in r.get('ip', []) if t.startswith(('geoip:', 'ext:'))})
+    for kind, toks in (('domain', toks_d), ('ip', toks_i)):
+        if not toks:
+            continue
+        reply = call('/xray/geodata/validate', {'tokens': ','.join(toks), 'kind': kind}, form=True)
+        if reply.get('success') and reply.get('obj'):
+            bad = ', '.join('%s (%s)' % (x.get('token', '?'), x.get('reason', '?')) for x in reply['obj'][:5])
+            die('в Xray нет нужных geo-баз: %s — обнови geo-файлы панели (geosite_RU.dat, geoip_RU.dat)' % bad)
+
+
+def routing_apply(st):
+    tpl = get_template()
+    prev = json.loads(json.dumps(tpl))
+    rules = build_rules(st, tpl)
+    _validate_tokens(rules)
+    routing = tpl.setdefault('routing', {})
+    kept = [r for r in routing.get('rules') or [] if not str(r.get('ruleTag', '')).startswith('3xr-')]
+    routing['rules'] = kept + rules
+    routing.setdefault('domainStrategy', 'AsIs')
+    if routing['domainStrategy'] == 'AsIs' and any('ip' in r for r in rules):
+        routing['domainStrategy'] = 'IPIfNonMatch'      # domain-only connections still hit IP rules
+    put_template(tpl, prev)
+
+
+def _outbound_desc(o):
+    s = o.get('settings') or {}
+    addr = s.get('address') or ''
+    port = s.get('port') or ''
+    if not addr:
+        vn = (s.get('vnext') or s.get('servers') or [{}])[0]
+        addr, port = vn.get('address', ''), vn.get('port', '')
+    if not addr and s.get('peers'):
+        addr = (s['peers'][0] or {}).get('endpoint', '')
+    proto = o.get('protocol', '')
+    sec = (o.get('streamSettings') or {}).get('security') or ''
+    return '%s%s%s' % (proto, (' · ' + sec) if sec and sec != 'none' else '',
+                       (' · %s%s' % (addr, (':%s' % port) if port else '')) if addr else '')
+
+
+def cmd_routing_show(args):
+    st = routing_load()
+    tpl = get_template()
+    outs = {o.get('tag'): o for o in tpl.get('outbounds') or []}
+    mode = st['mode']
+    print('mode=%s' % mode)
+    print('vpn=%s' % st['vpn'])
+    print('vpn_ok=%d' % (1 if st['vpn'] in outs else 0))
+    print('vpn_desc=%s' % (_outbound_desc(outs[st['vpn']]) if st['vpn'] in outs else ''))
+    print('custom=%d' % len(st['custom']))
+    nosniff = [ib for ib in inbounds() if ib.get('enable') and ib.get('protocol') not in ('mtproto', 'wireguard', 'amneziawg')
+               and not jload(ib.get('sniffing'), {}).get('enabled')]
+    print('nosniff=%d' % len(nosniff))
+
+
+def cmd_routing_text(args):
+    """Header text for the routing screen (markup)."""
+    st = routing_load()
+    tpl = get_template()
+    outs = {o.get('tag'): o for o in tpl.get('outbounds') or []}
+    mode = st['mode']
+    col = 'dim' if mode == 'off' else 'green'
+    out('Режим:       ' + c(col, ROUTING_MODES[mode]))
+    if st['vpn'] in outs:
+        out('VPN-выход:   ' + c('accent', st['vpn']) + c('dim', '  ' + _outbound_desc(outs[st['vpn']])))
+    elif st['vpn']:
+        out('VPN-выход:   ' + c('red', '✗ «%s» больше нет в панели' % st['vpn']))
+    else:
+        out('VPN-выход:   ' + c('dim', 'не выбран'))
+    n = len(st['custom'])
+    out('Свои правила: %s' % (c('bold', str(n)) if n else c('dim', 'нет')))
+
+
+def cmd_routing_outbounds(args):
+    """Menu rows of outbounds usable as the VPN exit."""
+    tpl = get_template()
+    for o in tpl.get('outbounds') or []:
+        if o.get('protocol') in ('freedom', 'blackhole', 'dns', 'loopback') or not o.get('tag') or o.get('tag') == 'api':
+            continue
+        out('%s\t%s\t%s' % (o['tag'], o['tag'], c('dim', _outbound_desc(o))))
+
+
+def _parse_link_via_panel(link):
+    """3x-ui's own share-link parser, fed through a one-shot local URL."""
+    import http.server
+    import threading
+    body = (link.strip() + '\n').encode()
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+    srv = http.server.HTTPServer(('127.0.0.1', 0), H)
+    th = threading.Thread(target=srv.serve_forever, daemon=True)
+    th.start()
+    try:
+        reply = call('/xray/outbound-subs/parse',
+                     {'url': 'http://127.0.0.1:%d/' % srv.server_port, 'allowPrivate': 'true'}, form=True, timeout=30)
+    finally:
+        srv.shutdown()
+    obs = ok(reply, 'разбор ссылки') or []
+    if not obs:
+        die('ссылка не распознана (поддерживаются vless://, vmess://, trojan://, ss://, hysteria2://, wireguard://)')
+    return obs[0]
+
+
+def _test_outbound(ob, outbounds):
+    reply = call('/xray/testOutbound', {'outbound': json.dumps(ob), 'allOutbounds': json.dumps(outbounds),
+                                        'mode': 'real'}, form=True, timeout=60)
+    obj = reply.get('obj') if reply.get('success') else None
+    if isinstance(obj, dict):
+        if obj.get('success') or obj.get('delay'):
+            return True, '%s мс' % obj.get('delay', '?')
+        return False, (obj.get('error') or reply.get('msg') or 'нет ответа')[:120]
+    return False, (reply.get('msg') or 'нет ответа')[:120]
+
+
+def cmd_routing_vpn(args):
+    """routing-vpn TAG | routing-vpn --link LINK  → prints test result."""
+    st = routing_load()
+    tpl = get_template()
+    prev = json.loads(json.dumps(tpl))
+    if args and args[0] == '--link':
+        ob = _parse_link_via_panel(args[1])
+        ob['tag'] = VPN_TAG
+        outs = [o for o in tpl.get('outbounds') or [] if o.get('tag') != VPN_TAG]
+        if not outs:
+            outs = [{'tag': DIRECT_TAG, 'protocol': 'freedom', 'settings': {}}]
+        outs.append(ob)                                   # never first: first = default outbound
+        tpl['outbounds'] = outs
+        good, info = _test_outbound(ob, outs)
+        st['vpn'] = VPN_TAG
+        put_template(tpl, prev)
+    else:
+        tag = args[0]
+        outs = {o.get('tag'): o for o in tpl.get('outbounds') or []}
+        if tag not in outs:
+            die('нет outbound «%s»' % tag)
+        good, info = _test_outbound(outs[tag], tpl.get('outbounds') or [])
+        st['vpn'] = tag
+    routing_save(st)
+    if st['mode'] != 'off' or st['custom']:
+        routing_apply(st)
+    print('test=%s\ninfo=%s\ndesc=%s' % ('ok' if good else 'fail', info,
+                                         _outbound_desc(next(o for o in get_template().get('outbounds', [])
+                                                             if o.get('tag') == st['vpn']))))
+
+
+def cmd_routing_mode(args):
+    mode = args[0]
+    if mode not in ROUTING_MODES:
+        die('режим: off | ru-direct | blocked-vpn')
+    st = routing_load()
+    old = st['mode']
+    st['mode'] = mode
+    routing_apply(st)          # dies before saving if something is wrong
+    routing_save(st)
+    if old != mode:
+        print('ok')
+
+
+def cmd_routing_add(args):
+    """routing-add direct|vpn domains ITEMS… | routing-add direct|vpn url URL"""
+    action, kind = args[0], args[1]
+    if action not in ('direct', 'vpn'):
+        die('действие: direct | vpn')
+    st = routing_load()
+    if kind == 'url':
+        url = args[2].strip()
+        if not re.match(r'^https?://', url):
+            die('нужна ссылка http(s)://…')
+        if any(r.get('url') == url for r in st['custom']):
+            die('этот список уже добавлен')
+        domains, ips = fetch_list(url)
+        rule = {'type': 'url', 'url': url, 'action': action, 'count': len(domains) + len(ips),
+                'updated': int(time.time())}
+    else:
+        items = [x for a in args[2:] for x in re.split(r'[\s,;]+', a) if x]
+        domains, ips = parse_entries('\n'.join(items))
+        if not domains and not ips:
+            die('не найдено ни одного домена или IP')
+        rule = {'type': 'domains', 'items': [d[len('domain:'):] if d.startswith('domain:') else d for d in domains] + ips,
+                'action': action}
+    st['custom'].append(rule)
+    routing_apply(st)
+    routing_save(st)
+    print('count=%d' % (len(domains) + len(ips)))
+
+
+def cmd_routing_rules(args):
+    """Menu rows (index, label…) of custom rules."""
+    st = routing_load()
+    for i, r in enumerate(st['custom']):
+        act = c('green', 'напрямую') if r.get('action') == 'direct' else c('accent', 'через VPN')
+        if r.get('type') == 'url':
+            what = r['url']
+            if len(what) > 52:
+                what = what[:30] + '…' + what[-20:]
+            info = '%s · %d записей' % (what, r.get('count', 0))
+        else:
+            items = r.get('items') or []
+            info = ', '.join(items[:3]) + (' и ещё %d' % (len(items) - 3) if len(items) > 3 else '')
+        out('%d\t%s\t%s' % (i, act, info))
+
+
+def cmd_routing_rule(args):
+    """routing-rule N del|direct|vpn|refresh"""
+    i, op = int(args[0]), args[1]
+    st = routing_load()
+    if not 0 <= i < len(st['custom']):
+        die('нет правила %d' % i)
+    r = st['custom'][i]
+    if op == 'del':
+        st['custom'].pop(i)
+        if r.get('type') == 'url':
+            try:
+                os.remove(_list_path(r['url']))
+            except OSError:
+                pass
+    elif op in ('direct', 'vpn'):
+        r['action'] = op
+    elif op == 'refresh' and r.get('type') == 'url':
+        domains, ips = fetch_list(r['url'])
+        r['count'] = len(domains) + len(ips)
+        r['updated'] = int(time.time())
+    routing_apply(st)
+    routing_save(st)
+
+
+def cmd_routing_refresh(args):
+    """Timer: re-download URL lists; apply only when something changed."""
+    st = routing_load()
+    changed = False
+    for r in st['custom']:
+        if r.get('type') != 'url':
+            continue
+        before = cached_list(r['url'])
+        try:
+            domains, ips = fetch_list(r['url'])
+        except SystemExit:
+            continue
+        r['count'] = len(domains) + len(ips)
+        r['updated'] = int(time.time())
+        changed = changed or (domains, ips) != before
+    routing_save(st)
+    if changed:
+        routing_apply(st)
+        print('обновлено')
+
+
+def cmd_routing_test(args):
+    target = args[0].strip().lower()
+    target = re.sub(r'^https?://', '', target).split('/')[0]
+    try:
+        _ipa.ip_address(target)
+        data = {'ip': target}
+    except ValueError:
+        data = {'domain': target}
+    data['port'] = 443
+    reply = call('/xray/routeTest', data, form=True)
+    obj = ok(reply, 'проверка маршрута') or {}
+    tag = obj.get('outboundTag') or ''
+    tpl = get_template()
+    outs = tpl.get('outbounds') or []
+    if not tag and outs:                       # no rule matched: the first outbound is used
+        tag = outs[0].get('tag', '')
+    st = routing_load()
+    proto = next((o.get('protocol') for o in outs if o.get('tag') == tag), '')
+    kind = 'vpn' if tag and tag == st.get('vpn') else (
+        'direct' if proto == 'freedom' else ('block' if proto == 'blackhole' else 'other'))
+    print('%s\t%s\t%s' % (kind, tag, 'rule' if obj.get('matched') else 'default'))
+
+
+def cmd_sniff_enable_all(args):
+    """Turn on sniffing (routeOnly) on inbounds without it: domain rules need it."""
+    n = 0
+    for ib in inbounds():
+        if ib.get('protocol') in ('mtproto', 'wireguard', 'amneziawg'):
+            continue
+        sn = jload(ib.get('sniffing'), {})
+        if sn.get('enabled'):
+            continue
+        sn.update({'enabled': True, 'destOverride': ['http', 'tls', 'quic'], 'metadataOnly': False, 'routeOnly': True})
+        ib['sniffing'] = sn
+        save_inbound(ib)
+        n += 1
+    print(n)
+
+
+# ------------------------------------------------------------------ migration
+# Reads an existing 3x-ui database directly (sqlite3, read-only): the panel may
+# be stopped and has no API token for us yet.
+XUI_DEFAULTS = {'webPort': '2053', 'webBasePath': '/', 'webListen': '', 'webDomain': '', 'webCertFile': '',
+                'subEnable': 'true', 'subListen': '', 'subPort': '2096', 'subPath': '/sub/', 'subDomain': '',
+                'subCertFile': '', 'subURI': '', 'subJsonEnable': 'false', 'subJsonPath': '/json/',
+                'subClashEnable': 'false', 'subClashPath': '/clash/', 'twoFactorEnable': 'false'}
+
+
+def cmd_migrate_scan(args):
+    import sqlite3
+    db = args[0]
+    con = sqlite3.connect('file:%s?mode=ro' % db, uri=True, timeout=10)
+    try:
+        st = dict(XUI_DEFAULTS)
+        try:
+            for k, v in con.execute('SELECT key, value FROM settings'):
+                if k in st and v is not None:
+                    st[k] = v
+        except sqlite3.Error as e:
+            die('не удалось прочитать настройки 3x-ui: %s' % e)
+        for k, v in st.items():
+            print('%s=%s' % (k, str(v).replace('\n', ' ')))
+        try:
+            row = con.execute('SELECT username FROM users ORDER BY id LIMIT 1').fetchone()
+            print('username=%s' % (row[0] if row else ''))
+        except sqlite3.Error:
+            print('username=')
+        try:
+            rows = con.execute('SELECT id, port, protocol, listen, remark, stream_settings, enable FROM inbounds').fetchall()
+        except sqlite3.Error:
+            rows = []
+        for ib_id, port, proto, listen, remark, ss_raw, enable in rows:
+            ss = jload(ss_raw, {})
+            sec = ss.get('security') or 'none'
+            net = ss.get('network') or 'tcp'
+            transport = 'udp' if proto in ('wireguard', 'amneziawg', 'hysteria') or net in ('kcp', 'hysteria') else 'tcp'
+            crt, sni = '', ''
+            if sec == 'tls':
+                t = ss.get('tlsSettings') or {}
+                sni = t.get('serverName') or ''
+                certs = t.get('certificates') or [{}]
+                crt = (certs[0] or {}).get('certificateFile') or ''
+            print('INB\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' % (ib_id, port, transport, proto, listen or '', sec,
+                                                            crt, sni, 1 if enable else 0) + '\t' + (remark or '').replace('\t', ' '))
+    finally:
+        con.close()
+
+
+def cmd_panel_login(args):
+    """panel-login URL USER — password on stdin; exit 0 if the panel accepts it."""
+    import urllib.request
+    import http.cookiejar
+    base, user = args[0].rstrip('/'), args[1]
+    password = sys.stdin.readline().rstrip('\n')
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False              # localhost with the domain's certificate
+    ctx.verify_mode = ssl.CERT_NONE
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()),
+                                         urllib.request.HTTPSHandler(context=ctx),
+                                         urllib.request.ProxyHandler({}))
+    headers = {'Content-Type': 'application/x-www-form-urlencoded', 'X-Requested-With': 'XMLHttpRequest'}
+    try:                                    # 3x-ui 3.x: session-bound CSRF token
+        with opener.open(base + '/csrf-token', timeout=15) as r:
+            tok = (json.loads(r.read() or b'{}') or {}).get('obj')
+        if tok:
+            headers['X-CSRF-Token'] = tok
+    except Exception:
+        pass                                # older panels have no CSRF endpoint
+    body = urllib.parse.urlencode({'username': user, 'password': password}).encode()
+    try:
+        with opener.open(urllib.request.Request(base + '/login', data=body, headers=headers), timeout=15) as r:
+            reply = json.loads(r.read() or b'{}')
+    except Exception as e:
+        die('панель не ответила: %s' % e)
+    sys.exit(0 if reply.get('success') else 1)
+
+
+def cmd_tls_inbounds_for(args):
+    """IDs of TLS inbounds that use DOMAIN (SNI or certificate path) but not CERTDIR."""
+    domain, certdir = args[0].lower(), args[1]
+    for ib in inbounds():
+        ss = stream(ib)
+        if ss.get('security') != 'tls':
+            continue
+        t = ss.get('tlsSettings') or {}
+        crt = ((t.get('certificates') or [{}])[0] or {}).get('certificateFile') or ''
+        if crt.startswith(certdir):
+            continue
+        if (t.get('serverName') or '').lower() == domain or domain in crt.lower():
+            print(ib['id'])
+
+
 # ------------------------------------------------------------ self-update
 REPO_RE = re.compile(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+')
 TAG_VER_RE = re.compile(r'v?\d+(\.\d+){0,3}')
@@ -6243,6 +7441,11 @@ COMMANDS = {
     'node-enable': cmd_node_enable, 'node-probe': cmd_node_probe, 'pdf': cmd_pdf,
     'iperf-cities': cmd_iperf_cities, 'iperf-city': cmd_iperf_city, 'iperf-table': cmd_iperf_table,
     'ipregion-check': cmd_ipregion_check, 'ipregion-table': cmd_ipregion_table,
+    'routing-show': cmd_routing_show, 'routing-text': cmd_routing_text, 'routing-outbounds': cmd_routing_outbounds,
+    'routing-vpn': cmd_routing_vpn, 'routing-mode': cmd_routing_mode, 'routing-add': cmd_routing_add,
+    'routing-rules': cmd_routing_rules, 'routing-rule': cmd_routing_rule, 'routing-refresh': cmd_routing_refresh,
+    'routing-test': cmd_routing_test, 'sniff-enable-all': cmd_sniff_enable_all,
+    'migrate-scan': cmd_migrate_scan, 'panel-login': cmd_panel_login, 'tls-inbounds-for': cmd_tls_inbounds_for,
 }
 
 if __name__ == '__main__':
@@ -7592,6 +8795,7 @@ manager(){
          users $'Пользователи\t{dim}трафик, активность, inbound-ы{/}' \
          groups $'Группы\t{dim}массовые действия{/}' \
          inbounds $'Inbound-ы\t{dim}VLESS, Trojan, Hysteria2, AmneziaWG, MTProto{/}' \
+         routing $'Маршрутизация\t{dim}РФ напрямую или заблокированное через VPN{/}' \
          nodes $'Подключить узел\t{dim}другие серверы 3x-ui под управлением этой панели{/}' \
          '#Диагностика' '' \
          diag $'Диагностика сервера\t{dim}iPerf3 до РФ, IP Region{/}' \
@@ -7608,6 +8812,7 @@ manager(){
       users) menu_users ;;
       groups) menu_groups ;;
       inbounds) menu_inbounds ;;
+      routing) menu_routing ;;
       nodes) menu_nodes ;;
       diag) menu_diag ;;
       settings) menu_settings ;;
@@ -7676,6 +8881,11 @@ usage(){
   inbounds add KIND[,KIND…] [--tls CERT:KEY:SNI] [--port N] [--sni HOST] [--name NAME]
   inbounds edit ID [--port N] [--name NAME] [--sni HOST] [--tls domain|CERT:KEY:SNI] [--enable 0|1]
   inbounds del ID
+  routing [list]                        маршрутизация Xray этого сервера: режим, VPN-выход, правила
+  routing mode off|ru-direct|blocked-vpn  РФ напрямую / заблокированное через VPN
+  routing vpn TAG|ССЫЛКА                VPN-выход: outbound панели или vless://, trojan://…
+  routing add ДОМЕНЫ… [--direct|--vpn]  свои домены/IP;  routing add-url URL [--direct|--vpn]
+  routing del N | routing test ДОМЕН | routing refresh | routing sniff
   node [list]                           подключённые узлы (другие панели 3x-ui)
   node add DOMAIN TOKEN [--name NAME]   подключить узел по одноразовому токену с узла
   node add https://узел/путь/ --api-token T [--name NAME]   подключить вручную
@@ -7684,7 +8894,7 @@ usage(){
   node api-token [--rotate]             (на узле) API-токен для мастер-панели
   version | update [--check]            версия | проверить/установить обновление
 
-Служебные: --repair  --demo  --uninstall  --remove-command  --restore-command
+Служебные: --migrate  --repair  --demo  --uninstall  --remove-command  --restore-command
 
 Переменные: XR_IPERF='Город=host,…'  XR_UI=cli|tui  XR_SNI=a.com,b.com,c.com  XR_SNIFF=route|metadata
             XR_COUNTRY=NL|none  XR_REPO=owner/name  NO_COLOR=1
@@ -7779,6 +8989,33 @@ cli_cmd(){
         edit) cli_inbounds_edit "${@:3}" ;;
         del) [[ -n "${3:-}" ]] || die 'inbounds del ID'; helper del-inbound "$3"; printf 'Удалён inbound %s\n' "$3" ;;
         *) die "Неизвестная подкоманда inbounds $sub" ;;
+      esac ;;
+    routing)
+      cli_need_panel
+      local r act
+      case "$sub" in
+        list|show) helper routing-text; printf '\n'; helper routing-rules | sed 's/\t/  /g' ;;
+        mode) [[ -n "${3:-}" ]] || die 'routing mode off|ru-direct|blocked-vpn'
+              helper routing-mode "$3" >/dev/null; routing_timer_sync; helper routing-text ;;
+        vpn) [[ -n "${3:-}" ]] || die 'routing vpn TAG|ССЫЛКА'
+             if [[ "$3" == *://* ]]; then r=$(helper routing-vpn --link "$3"); else r=$(helper routing-vpn "$3"); fi
+             printf 'VPN-выход: %s\nПроверка: %s (%s)\n' "$(sed -n 's/^desc=//p' <<< "$r")" \
+               "$(sed -n 's/^test=//p' <<< "$r")" "$(sed -n 's/^info=//p' <<< "$r")" ;;
+        add|add-url)
+          act=vpn; [[ " $* " == *' --direct '* ]] && act=direct
+          local -a vals=()
+          for r in "${@:3}"; do [[ "$r" == --direct || "$r" == --vpn ]] || vals+=("$r"); done
+          ((${#vals[@]})) || die 'routing add ДОМЕНЫ… [--direct|--vpn] | routing add-url URL [--direct|--vpn]'
+          if [[ "$sub" == add-url ]]; then r=$(helper routing-add "$act" url "${vals[0]}")
+          else r=$(helper routing-add "$act" domains "${vals[@]}"); fi
+          printf 'Добавлено записей: %s (%s)\n' "${r#count=}" "$([[ $act == vpn ]] && echo 'через VPN' || echo 'напрямую')"
+          routing_timer_sync ;;
+        del) [[ -n "${3:-}" ]] || die 'routing del N (номер из routing list)'
+             helper routing-rule "$3" del; routing_timer_sync ;;
+        refresh) helper routing-refresh ;;
+        test) [[ -n "${3:-}" ]] || die 'routing test ДОМЕН|IP'; helper routing-test "$3" | sed 's/\t/  /g' ;;
+        sniff) printf 'Сниффинг включён на inbound-ах: %s\n' "$(helper sniff-enable-all)" ;;
+        *) die "Неизвестная подкоманда routing $sub" ;;
       esac ;;
     node|nodes)
       case "$sub" in
@@ -7909,13 +9146,17 @@ if [[ "${XUI_REVERSE_LIB_ONLY:-0}" != 1 ]]; then
     --cli) UI_WANT=cli; main_interactive ;;
     --tui) UI_WANT=tui; main_interactive ;;
     --repair) ui_init || :; repair_incomplete ;;
+    --migrate)
+      [[ -f "$STATE" ]] && die 'Сервер уже под управлением 3x-ui_reverse.'
+      xui_present || die "3x-ui не найдена ($CLI, $DB)."
+      if migrate_flow && [[ -f "$STATE" ]]; then manager; fi ;;
     --demo) ui_init || :; demo_ui ;;
     --users) cli_cmd users list ;;
     --uninstall) uninstall_all || { flush_notes 'Удаление'; exit 1; } ;;
     --remove-command) remove_manager_command || : ;;
     --restore-command) restore_manager_command ;;
     --help|-h|help) usage ;;
-    info|status|pdf|bbr|diag|users|groups|inbounds|node|nodes|version|update) cli_cmd "$@" ;;
+    info|status|pdf|bbr|diag|routing|users|groups|inbounds|node|nodes|version|update) cli_cmd "$@" ;;
     '') main_interactive ;;
     *) die "Неизвестный параметр: $1 (см. --help)" ;;
   esac
