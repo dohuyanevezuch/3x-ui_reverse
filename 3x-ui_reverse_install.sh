@@ -6,7 +6,7 @@ set -Eeuo pipefail
 umask 077
 
 # Release version = the git tag of the commit this file comes from.
-VERSION=v2.7.0
+VERSION=v2.7.1
 # GitHub repository (owner/name) that publishes tagged releases of this script.
 # Can also be set from the "Версия" screen or with XR_REPO=owner/name.
 DEFAULT_REPO='dohuyanevezuch/3x-ui_reverse'
@@ -470,6 +470,11 @@ valid_panel_port(){ valid_port "$1" || [[ "$1" == 443 ]]; }
 valid_path(){ [[ "$1" =~ ^[a-zA-Z0-9_-]{6,64}$ ]]; }
 
 check_environment(){
+  check_system
+  command -v ss >/dev/null || true
+}
+# Root, systemd and a supported OS — needed by every mode (install, migration, tools).
+check_system(){
   [[ $EUID -eq 0 ]] || die 'Запускать нужно от root (sudo bash ...).'
   [[ -d /run/systemd/system ]] || die 'Требуется systemd.'
   [[ -r /etc/os-release ]] || die 'ОС не определена.'
@@ -496,14 +501,18 @@ check_environment(){
         die "Неподдерживаемая версия: $os_id ${os_ver:-?}. Поддерживаются $SUPPORTED_OS."
       fi ;;
   esac
-  if [[ -e "$STATE" || -e "$DB" || -e /usr/local/x-ui/x-ui ]] || systemctl list-unit-files --no-legend x-ui.service 2>/dev/null | grep -q '^x-ui.service'; then
-    die 'Обнаружена существующая 3x-ui / конфигурация. Установка только на чистый VPS.'
-  fi
-  if [[ -e "$SELF" && "$0" != "$SELF" && ! -e "$STATE" ]]; then die 'Обнаружен старый 3x-ui_reverse без состояния: проверь установку вручную.'; fi
-  command -v ss >/dev/null || true
 }
 # Only a fresh install needs a clean VPS; a migration takes over what is there.
 check_clean_vps(){
+  # An existing 3x-ui is not an error at start: the first-run menu offers to migrate it.
+  # Only a fresh install refuses to run over it.
+  if [[ -e "$STATE" || -e "$DB" || -e "$CLI" ]] || systemctl list-unit-files --no-legend x-ui.service 2>/dev/null | grep -q '^x-ui.service'; then
+    if xui_present; then
+      die "На сервере уже есть 3x-ui. Выбери «Перенести существующую 3x-ui» — пути, inbound-ы и пользователи сохранятся."
+    fi
+    die "Найдены остатки 3x-ui ($( { [[ -e "$CLI" ]] && printf '%s ' "$CLI"; [[ -e "$DB" ]] && printf '%s ' "$DB"; } )служба x-ui), но база или программа неполные. Удали их (x-ui uninstall) или восстанови 3x-ui и запусти скрипт снова — он предложит перенос."
+  fi
+  if [[ -e "$SELF" && "$0" != "$SELF" && ! -e "$STATE" ]]; then die "Найден $SELF без состояния (прошлая установка не завершилась?). Удали его и каталог $BASE, затем запусти установку снова."; fi
   # Do not change someone else's web services, even if not 80/443.
   if command -v nginx >/dev/null || command -v caddy >/dev/null || [[ -e /etc/nginx/sites-enabled/3x-ui_reverse.conf ]]; then
     die 'Обнаружены Nginx/Caddy. Скрипт требует чистый VPS, чтобы не повредить сайты.'
@@ -3504,7 +3513,7 @@ start_menu(){
     head_extra=$'\n\n'"{yellow}⚠ Найдена установленная 3x-ui $(xui_version).{/} Её можно перенести под управление
 скрипта: пути панели и подписок, inbound-ы и пользователи сохранятся."
     mig_item=(migrate $'Перенести существующую 3x-ui\t{dim}миграция с сохранением путей и inbound-ов{/}')
-    inst_item=(install $'Установить заново\t{dim}поверх: пути и порты панели сменятся{/}')
+    inst_item=()                  # a fresh install needs a clean VPS
   fi
   while :; do
     ch=$(TUI_LOGO=1 TUI_CANCEL='Выход' tui_menu '3x-ui_reverse' "Сервер ещё не настроен.
