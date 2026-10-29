@@ -6,7 +6,7 @@ set -Eeuo pipefail
 umask 077
 
 # Release version = the git tag of the commit this file comes from.
-VERSION=v2.9.0
+VERSION=v2.9.2
 # GitHub repository (owner/name) that publishes tagged releases of this script.
 # Can also be set from the "Версия" screen or with XR_REPO=owner/name.
 DEFAULT_REPO='dohuyanevezuch/3x-ui_reverse'
@@ -6289,6 +6289,13 @@ class Snapshot:
 
     def where(self, email):
         act = self.activity.get(email) or {}
+        if act.get('node'):
+            nid = act['node']
+            name = node_title(nid)
+            if flag_code(name):
+                return name
+            code = node_country(nid, self.ibs)
+            return ('%s %s' % (flag_emoji(code), name)).strip()
         return self.tag2name.get(act.get('inbound'), act.get('inbound') or '')
 
     def state(self, cl):
@@ -6803,8 +6810,10 @@ def cmd_track_activity(_args):
     except (OSError, ValueError):
         activity = {}
     seen = set()
+    log_ok = False                      # Xray writes the access log (file exists)
     try:
         with open(ACCESS_LOG, 'r+', errors='replace') as f:
+            log_ok = True
             for line in f:
                 m = LOG_RE.search(line)
                 if not m:
@@ -6821,19 +6830,46 @@ def cmd_track_activity(_args):
             f.truncate(0)    # Xray appends with O_APPEND, so writes resume at offset 0
     except FileNotFoundError:
         pass
-    # MTProto is served by mtg, not Xray: attribute online users we did not see
-    # in the Xray log to an active mtproto inbound they are attached to.
+    # Users the Xray log of THIS server did not show:
+    #  - online on a node (onlinesByGuid): their traffic is in the node's own log —
+    #    remember the node, not an inbound;
+    #  - online here and attached to an active MTProto inbound (served by mtg, not
+    #    Xray) — only when the access log is really written, otherwise every online
+    #    user would look like an MTProto one.
+    now = int(time.time())
     try:
         onlines = set(ok(call('/clients/onlines', {}, timeout=20), 'онлайн') or [])
-        active = set()
-        for tags in (ok(call('/clients/activeInbounds', {}, timeout=20), 'активные') or {}).values():
-            active.update(tags or [])
-        mt = [ib for ib in inbounds() if ib.get('protocol') == 'mtproto' and ib.get('tag') in active]
-        for ib in mt:
-            for cl in jload(ib.get('settings'), {}).get('clients') or []:
-                email = cl.get('email')
-                if email in onlines and email not in seen:
-                    activity[email] = {'inbound': ib.get('tag'), 'ts': int(time.time())}
+        by_guid = ok(call('/clients/onlinesByGuid', {}, timeout=20), 'онлайн по узлам') or {}
+        my_guid = (ok(call('/server/status', timeout=20), 'состояние') or {}).get('panelGuid') or ''
+        node_of_guid = {}
+        if any(g != my_guid for g in by_guid):
+            for n in ok(call('/nodes/list'), 'список узлов') or []:
+                if n.get('guid'):
+                    node_of_guid[n['guid']] = n['id']
+        on_nodes = set()
+        for guid, emails in by_guid.items():
+            if guid != my_guid:
+                on_nodes.update(emails or [])
+        here = (onlines - on_nodes) | set(by_guid.get(my_guid) or [])
+        for guid, emails in by_guid.items():
+            if guid == my_guid or guid not in node_of_guid:
+                continue
+            for email in emails or []:
+                if email not in seen:
+                    activity[email] = {'node': node_of_guid[guid], 'ts': now}
+                    seen.add(email)
+        if log_ok:
+            active = set()
+            for tags in (ok(call('/clients/activeInbounds', {}, timeout=20), 'активные') or {}).values():
+                active.update(tags or [])
+            mt = [ib for ib in inbounds() if ib.get('protocol') == 'mtproto' and not ib.get('nodeId')
+                  and ib.get('tag') in active]
+            for ib in mt:
+                for cl in jload(ib.get('settings'), {}).get('clients') or []:
+                    email = cl.get('email')
+                    if email in here and email not in seen:
+                        activity[email] = {'inbound': ib.get('tag'), 'ts': now}
+                        seen.add(email)
     except SystemExit:
         pass
     tmp = ACTIVITY + '.tmp'
@@ -6861,6 +6897,12 @@ def put_template(tpl, previous):
            'откат шаблона Xray')
         call('/server/restartXrayService', {})
         die('Xray не принял конфигурацию, откат выполнен: ' + err.strip()[:400])
+
+
+def cmd_access_log_ok(_args):
+    """Exit 0 if Xray of this panel writes the access log the activity tracker reads."""
+    log = get_template().get('log') or {}
+    sys.exit(0 if log.get('access') == ACCESS_LOG else 1)
 
 
 def cmd_enable_access_log(_args):
@@ -8182,14 +8224,35 @@ def _save_settings(allset):
     # and the users' connections keep running.
     ok(call('/setting/restartPanel', {}), 'перезапуск подписок')
     time.sleep(4)
-    for _ in range(30):
+    if _wait_panel(30):
+        return
+    # The panel did not come back by itself (e.g. the process exited and systemd
+    # does not restart it): start the service once more.
+    import subprocess
+    sys.stderr.write('routing: панель не ответила после перезапуска, systemctl restart x-ui\n')
+    try:
+        subprocess.run(['systemctl', 'restart', 'x-ui'], timeout=60, capture_output=True)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    if _wait_panel(40):
+        return
+    die('панель 3x-ui не запустилась после сохранения настроек — journalctl -u x-ui -n 50')
+
+
+def _wait_panel(seconds):
+    """Quietly wait for the panel API (no error line per attempt)."""
+    import io
+    for _ in range(seconds):
+        saved, sys.stderr = sys.stderr, io.StringIO()
         try:
             if call('/inbounds/list', timeout=5).get('success'):
-                return
+                return True
         except SystemExit:
             pass
+        finally:
+            sys.stderr = saved
         time.sleep(1)
-    die('панель не вернулась после перезапуска')
+    return False
 
 
 def routing_apply(st):
@@ -9203,7 +9266,7 @@ COMMANDS = {
     'group-create': cmd_group_create, 'group-rename': cmd_group_rename, 'group-delete': cmd_group_delete,
     'group-add-users': cmd_group_add_users, 'group-inbounds': cmd_group_inbounds,
     'groups': cmd_groups, 'menu-members': cmd_menu_members, 'group-set-members': cmd_group_set_members,
-    'country': cmd_country, 'inbounds-rename-plan': cmd_inbounds_rename_plan, 'inbounds-rename': cmd_inbounds_rename, 'inbounds-bulk': cmd_inbounds_bulk, 'country-style': cmd_country_style, 'inbounds-restyle': cmd_inbounds_restyle, 'menu-servers': cmd_menu_servers, 'panel-user': cmd_panel_user, 'web-docker': cmd_web_docker, 'web-caddyfiles': cmd_web_caddyfiles,
+    'country': cmd_country, 'access-log-ok': cmd_access_log_ok, 'inbounds-rename-plan': cmd_inbounds_rename_plan, 'inbounds-rename': cmd_inbounds_rename, 'inbounds-bulk': cmd_inbounds_bulk, 'country-style': cmd_country_style, 'inbounds-restyle': cmd_inbounds_restyle, 'menu-servers': cmd_menu_servers, 'panel-user': cmd_panel_user, 'web-docker': cmd_web_docker, 'web-caddyfiles': cmd_web_caddyfiles,
     'caddy-split': cmd_caddy_split, 'web-sites': cmd_web_sites, 'web-hosts': cmd_web_hosts, 'inbound-flags': cmd_inbound_flags, 'update-check': cmd_update_check, 'update-fetch': cmd_update_fetch,
     'dns-check': cmd_dns_check, 'public-ip': cmd_public_ip,
     'track-activity': cmd_track_activity, 'enable-access-log': cmd_enable_access_log,
@@ -10686,6 +10749,7 @@ EOF
 upgrade_panel_data(){
   # One-time data upgrades from older versions; need the panel API.
   [[ "${PANEL_INSTALLED:-1}" == 1 && -d "$BASE" ]] || return 0
+  activity_check
   local need=0 nflag
   [[ -f "$BASE/.flags-v27" ]] || need=1
   [[ -f "$BASE/routing.json" ]] && grep -q '"vpn"' "$BASE/routing.json" 2>/dev/null && need=1
@@ -10702,6 +10766,18 @@ upgrade_panel_data(){
     [[ "$nflag" =~ ^[1-9][0-9]*$ ]] && note "✓ К названиям inbound'ов добавлен флаг страны: $nflag шт."
   fi
   return 0
+}
+# Users' "where" column needs Xray's access log and the minute timer; a migrated
+# or reinstalled panel may lack either.
+activity_check(){
+  [[ -f "$BASE/.activity-checked" && "$BASE/.activity-checked" -nt "$HELPER" ]] && return 0
+  ensure_api_token 3 >/dev/null 2>&1 || return 0
+  if ! helper access-log-ok >/dev/null 2>>"$LOG"; then
+    helper enable-access-log >>"$LOG" 2>&1 &&
+      note '✓ Включён журнал Xray для учёта активности: в «Пользователях» теперь видно, через какой inbound подключались (Xray перезапущен на секунду).'
+  fi
+  systemctl is-enabled --quiet "$ACTIVITY_UNIT.timer" 2>/dev/null || setup_activity_timer >>"$LOG" 2>&1 || :
+  touch "$BASE/.activity-checked"
 }
 cli_need_panel(){
   [[ $EUID -eq 0 ]] || die 'Запусти через sudo.'
