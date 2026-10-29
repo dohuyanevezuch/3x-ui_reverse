@@ -6,7 +6,7 @@ set -Eeuo pipefail
 umask 077
 
 # Release version = the git tag of the commit this file comes from.
-VERSION=v2.9.3
+VERSION=v2.10.0
 # GitHub repository (owner/name) that publishes tagged releases of this script.
 # Can also be set from the "Версия" screen or with XR_REPO=owner/name.
 DEFAULT_REPO='dohuyanevezuch/3x-ui_reverse'
@@ -3079,6 +3079,77 @@ ${list:-  нет данных}
   done
 }
 
+# ---- subscription page templates (3x-ui "Sub Theme Directory")
+subpage_dir(){ printf "%s" "$BASE/custom_subpage"; }
+subpages_sync(){
+  local out
+  out=$(helper subpages-sync "$(subpage_dir)" "${XR_SUBPAGES_REPO:-}" 2>&1) || { SUBPAGE_ERR=${out#Ошибка: }; return 1; }
+  SUBPAGE_ERR=''
+}
+subpage_apply(){ helper subpage-set "$(subpage_dir)" "$1" >>"$LOG" 2>&1; }
+subpage_preview_hint(){
+  local sid base
+  base=$(sub_base); [[ -n "$base" ]] || return 0
+  sid=$(helper sub-id user1 2>/dev/null) || sid=''
+  if [[ -n "$sid" ]]; then
+    printf 'Открой в браузере ссылку подписки, например user1:\n  %s' "$base/$SUB_PATH/$sid"
+  else
+    printf 'Открой в браузере ссылку подписки любого пользователя: %s' "$base/$SUB_PATH/…"
+  fi
+}
+subpage_screen(){
+  local rows cur src updated name active size ch label head age
+  local -a items=()
+  # Templates are downloaded on first use and refreshed when older than a day.
+  updated=$(helper subpages-list "$(subpage_dir)" 2>>"$LOG" | awk -F'\t' '$1=="SRC"{print $3}') || updated=0
+  if (( $(date +%s) - ${updated:-0} > 86400 )); then
+    if ! with_progress 'Страница подписки' 'Скачиваем шаблоны с GitHub' subpages_sync; then
+      [[ -d "$(subpage_dir)" ]] && compgen -G "$(subpage_dir)/*/index.html" >/dev/null ||
+        { tui_msg 'Страница подписки' "{red}✗ Не удалось скачать шаблоны:{/} $SUBPAGE_ERR"; return 0; }
+      note "{yellow}⚠ Шаблоны не обновились ($SUBPAGE_ERR) — показаны скачанные раньше.{/}"
+      flush_notes 'Страница подписки'
+    fi
+  fi
+  while :; do
+    rows=$(helper subpages-list "$(subpage_dir)" 2>&1) || { tui_msg 'Страница подписки' "{red}✗ ${rows#Ошибка: }{/}"; return 0; }
+    cur=$(awk -F'\t' '$1=="CUR"{print $2}' <<< "$rows")
+    src=$(awk -F'\t' '$1=="SRC"{print $2}' <<< "$rows")
+    updated=$(awk -F'\t' '$1=="SRC"{print $3}' <<< "$rows")
+    items=(default "$([[ -z $cur ]] && echo '{green}●{/}' || echo '○') Стандартная страница 3x-ui")
+    label=''
+    while IFS=$'\t' read -r name active size; do
+      [[ "$name" == CUR || "$name" == SRC || -z "$name" ]] && continue
+      items+=("t:$name" "$([[ $active == 1 ]] && echo '{green}●{/}' || echo '○') $name"$'\t'"{dim}$size{/}")
+      [[ $active == 1 ]] && label=$name
+    done <<< "$rows"
+    if [[ -z "$cur" ]]; then label='стандартная 3x-ui'
+    elif [[ -z "$label" ]]; then label="своя: $cur"; fi
+    age=''; [[ "$updated" =~ ^[0-9]+$ && "$updated" -gt 0 ]] && age=$(date -d "@$updated" '+%d.%m.%Y %H:%M')
+    head="Сейчас: {bold}$label{/}
+{dim}Шаблоны: github.com/${src:-${XR_SUBPAGES_REPO:-dohuyanevezuch/3x-ui_subpages}}${age:+ · обновлены $age}
+Страница открывается, когда ссылку подписки открывают в браузере; приложения
+получают подписку как раньше.{/}"
+    ch=$(tui_menu 'Страница подписки' "$head" "${items[@]}" \
+         sync $'Обновить шаблоны\t{dim}скачать заново из репозитория{/}') || return 0
+    case "$ch" in
+      sync)
+        if with_progress 'Страница подписки' 'Скачиваем шаблоны с GitHub' subpages_sync; then
+          note '{green}✓ Шаблоны обновлены.{/} Выбранная страница уже показывает новую версию.'
+        else
+          note "{red}✗ $SUBPAGE_ERR{/}"
+        fi ;;
+      default|t:*)
+        name=${ch#t:}
+        if with_progress 'Страница подписки' 'Применяем страницу' subpage_apply "$name"; then
+          note "{green}✓ Страница подписки: $([[ $name == default ]] && echo 'стандартная 3x-ui' || echo "$name").{/}"
+          note "$(subpage_preview_hint)"
+        else
+          note "{red}✗ Не удалось применить (журнал: $LOG).{/}"
+        fi ;;
+    esac
+    flush_notes 'Страница подписки'
+  done
+}
 # ---- panel settings (were items 3–7)
 menu_settings(){
   local ch v olduser oldpass
@@ -3089,6 +3160,7 @@ menu_settings(){
          2 'Изменить путь панели' \
          3 'Изменить логин и пароль' \
          6 "Сохранить пароль из панели"$'\t{dim}если его сменили в самой 3x-ui{/}' \
+         7 "Страница подписки"$'\t{dim}оформление ссылки подписки в браузере{/}' \
          4 'Изменить порт подписок' \
          5 'Изменить путь подписок') || return 0
     if [[ "${PANEL_INSTALLED:-1}" != 1 ]]; then
@@ -3135,6 +3207,7 @@ menu_settings(){
         fi
         load_state ;;
       6) panel_creds_remember ;;
+      7) subpage_screen ;;
       4)
         v=$(tui_input 'Порт подписок' 'Новый порт подписок (пусто — случайный):' '') || continue
         v=${v:-$(newport)}
@@ -9230,9 +9303,129 @@ def cmd_menu_servers(_args):
         print('%s\t%s\t{dim}узел · %s%s{/}' % (nid, label, n.get('address') or '', state))
 
 
+# ------------------------------------------------------------------ subscription page templates
+# Templates for 3x-ui's own "Sub Theme Directory" (subThemeDir): every top-level
+# folder of the repository with an index.html / sub.html is one style.
+SUBPAGES_REPO = os.environ.get('XR_SUBPAGES_REPO', 'dohuyanevezuch/3x-ui_subpages')
+CODELOAD = os.environ.get('XR_CODELOAD', 'https://codeload.github.com').rstrip('/')
+SUBPAGE_NAME_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}')
+
+
+def _subpage_ok(path):
+    return any(os.path.isfile(os.path.join(path, f)) for f in ('index.html', 'sub.html'))
+
+
+def cmd_subpages_sync(args):
+    """subpages-sync DIR [REPO] — download the repository and refresh DIR/<style>/."""
+    import io
+    import shutil
+    import tarfile
+    import tempfile
+    import urllib.request
+    dest = args[0]
+    repo = args[1] if len(args) > 1 and args[1] else SUBPAGES_REPO
+    if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repo):
+        die('репозиторий указывается как owner/name')
+    url = '%s/%s/tar.gz/HEAD' % (CODELOAD, repo)
+    try:
+        req = urllib.request.Request(url, headers={'User-Agent': '3x-ui_reverse'})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            data = r.read((50 << 20) + 1)
+    except Exception as e:
+        die('не удалось скачать шаблоны с github.com/%s: %s' % (repo, e))
+    if len(data) > 50 << 20:
+        die('архив шаблонов больше 50 МБ')
+    os.makedirs(dest, mode=0o755, exist_ok=True)
+    work = tempfile.mkdtemp(prefix='.sync-', dir=dest)
+    try:
+        styles = {}
+        total = 0
+        with tarfile.open(fileobj=io.BytesIO(data), mode='r:gz') as tar:
+            for m in tar.getmembers():
+                parts = m.name.split('/')
+                # repo-<sha>/<style>/<file…>: regular files only, no tricks in names
+                if len(parts) < 3 or not m.isfile() or any(p in ('', '.', '..') for p in parts):
+                    continue
+                style = parts[1]
+                if not SUBPAGE_NAME_RE.fullmatch(style) or style.startswith('.'):
+                    continue
+                total += m.size
+                if total > 50 << 20:
+                    die('шаблоны больше 50 МБ')
+                target = os.path.join(work, style, *parts[2:])
+                os.makedirs(os.path.dirname(target), mode=0o755, exist_ok=True)
+                src = tar.extractfile(m)
+                with open(target, 'wb') as out_f:
+                    shutil.copyfileobj(src, out_f)
+                os.chmod(target, 0o644)
+                styles[style] = True
+        names = sorted(s for s in styles if _subpage_ok(os.path.join(work, s)))
+        if not names:
+            die('в github.com/%s нет папок с index.html' % repo)
+        for name in names:
+            final = os.path.join(dest, name)
+            old = final + '.old'
+            shutil.rmtree(old, ignore_errors=True)
+            if os.path.isdir(final):
+                os.rename(final, old)
+            os.rename(os.path.join(work, name), final)
+            os.chmod(final, 0o755)
+            shutil.rmtree(old, ignore_errors=True)
+        with open(os.path.join(dest, '.source'), 'w') as f:
+            json.dump({'repo': repo, 'updated': int(time.time()), 'styles': names}, f)
+        print(' '.join(names))
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def _theme_dir():
+    return (_settings().get('subThemeDir') or '').strip()
+
+
+def cmd_subpages_list(args):
+    """subpages-list DIR — 'CUR <TAB> path', then 'name <TAB> label' for the menu."""
+    dest = args[0]
+    cur = _theme_dir()
+    print('CUR\t%s' % cur)
+    try:
+        src = json.load(open(os.path.join(dest, '.source')))
+    except (OSError, ValueError):
+        src = {}
+    print('SRC\t%s\t%s' % (src.get('repo', ''), src.get('updated', 0)))
+    for name in sorted(os.listdir(dest)) if os.path.isdir(dest) else []:
+        path = os.path.join(dest, name)
+        if name.startswith('.') or name.endswith('.old') or not os.path.isdir(path) or not _subpage_ok(path):
+            continue
+        size = sum(os.path.getsize(os.path.join(r, f)) for r, _, fs in os.walk(path) for f in fs)
+        active = cur.rstrip('/') == path.rstrip('/')
+        print('%s\t%s\t%s' % (name, '1' if active else '0', human(size)))
+
+
+def cmd_subpage_set(args):
+    """subpage-set DIR NAME|default — point 3x-ui's subscription page to DIR/NAME/."""
+    dest, name = args[0], args[1]
+    if name == 'default':
+        value = ''
+    else:
+        if not SUBPAGE_NAME_RE.fullmatch(name):
+            die('неверное имя шаблона')
+        path = os.path.join(dest, name)
+        if not _subpage_ok(path):
+            die('шаблон %s не найден в %s' % (name, dest))
+        value = path.rstrip('/') + '/'
+    allset = _settings()
+    if (allset.get('subThemeDir') or '') == value:
+        print('unchanged')
+        return
+    allset['subThemeDir'] = value
+    _save_settings(allset)
+    print('ok')
+
+
 # ------------------------------------------------------------ self-update
 REPO_RE = re.compile(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+')
 TAG_VER_RE = re.compile(r'v?\d+(\.\d+){0,3}')
+GITHUB_API = os.environ.get('XR_GITHUB_API', 'https://api.github.com').rstrip('/')
 
 
 def verkey(tag):
@@ -9244,7 +9437,7 @@ def cmd_update_check(args):
     repo, current = args[0], args[1] if len(args) > 1 else 'v0'
     if not REPO_RE.fullmatch(repo):
         die('репозиторий указывается как owner/name')
-    api = 'https://api.github.com/repos/' + repo
+    api = GITHUB_API + '/repos/' + repo
     tag = ''
     try:
         tag = json.loads(_fetch(api + '/releases/latest', 10)).get('tag_name') or ''
@@ -9285,6 +9478,37 @@ def cmd_update_fetch(args):
     os.chmod(dest, 0o700)
 
 
+def cmd_update_notes(args):
+    """update-notes REPO CURRENT TAG — what changed: the release text, else the commit
+    messages between the two tags, else the message of the tag's commit."""
+    repo, current, tag = args[0], args[1], args[2]
+    if not REPO_RE.fullmatch(repo) or not TAG_VER_RE.fullmatch(tag):
+        die('некорректный репозиторий или тег')
+    api = GITHUB_API + '/repos/' + repo
+    text = ''
+    try:
+        text = (json.loads(_fetch(api + '/releases/tags/' + tag, 10)).get('body') or '').strip()
+    except Exception:
+        pass
+    if not text and TAG_VER_RE.fullmatch(current or ''):
+        try:
+            cmp_ = json.loads(_fetch('%s/compare/%s...%s' % (api, current, tag), 15))
+            msgs = [(c.get('commit') or {}).get('message', '').strip() for c in cmp_.get('commits') or []]
+            msgs = [m for m in reversed(msgs) if m]
+            text = '\n'.join('• ' + m.split('\n')[0] + (
+                ('\n' + '\n'.join('  ' + l for l in m.split('\n')[1:] if l.strip())) if len(msgs) == 1 else '')
+                for m in msgs[:20])
+        except Exception:
+            pass
+    if not text:
+        try:
+            text = ((json.loads(_fetch(api + '/commits/' + tag, 10)).get('commit') or {}).get('message') or '').strip()
+        except Exception:
+            pass
+    text = re.sub(r'\{|\}', '', text)          # no markup from the outside
+    print((text[:1800] + '\n…') if len(text) > 1800 else text)
+
+
 def cmd_ping(_args):
     ok(call('/inbounds/list', timeout=10), 'проверка API')
 
@@ -9304,7 +9528,7 @@ COMMANDS = {
     'group-add-users': cmd_group_add_users, 'group-inbounds': cmd_group_inbounds,
     'groups': cmd_groups, 'menu-members': cmd_menu_members, 'group-set-members': cmd_group_set_members,
     'country': cmd_country, 'nodes-status': cmd_nodes_status, 'access-log-ok': cmd_access_log_ok, 'inbounds-rename-plan': cmd_inbounds_rename_plan, 'inbounds-rename': cmd_inbounds_rename, 'inbounds-bulk': cmd_inbounds_bulk, 'country-style': cmd_country_style, 'inbounds-restyle': cmd_inbounds_restyle, 'menu-servers': cmd_menu_servers, 'panel-user': cmd_panel_user, 'web-docker': cmd_web_docker, 'web-caddyfiles': cmd_web_caddyfiles,
-    'caddy-split': cmd_caddy_split, 'web-sites': cmd_web_sites, 'web-hosts': cmd_web_hosts, 'inbound-flags': cmd_inbound_flags, 'update-check': cmd_update_check, 'update-fetch': cmd_update_fetch,
+    'caddy-split': cmd_caddy_split, 'web-sites': cmd_web_sites, 'web-hosts': cmd_web_hosts, 'inbound-flags': cmd_inbound_flags, 'update-check': cmd_update_check, 'update-notes': cmd_update_notes, 'subpages-sync': cmd_subpages_sync, 'subpages-list': cmd_subpages_list, 'subpage-set': cmd_subpage_set, 'update-fetch': cmd_update_fetch,
     'dns-check': cmd_dns_check, 'public-ip': cmd_public_ip,
     'track-activity': cmd_track_activity, 'enable-access-log': cmd_enable_access_log,
     'node-token-create': cmd_node_token_create, 'node-token-check': cmd_node_token_check,
@@ -10496,12 +10720,12 @@ install_self(){
   rm -f -- "$tmp"
   return 1
 }
-UPDATE_CACHE=$BASE/update-check
+
 # Cached result: "EPOCH TAG SHA newer|same|older" (refreshed at most daily).
 update_cached(){
   local epoch tag sha rel
-  [[ -r "$UPDATE_CACHE" ]] || return 1
-  read -r epoch tag sha rel < "$UPDATE_CACHE" || return 1
+  [[ -r "$BASE/update-check" ]] || return 1
+  read -r epoch tag sha rel < "$BASE/update-check" || return 1
   [[ "$epoch" =~ ^[0-9]+$ && -n "$tag" ]] || return 1
   printf '%s %s %s %s' "$epoch" "$tag" "$sha" "$rel"
 }
@@ -10510,7 +10734,7 @@ update_check_now(){
   repo=$(update_repo)
   [[ -n "$repo" ]] || return 1
   out=$(helper update-check "$repo" "$VERSION" 2>&1) || { printf '%s' "${out#Ошибка: }"; return 1; }
-  [[ -d "$BASE" ]] && printf '%s %s\n' "$(date +%s)" "$out" > "$UPDATE_CACHE"
+  [[ -d "$BASE" ]] && printf '%s %s\n' "$(date +%s)" "$out" > "$BASE/update-check"
   printf '%s' "$out"
 }
 # Daily background refresh so the main menu can show "доступна vX.Y.Z".
@@ -10527,6 +10751,45 @@ update_check_background(){
   fi
   return 0
 }
+# On every start: check GitHub in the background, then offer a newer version
+# with what changed (release text or commit messages). "Нет" is remembered for
+# that version only, the menu "Версия" still offers it.
+UPDATE_BG_PID='' UPDATE_BG_T0=0
+update_start_bg(){
+  UPDATE_BG_PID=''
+  [[ -n "$(update_repo)" && -d "$BASE" && -f "$HELPER" && "${XR_NO_UPDATE_CHECK:-0}" != 1 ]] || return 0
+  UPDATE_BG_T0=$(date +%s)
+  if [[ $UI_MODE == tui ]]; then
+    ( update_check_now >/dev/null 2>&1 || : ) {TUI_REQ}>&- {TUI_RESP}>&- {UI_OUT_FD}>&- {UI_ERR_FD}>&- </dev/null &
+  else
+    ( update_check_now >/dev/null 2>&1 || : ) </dev/null &
+  fi
+  UPDATE_BG_PID=$!
+}
+update_offer(){
+  local i cached epoch tag sha rel notes repo
+  [[ -n "$UPDATE_BG_PID" ]] || return 0
+  for ((i=0; i<16; i++)); do kill -0 "$UPDATE_BG_PID" 2>/dev/null || break; sleep 0.5; done
+  UPDATE_BG_PID=''
+  cached=$(update_cached) || return 0
+  read -r epoch tag sha rel <<< "$cached"
+  [[ "$rel" == newer && "$epoch" -ge "$UPDATE_BG_T0" ]] || return 0
+  [[ "$(cat "$BASE/update-dismissed" 2>/dev/null)" == "$tag" ]] && return 0
+  repo=$(update_repo)
+  notes=$(helper update-notes "$repo" "$VERSION" "$tag" 2>>"$LOG") || notes=''
+  [[ -n "$notes" ]] || notes='{dim}описание изменений не найдено{/}'
+  if tui_yesno 'Доступно обновление' "Вышла версия {green}$tag{/} {dim}(сейчас $VERSION, коммит $sha){/}
+
+{bold}Что изменилось:{/}
+$notes
+
+Обновить сейчас?" 'Да' 'Нет' yes; then
+    do_update "$tag" noconfirm || :
+  else
+    printf '%s\n' "$tag" > "$BASE/update-dismissed"
+    note "{dim}Обновиться позже можно в «Версия $VERSION».{/}"
+  fi
+}
 version_label(){
   local cached tag rel
   if cached=$(update_cached); then
@@ -10540,7 +10803,7 @@ version_label(){
 do_update(){
   local tag=$1 repo tmp backup
   repo=$(update_repo)
-  tui_yesno 'Обновление' "Обновить 3x-ui_reverse $VERSION → {green}$tag{/}?
+  [[ "${2:-}" == noconfirm ]] || tui_yesno 'Обновление' "Обновить 3x-ui_reverse $VERSION → {green}$tag{/}?
 
 Будет скачан скрипт из github.com/$repo (тег $tag) и установлен как $SELF.
 Текущая версия сохранится в $BASE/backups/." 'Обновить' 'Отмена' yes || return 0
@@ -10563,7 +10826,7 @@ do_update(){
   backup="$BASE/backups/3x-ui_reverse-$VERSION.sh"
   if [[ -f "$SELF" ]]; then cp -a -- "$SELF" "$backup"; else cp -a -- "$0" "$backup" 2>/dev/null || :; fi
   install -m 755 -- "$tmp" "$SELF"
-  rm -f -- "$tmp" "$UPDATE_CACHE"
+  rm -f -- "$tmp" "$BASE/update-check"
   ui_stop
   tui_msg 'Обновлено' "{green}✓ Установлена версия $tag.{/}
 Предыдущая версия: $backup
@@ -10621,7 +10884,7 @@ menu_version(){
           if [[ -n "$out" && ! "$out" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
             tui_msg 'Ошибка' 'Формат: owner/name, например ivan/3x-ui_reverse.'
           else
-            UPDATE_REPO=$out; save_state; rm -f -- "$UPDATE_CACHE"
+            UPDATE_REPO=$out; save_state; rm -f -- "$BASE/update-check"
             note "✓ Источник обновлений: ${out:-отключён}."
           fi
         fi ;;
@@ -10651,11 +10914,12 @@ manager(){
   fi
   # Keep the API helper in sync with this version of the script.
   write_helper; write_helper_env
+  update_start_bg                 # ask GitHub while the rest of the start-up runs
   pair_revoke                     # pairing files left by a killed session
   upgrade_panel_data
   panel_creds_sync
-  update_check_background
   flush_notes 'Обновление'
+  update_offer
   local ch
   # The text menu already has "0) Выход"; the TUI gets an explicit item for the mouse.
   local -a quit_item=()
@@ -10758,6 +11022,7 @@ usage(){
   inbounds add KIND[,KIND…] [--tls CERT:KEY:SNI] [--port N] [--sni HOST] [--name NAME]
   inbounds edit ID [--port N] [--name NAME] [--sni HOST] [--tls domain|CERT:KEY:SNI] [--enable 0|1]
   inbounds del ID
+  subpage list | sync | set NAME|default    страница подписки (шаблоны dohuyanevezuch/3x-ui_subpages)
   inbounds servers                      этот сервер и узлы (номер — для --node)
   inbounds add KIND,… --node N          создать на узле (без XHTTP TLS и Hysteria2)
   inbounds rename IDS [--yes]           названия как у скрипта: 🇩🇪 Germany VLESS TCP Reality
@@ -10929,6 +11194,16 @@ cli_cmd(){
     sites)
       cli_need_panel
       cli_sites "${@:2}" ;;
+    subpage)
+      cli_need_panel
+      case "$sub" in
+        list) helper subpages-list "$(subpage_dir)" | awk -F'\t' '$1=="CUR"{print "Сейчас: " ($2==""?"стандартная 3x-ui":$2); next} $1=="SRC"{next} {print ($2=="1"?"* ":"  ") $1 "  " $3}' ;;
+        sync) helper subpages-sync "$(subpage_dir)" "${XR_SUBPAGES_REPO:-}" ;;
+        set) [[ -n "${3:-}" ]] || die 'subpage set NAME|default'
+             [[ "$3" == default ]] || [[ -d "$(subpage_dir)/$3" ]] || helper subpages-sync "$(subpage_dir)" "${XR_SUBPAGES_REPO:-}" >/dev/null
+             helper subpage-set "$(subpage_dir)" "$3" >/dev/null && printf 'Страница подписки: %s\n' "$3" ;;
+        *) die "Неизвестная подкоманда subpage $sub" ;;
+      esac ;;
     routing)
       cli_need_panel
       local r act
@@ -10989,7 +11264,7 @@ cli_cmd(){
       bash -n "$tmp" && grep -qx "VERSION=$tag" "$tmp" || { rm -f -- "$tmp"; die 'Скачанный файл не прошёл проверку.'; }
       install -d -m 700 "$BASE/backups"
       [[ -f "$SELF" ]] && cp -a -- "$SELF" "$BASE/backups/3x-ui_reverse-$VERSION.sh"
-      install -m 755 -- "$tmp" "$SELF"; rm -f -- "$tmp" "$UPDATE_CACHE"
+      install -m 755 -- "$tmp" "$SELF"; rm -f -- "$tmp" "$BASE/update-check"
       printf 'Обновлено до %s: %s\n' "$tag" "$SELF" ;;
   esac
 }
@@ -11095,7 +11370,7 @@ if [[ "${XUI_REVERSE_LIB_ONLY:-0}" != 1 ]]; then
     --remove-command) remove_manager_command || : ;;
     --restore-command) restore_manager_command ;;
     --help|-h|help) usage ;;
-    info|status|pdf|bbr|diag|routing|sites|users|groups|inbounds|node|nodes|version|update) cli_cmd "$@" ;;
+    info|status|pdf|bbr|diag|routing|sites|users|groups|inbounds|node|nodes|version|update|subpage) cli_cmd "$@" ;;
     '') main_interactive ;;
     *) die "Неизвестный параметр: $1 (см. --help)" ;;
   esac
