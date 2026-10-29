@@ -6,7 +6,7 @@ set -Eeuo pipefail
 umask 077
 
 # Release version = the git tag of the commit this file comes from.
-VERSION=v2.7.1
+VERSION=v2.8.6
 # GitHub repository (owner/name) that publishes tagged releases of this script.
 # Can also be set from the "Версия" screen or with XR_REPO=owner/name.
 DEFAULT_REPO='dohuyanevezuch/3x-ui_reverse'
@@ -311,7 +311,7 @@ tui_resume(){ [[ $UI_MODE == tui ]] && ui_call '{"cmd":"resume"}'; return 0; }
 note(){
   if [[ $UI_MODE == tui ]]; then NOTES+=("$*")
   elif [[ $UI_MODE == cli ]]; then ui_tty_print "$*"
-  else printf '%s\n' "$*"; fi
+  else printf '%s\n' "$*" | sed 's/{\(\/\|[a-z]*\)}//g'; fi
 }
 flush_notes(){
   ((${#NOTES[@]})) || return 0
@@ -605,7 +605,7 @@ write_info(){
 TLS:                   $TLS_MODE
 Панель:                $panel_url
 Логин:                 $PANEL_USER
-Пароль:                $PANEL_PASS
+Пароль:                ${PANEL_PASS:-(изменён в панели 3x-ui)}
 Порт панели:           $PANEL_PORT
 
 Подписки (вместо CLIENT_SUB_ID укажи Sub ID клиента):
@@ -649,10 +649,22 @@ HTML
 }
 
 write_caddy(){
-  local target=${1:-$BASE/Caddyfile}
+  local target=${1:-$BASE/Caddyfile} wd; wd=$(web_dir)
+  # Hand edits of the live Caddyfile are not lost: other domains move to caddy/sites/.
+  [[ "$target" == "$BASE/Caddyfile" ]] && caddy_keep_manual
+  write_caddy_body "$target"
+  [[ "$target" == "$BASE/Caddyfile" ]] && caddy_mark
+  return 0
+}
+write_caddy_body(){
+  local target=$1 wd; wd=$(web_dir)
+  local acme=''
+  [[ -s "$wd/acme-email" ]] && acme=$(head -n1 "$wd/acme-email")
+  [[ "$acme" =~ ^[^[:space:]@{}]+@[^[:space:]@{}]+$ ]] || acme=''
   cat > "$target" <<EOF
 {
-    storage file_system $(certdir)
+    storage file_system $(certdir)${acme:+
+    email $acme}
 }
 
 $DOMAIN {
@@ -677,13 +689,33 @@ EOF
     }
 EOF
   fi
-  cat >> "$target" <<'EOF'
+  if [[ -s "$wd/root.caddy" ]]; then
+    # A service on the domain root instead of the stub; if it is down, the stub answers.
+    cat >> "$target" <<EOF
+    handle {
+        import $wd/root.caddy
+    }
+    handle_errors {
+        @down expression \`{err.status_code} in [502, 503, 504]\`
+        handle @down {
+            root * $SITE
+            rewrite * /index.html
+            file_server {
+                status 200
+            }
+        }
+    }
+}
+EOF
+  else
+    cat >> "$target" <<'EOF'
     handle {
         try_files {path} /index.html
         file_server
     }
 }
 EOF
+  fi
   # Subscription links from before the migration (domain:OLD_PORT/…) -> 443.
   if [[ -n "${OLD_SUB_PORT:-}" && "${PANEL_INSTALLED:-1}" == 1 ]]; then
     local addr="https://$DOMAIN:$OLD_SUB_PORT"
@@ -695,7 +727,36 @@ $addr {
 }
 EOF
   fi
+  if compgen -G "$wd/sites/*.caddy" >/dev/null; then
+    printf '\n# Other sites and services: %s/sites (not rewritten by the script)\nimport %s/sites/*.caddy\n' "$wd" "$wd" >> "$target"
+  fi
   chmod 644 "$target"
+}
+web_dir(){ echo "$BASE/caddy"; }
+# Checksum of the Caddyfile as the script wrote it: a mismatch means hand edits.
+caddy_mark(){ [[ -f "$BASE/Caddyfile" ]] && sha256sum "$BASE/Caddyfile" | cut -d' ' -f1 > "$BASE/.Caddyfile.sha256"; return 0; }
+caddy_keep_manual(){
+  local live=$BASE/Caddyfile sum cand copy out moved
+  [[ -f "$live" && -n "${DOMAIN:-}" ]] || return 0
+  sum=$(sha256sum "$live" | cut -d' ' -f1)
+  [[ -f "$BASE/.Caddyfile.sha256" && "$(cat "$BASE/.Caddyfile.sha256")" == "$sum" ]] && return 0
+  if [[ ! -f "$BASE/.Caddyfile.sha256" ]]; then
+    # No checksum yet (older version): unchanged if it renders the same.
+    cand=$(mktemp "$BASE/caddy-check.XXXXXXXX")
+    write_caddy_body "$cand"
+    if cmp -s "$cand" "$live"; then rm -f "$cand"; return 0; fi
+    rm -f "$cand"
+  fi
+  copy="$BASE/Caddyfile.manual-$(date +%Y%m%d-%H%M%S)"
+  cp -a "$live" "$copy"
+  out=$(helper caddy-split "$live" "$DOMAIN" "$(web_dir)/sites" --source "Caddyfile (ручные правки)" 2>>"$LOG") || out=''
+  printf 'caddy-split %s:\n%s\n' "$copy" "$out" >> "$LOG"
+  moved=$(awk -F'\t' '$1=="moved"{printf "%s%s", (n++?", ":""), $2}' <<< "$out")
+  if [[ -n "$moved" ]]; then
+    note "Caddyfile был изменён вручную. Сайты других доменов сохранены отдельно и продолжат работать: $moved (каталог $(web_dir)/sites). Правки внутри блока $DOMAIN не переносятся — они в копии: $copy"
+  elif [[ -f "$BASE/.Caddyfile.sha256" ]]; then
+    note "{yellow}⚠ Caddyfile был изменён вручную — правки основного домена перезаписаны. Копия: $copy. Свой сервис на корне домена задаётся в «Сайты и сервисы».{/}"
+  fi
 }
 
 write_nginx(){
@@ -793,7 +854,7 @@ EOF
 }
 
 validate_proxy(){
-  if [[ "$PROXY" == caddy ]]; then run caddy validate --config "$BASE/Caddyfile" --adapter caddyfile
+  if [[ "$PROXY" == caddy ]]; then web_validate
   else run nginx -t; fi
 }
 reload_proxy(){
@@ -836,7 +897,66 @@ PY
 
 # Bring CLI panel settings back in line and bind only localhost.
 apply_panel(){
-  run "$CLI" setting -port "$PANEL_PORT" -webBasePath "$PANEL_PATH" -listenIP 127.0.0.1
+  run "$CLI" setting -port "$PANEL_PORT" -webBasePath "$PANEL_PATH" -listenIP 127.0.0.1 || return 1
+  xui_env_sync_port "$PANEL_PORT"
+}
+# ---- Environment of the x-ui service. 3x-ui 3.x reads XUI_* variables from these
+# files itself (and from systemd Environment=): XUI_PORT overrides the panel port
+# stored in the database, XUI_DB_FOLDER moves the SQLite file, XUI_DB_TYPE=postgres
+# keeps everything in PostgreSQL.
+XUI_ENV_FILES=(/etc/default/x-ui /etc/sysconfig/x-ui /etc/conf.d/x-ui)
+XUI_ENV_BACKUPS=()               # "original|copy" made by xui_env_sync_port (migration undo)
+xui_unit_files(){ systemctl cat x-ui 2>/dev/null | sed -n 's/^# \(\/.*\)$/\1/p'; }
+# Env files: the ones 3x-ui reads itself plus EnvironmentFile= of the unit.
+xui_env_paths(){
+  printf '%s\n' "${XUI_ENV_FILES[@]}"
+  systemctl show x-ui -p EnvironmentFiles --value 2>/dev/null | tr ' ' '\n' | grep '^/' | sed 's/^-//' || :
+}
+xui_env_get(){
+  local key=$1 f v='' line
+  for f in $(xui_env_paths | sort -u); do
+    [[ -f "$f" ]] || continue
+    line=$(grep -E "^[[:space:]]*(export[[:space:]]+)?$key=" "$f" 2>/dev/null | tail -n1) || :
+    [[ -n "$line" ]] && v=${line#*=}
+  done
+  if [[ -z "$v" ]]; then
+    line=$(systemctl show x-ui -p Environment --value 2>/dev/null | tr ' ' '\n' | grep -E "^$key=" | tail -n1) || :
+    [[ -n "$line" ]] && v=${line#*=}
+  fi
+  v=${v%%#*}; v=${v//[[:space:]]/}; v=${v%\"}; v=${v#\"}; v=${v%\'}; v=${v#\'}
+  printf '%s' "$v"
+}
+# SQLite path of the running panel when XUI_DB_FOLDER is set for the service.
+xui_resolve_db(){
+  local folder
+  [[ "$DB" == /etc/x-ui/x-ui.db ]] || return 0
+  folder=$(xui_env_get XUI_DB_FOLDER)
+  [[ -n "$folder" && "$folder" == /* ]] || return 0
+  DB="${folder%/}/x-ui.db"
+  export XUI_DB_FOLDER=${folder%/}     # the CLI must edit the same database
+}
+# XUI_PORT wins over the port in the database: keep it equal to PANEL_PORT.
+xui_env_sync_port(){
+  local port=$1 f cur changed=0 copy
+  cur=$(xui_env_get XUI_PORT)
+  [[ -n "$cur" && "$cur" != "$port" ]] || return 0
+  install -d -m 700 "$BASE/backups"
+  for f in $(xui_env_paths | sort -u) $(xui_unit_files); do
+    [[ -f "$f" ]] && grep -q 'XUI_PORT=' "$f" 2>/dev/null || continue
+    copy="$BASE/backups/$(basename "$f").$(date +%Y%m%d-%H%M%S-%N)"
+    cp -a "$f" "$copy" && XUI_ENV_BACKUPS+=("$f|$copy")
+    sed -i -E "s/(XUI_PORT=[\"']?)[0-9]+/\1$port/g" "$f"
+    printf 'XUI_PORT %s -> %s in %s\n' "$cur" "$port" "$f" >> "$LOG"
+    changed=1
+  done
+  ((changed)) && run systemctl daemon-reload
+  return 0
+}
+xui_env_restore(){
+  local e
+  for e in "${XUI_ENV_BACKUPS[@]}"; do cp -a "${e#*|}" "${e%%|*}" 2>>"$LOG" || :; done
+  ((${#XUI_ENV_BACKUPS[@]})) && { XUI_ENV_BACKUPS=(); run systemctl daemon-reload || :; }
+  return 0
 }
 # Check the LOCAL address only (column 4). The PEER column of `ss`
 # commonly reads 0.0.0.0:* even for a listener bound to 127.0.0.1.
@@ -879,12 +999,12 @@ update_proxy_safe(){
   cp -a "$config" "$backup"
   if [[ "$PROXY" == caddy ]]; then write_caddy; else write_nginx full; fi
   if ! validate_proxy; then
-    cp -a "$backup" "$config"
+    cp -a "$backup" "$config"; [[ "$PROXY" == caddy ]] && caddy_mark
     warn "Новый конфиг не прошёл проверку, восстановлен $backup"
     return 1
   fi
   if ! reload_proxy; then
-    cp -a "$backup" "$config"
+    cp -a "$backup" "$config"; [[ "$PROXY" == caddy ]] && caddy_mark
     reload_proxy || true
     return 1
   fi
@@ -1148,6 +1268,12 @@ proxy_configure(){
     # Stock package places a demo Caddyfile; back it up before replacing.
     [[ -f /etc/caddy/Caddyfile && ! -L /etc/caddy/Caddyfile ]] &&
       cp -a /etc/caddy/Caddyfile "$BASE/Caddyfile.$([[ ${MIGRATING:-0} == 1 ]] && echo before-migration || echo package-default)"
+    if [[ ${MIGRATING:-0} == 1 && -f "$BASE/Caddyfile.before-migration" ]]; then
+      local kept
+      kept=$(helper caddy-split "$BASE/Caddyfile.before-migration" "$DOMAIN" "$(web_dir)/sites" --source 'прежний Caddyfile' 2>>"$LOG" |
+             awk -F'\t' '$1=="moved"{printf "%s%s", (n++?", ":""), $2}')
+      [[ -n "$kept" ]] && note "✓ Сайты из прежнего Caddyfile перенесены и продолжат работать: $kept."
+    fi
     write_caddy
     ln -sfn "$BASE/Caddyfile" /etc/caddy/Caddyfile
     chown -R caddy:caddy "$(certdir)"
@@ -1396,7 +1522,8 @@ show_info_color(){
   if [[ "${PANEL_INSTALLED:-1}" == 1 ]]; then
     color_value 'Адрес панели' "$panel_url" "$C_GREEN"
     color_value 'Логин' "$PANEL_USER" "$C_YELLOW"
-    color_value 'Пароль' "$PANEL_PASS" "$C_YELLOW"
+    if [[ -n "$PANEL_PASS" ]]; then color_value 'Пароль' "$PANEL_PASS" "$C_YELLOW"
+    else color_value 'Пароль' 'изменён в панели — «Настройки панели → Сохранить пароль из панели»' "$C_DIM"; fi
     color_value 'Порт' "$PANEL_PORT" "$C_DIM"
     if ntoken=$(node_api_token 2>>"$LOG"); then
       if (( 30 + ${#ntoken} > $(ui_width) )); then      # narrow terminal: own line
@@ -1411,7 +1538,7 @@ show_info_color(){
     fi
     copy_item 'адрес панели' "$panel_url"
     copy_item 'логин' "$PANEL_USER"
-    copy_item 'пароль' "$PANEL_PASS"
+    [[ -n "$PANEL_PASS" ]] && copy_item 'пароль' "$PANEL_PASS"
     copy_item 'API-токен узла' "${ntoken:-}"
     printf '\n%s  ● ПОДПИСКИ%s\n' "$C_BLUE" "$C_RESET"
     color_value 'Обычная / VLESS' "/$SUB_PATH/" "$C_YELLOW"
@@ -1502,6 +1629,11 @@ check_proxy_owned_for_purge(){
     caddy)
       if [[ ! -L /etc/caddy/Caddyfile ]] || [[ $(readlink -f /etc/caddy/Caddyfile) != "$BASE/Caddyfile" ]]; then
         warn 'Caddyfile больше не управляется 3x-ui_reverse.'
+        rm -f -- "$candidate"
+        return 1
+      fi
+      if [[ -s "$(web_dir)/root.caddy" ]] || compgen -G "$(web_dir)/sites/*.caddy" >/dev/null; then
+        warn "Caddy обслуживает твои сайты и сервисы ($(web_dir)). Чтобы не отключить их, удаление Caddy остановлено."
         rm -f -- "$candidate"
         return 1
       fi
@@ -1648,6 +1780,12 @@ confirm_yes(){
 }
 # Copy a backup INTO the live database with SQLite's backup API: a plain cp
 # would leave a stale -wal journal that SQLite replays over the restored data.
+# Login/password from the state; an unknown password (changed in the web panel)
+# leaves the panel's own credentials in place.
+apply_creds(){
+  [[ -n "$PANEL_PASS" ]] || return 0
+  run "$CLI" setting -username "$PANEL_USER" -password "$PANEL_PASS"
+}
 restore_db(){
   local src=$1
   [[ -f "$src" ]] || return 1
@@ -1937,7 +2075,7 @@ reinstall_panel(){
        ! run "$CLI" setting -port 443 -webBasePath "$PANEL_PATH" -listenIP 0.0.0.0 ||
        ! run "$CLI" cert -webCert "/root/cert/$DOMAIN/fullchain.pem" -webCertKey "/root/cert/$DOMAIN/privkey.pem" ||
        ! set_direct_subscriptions ||
-       ! run "$CLI" setting -username "$PANEL_USER" -password "$PANEL_PASS" ||
+       ! apply_creds ||
        ! run systemctl restart x-ui; then
       run systemctl stop x-ui || :
       ui_stop failed; warn 'Не удалось вернуть прямой HTTPS, x-ui остановлен.'; return 1
@@ -1951,7 +2089,7 @@ reinstall_panel(){
     PANEL_INSTALLED=1; TLS_MODE=direct; PROXY_INSTALLED=0
   else
     if ! apply_panel || ! set_subscriptions >>"$LOG" 2>&1 ||
-       ! run "$CLI" setting -username "$PANEL_USER" -password "$PANEL_PASS"; then
+       ! apply_creds; then
       ui_stop failed; warn 'Ошибка применения конфигурации. Сервис остановлен.'; return 1
     fi
     finalize_bootstrap_guard
@@ -2413,7 +2551,7 @@ dns_check_screen(){
     fi
     if [[ "$first" == go ]]; then
       ch=$(TUI_LOGO=1 TUI_DEFAULT=go TUI_CANCEL='Отмена' tui_menu 'Проверка DNS' "$head"$'\n\n'"$table" \
-           go '{green}Продолжить установку{/}' again 'Проверить снова' cancel 'Отменить') || return 1
+           go "{green}${DNS_GO_LABEL:-Продолжить установку}{/}" again 'Проверить снова' cancel 'Отменить') || return 1
     else
       ch=$(TUI_LOGO=1 TUI_DEFAULT=again TUI_CANCEL='Отмена' tui_menu 'Проверка DNS' "$head"$'\n\n'"$table" \
            again 'Проверить снова' go '{yellow}Всё равно продолжить{/}' cancel 'Отменить') || return 1
@@ -2863,6 +3001,7 @@ menu_settings(){
          1 'Изменить порт панели' \
          2 'Изменить путь панели' \
          3 'Изменить логин и пароль' \
+         6 "Сохранить пароль из панели"$'\t{dim}если его сменили в самой 3x-ui{/}' \
          4 'Изменить порт подписок' \
          5 'Изменить путь подписок') || return 0
     if [[ "${PANEL_INSTALLED:-1}" != 1 ]]; then
@@ -2908,6 +3047,7 @@ menu_settings(){
           warn 'Учётные данные не изменены.'
         fi
         load_state ;;
+      6) panel_creds_remember ;;
       4)
         v=$(tui_input 'Порт подписок' 'Новый порт подписок (пусто — случайный):' '') || continue
         v=${v:-$(newport)}
@@ -3414,7 +3554,7 @@ write_pdf(){
     [[ -n "$country$ip" ]] && printf 'server_label\t%s\n' "${country}${country:+${ip:+ · }}${ip}"
     [[ "$(bbr_now)" == bbr\ * ]] && printf 'bbr_label\t%s\n' "$(bbr_label)"
     if [[ -n "$panel_url" ]]; then
-      printf 'panel_url\t%s\nuser\t%s\npass\t%s\nport\t%s\n' "$panel_url" "$PANEL_USER" "$PANEL_PASS" "$PANEL_PORT"
+      printf 'panel_url\t%s\nuser\t%s\npass\t%s\nport\t%s\n' "$panel_url" "$PANEL_USER" "${PANEL_PASS:-изменён в панели}" "$PANEL_PORT"
       ntoken=$(node_api_token 2>>"$LOG") && printf 'node_token\t%s\n' "$ntoken"
       printf 'sub\t/%s/\njson\t/%s/\nclash\t/%s/\n' "$SUB_PATH" "$JSON_PATH" "$CLASH_PATH"
       sbase=$(sub_base)
@@ -3833,7 +3973,8 @@ MIGRATING=0
 declare -A XS=()          # settings of the existing panel (migrate-scan)
 MIG_INB=()                # "id port transport proto listen sec crt sni enable remark"
 
-xui_present(){ [[ -x "$CLI" && -f "$DB" ]]; }
+xui_present(){ [[ -x "$CLI" ]] && { [[ -f "$DB" ]] || xui_on_postgres; }; }
+xui_on_postgres(){ [[ "$(xui_env_get XUI_DB_TYPE)" == postgres* ]]; }
 xui_version(){ local v; v=$("$CLI" -v 2>/dev/null || :); v=${v%%$'\n'*}; printf '%s' "${v//$'\r'/}"; }
 xui_has_tokens(){ local h; h=$("$CLI" setting -h 2>&1 || :); [[ "$h" == *getApiToken* ]]; }
 # Who listens on a TCP port: process names, comma separated.
@@ -3852,6 +3993,12 @@ migrate_scan(){
       k=${line%%=*}; v=${line#*=}; XS[$k]=$v
     fi
   done < <(helper migrate-scan "$DB" 2>>"$LOG")
+  # XUI_PORT for the service overrides the port stored in the database.
+  v=$(xui_env_get XUI_PORT)
+  if [[ "$v" =~ ^[0-9]+$ ]]; then
+    printf 'XUI_PORT override: %s (database: %s)\n' "$v" "${XS[webPort]:-}" >> "$LOG"
+    XS[webPort]=$v
+  fi
   [[ -n "${XS[webPort]:-}" ]]
 }
 # Domain candidates: panel/subscription domain, certificate names, subURI host.
@@ -3907,6 +4054,10 @@ migrate_flow(){
   local ver mode entered pass_mode pass1 proxy_choice o443 o80 conf
   local -a conflicts=() blockers=()
   ver=$(xui_version)
+  if xui_on_postgres; then
+    pg_to_sqlite_flow || return 1
+    ver=$(xui_version)
+  fi
   if ! migrate_scan; then
     tui_msg 'Миграция' "{red}✗ Не удалось прочитать базу 3x-ui ($DB).{/} Подробности в журнале."
     return 1
@@ -3954,9 +4105,17 @@ migrate_flow(){
     case "$conf" in caddy|nginx|x-ui|xray*|'') ;; *) blockers+=("$conf") ;; esac
   done
   if ((${#blockers[@]})); then
+    local dhint=''
+    if [[ " ${blockers[*]} " == *docker-proxy* ]]; then
+      dhint=$'\n\n'"{yellow}Порты держит контейнер Docker{/} — скорее всего, Caddy или Nginx в Docker.
+Останови только его, остальные контейнеры не трогай:
+  {accent}docker compose stop caddy{/}   (в каталоге его docker-compose.yml)
+Его Caddyfile после миграции переносится в «Сайты и сервисы → Перенести сайты из Caddyfile»:
+сайты других доменов и сервис на корне домена продолжат работать через этот Caddy."
+    fi
     tui_msg 'Порты 80/443 заняты' "{red}✗ Порты 80/443 занимает: ${blockers[*]}.{/}
 
-Прокси должен слушать 80 и 443. Останови или удали эту программу и запусти миграцию снова."
+Прокси должен слушать 80 и 443. Останови или удали эту программу и запусти миграцию снова.$dhint"
     return 1
   fi
   local has_c=0 has_n=0 def=caddy lc ln
@@ -3992,11 +4151,18 @@ $(for c in "${conflicts[@]}"; do printf '  id %s — порт %s\n' "${c% *}" "$
 3x-ui:       $([[ $mode == takeover ]] && echo "оставить $ver" || echo 'переустановить последнюю версию')
 Прокси:      $PROXY ($(command -v "$PROXY" >/dev/null 2>&1 && echo 'взять под управление' || echo 'установить'))
 Панель:      https://$DOMAIN/${panel_path:-<новый путь>}/
-Подписки:    https://$DOMAIN/${sub_path:-sub}/…$( [[ "${XS[subEnable]}" == true && "${XS[subPort]}" != 443 ]] && printf '\n             старые %s://%s:%s/… → перенаправление' "${XS[subCertFile]:+https}${XS[subCertFile]:-http}" "$DOMAIN" "${XS[subPort]}")
+Подписки:    https://$DOMAIN/${sub_path:-sub}/…$( migrate_sub_redirect && printf '\n             старые %s://%s:%s/… → перенаправление' "${XS[subCertFile]:+https}${XS[subCertFile]:-http}" "$DOMAIN" "${XS[subPort]}")
 Вход:        $([[ $pass_mode == keep ]] && echo "прежний ($PANEL_USER)" || echo 'новые логин и пароль')$note_paths
 
 Перед изменениями база будет сохранена в /opt/3x-ui_reverse/backups/." 'Мигрировать' 'Отмена' yes || return 1
   migrate_run "$mode" "${conflicts[@]}"
+}
+# Old public subscription port that needs a redirect to 443. Not needed when
+# clients already use the subscription on 443 (an external reverse proxy, e.g.
+# Caddy in Docker): subURI is https://domain/… without a port.
+migrate_sub_redirect(){
+  [[ "${XS[subEnable]:-}" == true && "${XS[subPort]:-}" =~ ^[0-9]+$ && "${XS[subPort]}" != 443 && "${XS[subPort]}" != 80 ]] || return 1
+  ! [[ "${XS[subURI]:-}" =~ ^https://[^/:]+(:443)?(/|$) ]]
 }
 migrate_check_password(){
   local scheme=http host=127.0.0.1 url
@@ -4026,8 +4192,7 @@ migrate_run(){
   old_port=${XS[subPort]}
   SUB_PORT=''; SUB_PORT=$(newport) || die 'Не удалось подобрать порт подписок.'
   OLD_SUB_PORT=''; OLD_SUB_SCHEME=''
-  if [[ "${XS[subEnable]}" == true && "$old_port" =~ ^[0-9]+$ && "$old_port" != 443 && "$old_port" != 80 &&
-        "$old_port" != "$PANEL_PORT" ]]; then
+  if migrate_sub_redirect && [[ "$old_port" != "$PANEL_PORT" ]]; then
     OLD_SUB_PORT=$old_port
     OLD_SUB_SCHEME=http; [[ -n "${XS[subCertFile]:-}" ]] && OLD_SUB_SCHEME=https
   fi
@@ -4116,6 +4281,9 @@ migrate_run(){
   [[ -n "$OLD_SUB_PORT" ]] &&
     note "Старые ссылки подписки ${OLD_SUB_SCHEME}://$DOMAIN:$OLD_SUB_PORT/… перенаправляются на https://$DOMAIN/…"
   MIGRATE_BACKUP=''
+  if [[ "$PROXY" == caddy ]] && helper web-caddyfiles 2>>"$LOG" | grep -q .; then
+    note "{yellow}Найден Caddyfile от Caddy в Docker.{/} Его сайты (другие домены и сервис на корне $DOMAIN) переносятся в «Сайты и сервисы → Перенести сайты из Caddyfile»."
+  fi
   tui_show 'Миграция завершена' install_summary
   flush_notes 'Обрати внимание'
   MIGRATING=0
@@ -4131,6 +4299,7 @@ migrate_restore(){
   MIGRATE_BACKUP=''
   run systemctl stop x-ui || :
   restore_db "$backup" || :
+  xui_env_restore
   rm -f /etc/systemd/system/x-ui.service.d/20-reverse-localhost.conf
   run systemctl daemon-reload || :
   if [[ "$PROXY" == caddy && -f "$BASE/Caddyfile.before-migration" ]]; then
@@ -4181,6 +4350,661 @@ firewall_web_ports(){
     run firewall-cmd --reload || :
   fi
   return 0
+}
+
+# ---- 3x-ui on PostgreSQL -> SQLite. The script backs up and restores SQLite only,
+# so a PostgreSQL panel is first switched to a SQLite copy that 3x-ui itself builds
+# from the live data (/panel/api/server/getMigration). PostgreSQL is not touched:
+# undoing means putting XUI_DB_TYPE back.
+PG_ENV_BACKUPS=()
+pg_panel_url(){
+  local show port path listen host scheme=http
+  show=$("$CLI" setting -show 2>&1) || :
+  port=$(sed -n 's/^port: *\([0-9]\+\).*/\1/p' <<< "$show" | head -n1)
+  path=$(sed -n 's/^webBasePath: *//p' <<< "$show" | head -n1)
+  listen=$("$CLI" setting -getListen 2>&1 | sed -n 's/^listenIP: *//p' | head -n1)
+  [[ "$port" =~ ^[0-9]+$ ]] || return 1
+  case "$listen" in ''|0.0.0.0|::|'[::]'|127.0.0.1) host=127.0.0.1 ;; *:*) host="[$listen]" ;; *) host=$listen ;; esac
+  "$CLI" setting -getCert 2>&1 | grep -Eq 'cert(File)?: *[^ ]+' && scheme=https
+  path=/$(strip_slashes "$path"); [[ "$path" == / ]] || path+=/
+  printf '%s://%s:%s%s' "$scheme" "$host" "$port" "$path"
+}
+pg_env_switch(){        # comment out XUI_DB_TYPE / XUI_DB_DSN (backups kept for undo)
+  local f copy
+  PG_ENV_BACKUPS=()
+  for f in $(xui_env_paths | sort -u); do
+    [[ -f "$f" ]] && grep -Eq '^[[:space:]]*(export[[:space:]]+)?XUI_DB_(TYPE|DSN)=' "$f" || continue
+    copy="$f.before-sqlite-$(date +%Y%m%d-%H%M%S)"
+    cp -a "$f" "$copy" || return 1
+    PG_ENV_BACKUPS+=("$f|$copy")
+    sed -i -E 's/^([[:space:]]*(export[[:space:]]+)?XUI_DB_(TYPE|DSN)=)/# 3x-ui_reverse: SQLite now, PostgreSQL kept as a backup: \1/' "$f"
+  done
+  ((${#PG_ENV_BACKUPS[@]}))
+}
+pg_env_undo(){
+  local e
+  for e in "${PG_ENV_BACKUPS[@]}"; do cp -a "${e#*|}" "${e%%|*}" 2>>"$LOG" || :; done
+}
+pg_to_sqlite(){
+  local url token tmp code n_api n_db stale='' ts
+  ts=$(date +%Y%m%d-%H%M%S)
+  url=$(pg_panel_url) || { PG_ERR='Не удалось узнать порт панели (x-ui setting -show).'; return 1; }
+  printf 'pg->sqlite: panel %s\n' "$url" >> "$LOG"
+  token=$("$CLI" setting -getApiToken -tokenName 3x-ui_reverse-pg2sqlite -tokenScope admin 2>>"$LOG" | sed -n 's/^apiToken: *//p' | tail -n1)
+  [[ -n "$token" ]] || { PG_ERR='3x-ui не выдала API-токен (x-ui setting -getApiToken).'; return 1; }
+  n_api=$(curl -fsSk --max-time 20 -H "Authorization: Bearer $token" "${url}panel/api/inbounds/list" 2>>"$LOG" |
+          python3 -c 'import json,sys; print(len(json.load(sys.stdin).get("obj") or []))' 2>>"$LOG") ||
+    { PG_ERR="Панель не отвечает на $url — проверь, что x-ui запущена."; return 1; }
+  install -d -m 700 "$(dirname "$DB")"
+  tmp="$(dirname "$DB")/x-ui.db.from-postgres-$ts"
+  code=$(curl -sSk --max-time 300 -H "Authorization: Bearer $token" -o "$tmp" -w '%{http_code}' \
+         "${url}panel/api/server/getMigration" 2>>"$LOG") || code=000
+  if [[ "$code" != 200 ]]; then rm -f "$tmp"; PG_ERR="3x-ui не отдала копию базы (HTTP $code)."; return 1; fi
+  chmod 600 "$tmp"
+  n_db=$(python3 - "$tmp" <<'PYCHK' 2>>"$LOG"
+import sqlite3, sys
+con = sqlite3.connect('file:%s?mode=ro' % sys.argv[1], uri=True)
+assert con.execute('PRAGMA integrity_check').fetchone()[0] == 'ok'
+con.execute('SELECT count(*) FROM settings').fetchone()
+print(con.execute('SELECT count(*) FROM inbounds').fetchone()[0])
+PYCHK
+  ) || { rm -f "$tmp"; PG_ERR='Полученная копия базы повреждена.'; return 1; }
+  if [[ "$n_db" != "$n_api" ]]; then
+    rm -f "$tmp"; PG_ERR="В копии $n_db inbound-ов, а в панели $n_api."; return 1
+  fi
+  # Switch: the old SQLite file (unused while on PostgreSQL) is kept aside.
+  run systemctl stop x-ui || { rm -f "$tmp"; PG_ERR='Не удалось остановить x-ui.'; return 1; }
+  if [[ -f "$DB" ]]; then stale="$DB.unused-$ts"; mv -f "$DB" "$stale"; fi
+  rm -f "$DB-wal" "$DB-shm"
+  mv -f "$tmp" "$DB"
+  if ! pg_env_switch; then
+    PG_ERR='XUI_DB_TYPE задан не в /etc/default/x-ui — переключи базу вручную.'
+    pg_sqlite_undo "$stale"; return 1
+  fi
+  python3 - "$DB" <<'PYTOK' >>"$LOG" 2>&1 || :
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+try:
+    con.execute("DELETE FROM api_tokens WHERE name = '3x-ui_reverse-pg2sqlite'")
+    con.commit()
+except sqlite3.Error as e:
+    print('api_tokens:', e)
+PYTOK
+  run systemctl start x-ui || :
+  local i ok=0
+  for ((i=0; i<20; i++)); do
+    sleep 1
+    curl -sk -o /dev/null --max-time 5 "$url" 2>>"$LOG" && { ok=1; break; }
+  done
+  if ((!ok)) || xui_on_postgres; then
+    PG_ERR='После перехода на SQLite панель не запустилась.'
+    pg_sqlite_undo "$stale"; return 1
+  fi
+  PG_STALE=$stale
+  return 0
+}
+pg_sqlite_undo(){
+  local stale=$1
+  run systemctl stop x-ui || :
+  pg_env_undo
+  if [[ -f "$DB" ]]; then mv -f "$DB" "$DB.failed-$(date +%Y%m%d-%H%M%S)"; fi
+  [[ -n "$stale" && -f "$stale" ]] && mv -f "$stale" "$DB"
+  run systemctl start x-ui || :
+}
+PG_ERR='' PG_STALE=''
+pg_to_sqlite_flow(){
+  TUI_LOGO=1 tui_yesno 'Миграция 3x-ui' "{yellow}Эта 3x-ui хранит данные в PostgreSQL{/} (XUI_DB_TYPE=postgres в /etc/default/x-ui).
+
+Скрипт работает с базой SQLite: перед любыми изменениями делает её копию и при ошибке
+возвращает как было. Поэтому сначала панель переводится на SQLite:
+  1. 3x-ui сама собирает SQLite-копию из текущих данных (как «Скачать миграцию» в панели);
+  2. копия проверяется: целостность и число inbound-ов;
+  3. в /etc/default/x-ui строки XUI_DB_TYPE/XUI_DB_DSN закомментируются, x-ui перезапустится.
+
+{dim}Данные в PostgreSQL не трогаются и остаются резервной копией. Подключения клиентов
+прервутся на несколько секунд. При ошибке всё вернётся на PostgreSQL.{/}" 'Перевести на SQLite' 'Отмена' yes || return 1
+  ui_start 'PostgreSQL → SQLite' 'Получаем копию базы от 3x-ui' 'Переключаем x-ui на SQLite'
+  msg 'Получаем копию базы от 3x-ui'; step 30 'Получаем копию базы от 3x-ui'
+  if ! pg_to_sqlite; then
+    ui_stop failed
+    tui_msg 'PostgreSQL → SQLite' "{red}✗ $PG_ERR{/}
+
+x-ui работает на PostgreSQL, как раньше. Подробности: $LOG"
+    return 1
+  fi
+  step 100 'x-ui работает на SQLite'; ui_stop
+  note "✓ 3x-ui переведена с PostgreSQL на SQLite ($DB). Данные в PostgreSQL не менялись — это резервная копия; базу можно отключить позже."
+  [[ -n "$PG_STALE" ]] && note "{dim}Старый неиспользуемый файл SQLite: $PG_STALE{/}"
+  return 0
+}
+
+# ---- Login and password changed in the 3x-ui web panel: the script keeps a copy
+# in its state (the panel stores only a hash). The login is read from the
+# database; the password is checked by logging in on 127.0.0.1. A password the
+# panel rejects is forgotten (shown as "changed in the panel") and is not tried
+# again, so 3x-ui does not log failed logins every time the manager starts.
+panel_local_url(){
+  local scheme=http
+  [[ "${TLS_MODE:-proxy}" == direct ]] && scheme=https
+  printf '%s://127.0.0.1:%s/%s' "$scheme" "$PANEL_PORT" "$PANEL_PATH"
+}
+panel_login_check(){       # USER PASS -> 0 accepted, 1 rejected, 3 panel did not answer
+  local rc=0
+  printf '%s\n' "$2" | helper panel-login "$(panel_local_url)" "$1" >/dev/null 2>>"$LOG" || rc=$?
+  return $rc
+}
+panel_creds_sync(){
+  [[ "${PANEL_INSTALLED:-1}" == 1 && -f "$DB" && -d "$BASE" ]] || return 0
+  local out user tfa rc=0 changed=0
+  out=$(helper panel-user "$DB" 2>>"$LOG") || return 0
+  user=$(sed -n 's/^user=//p' <<< "$out"); tfa=$(sed -n 's/^2fa=//p' <<< "$out")
+  [[ -n "$user" ]] || return 0
+  if [[ "$user" != "$PANEL_USER" ]]; then
+    note "Логин панели изменён в 3x-ui: теперь «$user»."
+    PANEL_USER=$user; changed=1
+  fi
+  if [[ -n "$PANEL_PASS" && "$tfa" != 1 ]]; then
+    panel_login_check "$PANEL_USER" "$PANEL_PASS" || rc=$?
+    if ((rc == 1)); then
+      PANEL_PASS=''; changed=1
+      note "{yellow}Пароль панели изменён в 3x-ui — скрипт его не знает.{/} Чтобы он снова показывался в параметрах и PDF: «Настройки панели → Сохранить пароль из панели»."
+    fi
+  fi
+  if ((changed)); then
+    save_state; write_info 2>>"$LOG" || :
+    write_pdf quiet >/dev/null 2>&1 || :
+  fi
+  return 0
+}
+# Settings: remember the password set in the web panel (checked before saving).
+panel_creds_remember(){
+  local v rc
+  while :; do
+    v=$(tui_input 'Пароль из панели' "Пароль, который сейчас задан в 3x-ui для «$PANEL_USER».
+{dim}Скрипт проверит его входом в панель на 127.0.0.1 и сохранит в параметрах (chmod 600).{/}" '') || return 0
+    [[ -n "$v" ]] || return 0
+    rc=0; panel_login_check "$PANEL_USER" "$v" || rc=$?
+    case $rc in
+      0) PANEL_PASS=$v; save_state; write_info 2>>"$LOG" || :; write_pdf quiet >/dev/null 2>&1 || :
+         note "{green}✓ Пароль сохранён.{/}"; return 0 ;;
+      1) tui_yesno 'Пароль не подошёл' "Панель не приняла этот пароль для «$PANEL_USER»
+(или включена двухфакторная защита)." 'Ввести снова' 'Отмена' yes || return 0 ;;
+      *) tui_msg 'Пароль из панели' '{red}Панель не ответила.{/} Проверь, что x-ui запущена.'; return 0 ;;
+    esac
+  done
+}
+
+# ---- Sites and services behind Caddy: the domain root and other domains.
+# Files in $(web_dir) belong to the user: the script imports them and never
+# rewrites them when it regenerates its own Caddyfile.
+WEB_ERR=''
+web_snapshot(){
+  local wd snap; wd=$(web_dir)
+  install -d -m 755 "$wd" "$wd/sites" "$BASE/backups"
+  snap="$BASE/backups/web-$(date +%Y%m%d-%H%M%S-%N).tar"
+  local -a what=(caddy Caddyfile)
+  [[ -f "$BASE/.Caddyfile.sha256" ]] && what+=(.Caddyfile.sha256)
+  tar -C "$BASE" -cf "$snap" "${what[@]}" 2>>"$LOG" || :
+  # keep the last 10 snapshots
+  find "$BASE/backups" -maxdepth 1 -name 'web-*.tar' -printf '%T@ %p\n' 2>/dev/null | sort -rn | tail -n +11 | cut -d' ' -f2- | xargs -r rm -f --
+  printf '%s' "$snap"
+}
+web_restore(){
+  local snap=$1
+  [[ -f "$snap" ]] || return 0
+  rm -rf "$(web_dir)"
+  tar -C "$BASE" -xf "$snap" 2>>"$LOG" || :
+  reload_proxy >/dev/null 2>&1 || :
+}
+# Validate the Caddyfile; a broken file of the user's (caddy/sites/*.caddy or
+# root.caddy) is switched off (renamed *.disabled) so the panel keeps working.
+WEB_VALIDATE_ERR='' WEB_DISABLED=''
+# "caddy validate" runs as root and creates the access logs of the sites it checks;
+# the caddy service user could not open those root-owned files and would fail to start.
+caddy_check(){
+  local out rc=0
+  out=$(caddy validate --config "$1" --adapter caddyfile 2>&1) || rc=$?
+  caddy_fix_logs
+  printf '%s\n' "$out"
+  return $rc
+}
+caddy_fix_logs(){
+  id caddy >/dev/null 2>&1 || return 0
+  install -d -m 755 -o caddy -g caddy /var/log/caddy 2>>"$LOG" || :
+  chown -R caddy:caddy /var/log/caddy 2>>"$LOG" || :
+}
+# Last error of the caddy service (why it did not start or reload).
+caddy_last_error(){
+  journalctl -u caddy -n 40 --no-pager 2>/dev/null | grep -o 'Error: .*\|"error":"[^"]*' | tail -n1 |
+    sed 's/^"error":"//; s/\\"/"/g' | cut -c1-400
+}
+# E-mail for Let's Encrypt from an imported Caddyfile (global "email" option).
+web_keep_email(){
+  local e
+  e=$(awk -F'\t' '$1=="email"{print $2; exit}' <<< "$1")
+  [[ -n "$e" && ! -s "$(web_dir)/acme-email" ]] || return 0
+  [[ "$e" =~ ^[^[:space:]@]+@[^[:space:]@]+$ ]] || return 0
+  printf '%s\n' "$e" > "$(web_dir)/acme-email"; chmod 644 "$(web_dir)/acme-email"
+}
+web_validate(){
+  local out f wd tmp snip
+  WEB_VALIDATE_ERR='' WEB_DISABLED=''
+  out=$(caddy_check "$BASE/Caddyfile") && return 0
+  printf 'caddy validate:\n%s\n' "$out" >> "$LOG"
+  wd=$(web_dir)
+  tmp=$(mktemp "$BASE/caddy-one.XXXXXXXX")
+  snip=''; [[ -f "$wd/sites/00-snippets.caddy" ]] && snip="import $wd/sites/00-snippets.caddy"
+  for f in "$wd"/sites/*.caddy "$wd/root.caddy"; do
+    [[ -f "$f" ]] || continue
+    if [[ "$f" == */root.caddy ]]; then
+      printf '{\n    admin off\n}\n%s\nroot-check.invalid {\n    handle {\n        import %s\n    }\n}\n' "$snip" "$f" > "$tmp"
+    elif [[ "$f" == */00-snippets.caddy ]]; then
+      printf '{\n    admin off\n}\nimport %s\n' "$f" > "$tmp"
+    else
+      printf '{\n    admin off\n}\n%s\nimport %s\n' "$snip" "$f" > "$tmp"
+    fi
+    if ! caddy_check "$tmp" >/dev/null; then
+      mv -f "$f" "$f.disabled"
+      WEB_DISABLED+="${WEB_DISABLED:+, }${f##*/}"
+    fi
+  done
+  rm -f "$tmp"
+  if [[ -n "$WEB_DISABLED" ]]; then
+    write_caddy_body "$BASE/Caddyfile"; caddy_mark
+    if caddy_check "$BASE/Caddyfile" >/dev/null; then
+      note "{yellow}⚠ В файлах ошибка, они отключены (переименованы в *.disabled): $WEB_DISABLED. Исправь и включи обратно — «Сайты и сервисы».{/}"
+      return 0
+    fi
+  fi
+  WEB_VALIDATE_ERR=$(grep -v '"level":"info"' <<< "$out" | tail -n 3 | cut -c1-500)
+  return 1
+}
+# Panel through Caddy on this server: HTTP code (000 = no answer) and curl's reason.
+# -k: this checks routing; a certificate still being issued is not a routing error.
+WEB_PROBE_ERR=''
+web_panel_probe(){
+  local code err
+  WEB_PROBE_ERR=''
+  err=$(curl -sSk -o /dev/null -w '%{http_code}' --max-time 8 --resolve "$DOMAIN:443:127.0.0.1" \
+        "https://$DOMAIN/$PANEL_PATH/" 2>&1) || :
+  code=${err: -3}; [[ "$code" =~ ^[0-9]{3}$ ]] || code=000
+  [[ "$code" == 000 ]] && WEB_PROBE_ERR=$(sed 's/^curl: ([0-9]*) //' <<< "${err%???}" | grep -v '^$' | tail -n1 | cut -c1-200)
+  printf '%s' "$code"
+}
+# Regenerate, validate, reload and make sure the panel still answers through Caddy.
+# If the panel did not answer through Caddy before the change either, the change is
+# not the cause: it is applied and the existing problem is reported instead.
+WEB_WARN=''
+web_apply_now(){
+  local code before='' before_err='' i
+  WEB_ERR='' WEB_WARN=''
+  if [[ "${PANEL_INSTALLED:-1}" == 1 ]]; then
+    before=$(web_panel_probe); before_err=$WEB_PROBE_ERR
+  fi
+  # Imported sites may log to /var/log/caddy: make sure the service user can write there.
+  id caddy >/dev/null 2>&1 && install -d -m 755 -o caddy -g caddy /var/log/caddy 2>>"$LOG"
+  write_caddy
+  if ! web_validate; then
+    WEB_ERR=$WEB_VALIDATE_ERR
+    return 1
+  fi
+  caddy_fix_logs
+  if ! reload_proxy; then
+    WEB_ERR="Caddy не перезагрузился."
+    local cerr; cerr=$(caddy_last_error); [[ -n "$cerr" ]] && WEB_ERR+=$'\n'"Caddy: $cerr"
+    return 1
+  fi
+  [[ "${PANEL_INSTALLED:-1}" == 1 ]] || return 0
+  for ((i=0; i<10; i++)); do
+    code=$(web_panel_probe)
+    [[ "$code" == 200 ]] && return 0
+    sleep 1
+  done
+  printf 'panel via caddy: before=%s (%s) after=%s (%s)\n' "$before" "$before_err" "$code" "$WEB_PROBE_ERR" >> "$LOG"
+  if [[ "$before" != 200 ]]; then
+    WEB_WARN="Панель через Caddy не отвечала и до изменения (HTTP $before${before_err:+: $before_err}). Проверь: systemctl status caddy, ss -ltnp | grep -E ':(80|443) ', journalctl -u caddy -n 50."
+    return 0
+  fi
+  WEB_ERR="Панель через Caddy перестала отвечать (HTTP $code${WEB_PROBE_ERR:+: $WEB_PROBE_ERR})."
+  local cerr; cerr=$(caddy_last_error); [[ -n "$cerr" ]] && WEB_ERR+=$'\n'"Caddy: $cerr"
+  return 1
+}
+# web_change TITLE PHASE SNAPSHOT — apply with a gauge; roll back on failure.
+web_change(){
+  local title=$1 phase=$2 snap=$3
+  ui_start "$title" "$phase"
+  msg "$phase"; step 40 "$phase"
+  if web_apply_now; then
+    ui_stop
+    [[ -n "$WEB_WARN" ]] && note "{yellow}⚠ $WEB_WARN{/}"
+    return 0
+  fi
+  ui_stop failed
+  web_restore "$snap"
+  tui_msg "$title" "{red}✗ Конфигурация не применена, всё возвращено как было.{/}
+
+$WEB_ERR"
+  return 1
+}
+# Wait for Caddy to get a certificate for a new domain (any HTTP answer over TLS).
+web_cert_ok(){
+  local d=$1 i
+  for ((i=0; i<20; i++)); do
+    curl -s -o /dev/null --max-time 6 --resolve "$d:443:127.0.0.1" "https://$d/" 2>/dev/null && return 0
+    sleep 2
+  done
+  return 1
+}
+web_flag_text(){
+  case "$1" in
+    ok) printf '{green}✓ только 127.0.0.1{/}' ;;
+    exposed) printf '{yellow}⚠ порт открыт наружу мимо Caddy{/}' ;;
+    ip) printf '{yellow}⚠ не опубликован — адрес контейнера{/}' ;;
+    unknown) printf '{red}✗ контейнер не найден{/}' ;;
+    log) printf '{dim}журнал → /var/log/caddy{/}' ;;
+    path) printf '{green}✓ каталог на сервере{/}' ;;
+    nopath) printf '{yellow}⚠ каталога нет на сервере{/}' ;;
+    *) printf '{red}✗ нет адреса{/}' ;;
+  esac
+}
+web_exposed_help(){
+  printf '%s' "Чтобы закрыть его снаружи, в docker-compose.yml контейнера укажи
+  {accent}ports:{/}
+  {accent}  - \"127.0.0.1:$1:$2\"{/}
+и пересоздай контейнер: {accent}docker compose up -d{/}. Docker открывает опубликованные
+порты в обход UFW — без 127.0.0.1 сервис виден по IP сервера напрямую."
+}
+# web_pick_upstream TITLE — sets WEB_UP (host:port) and WEB_SVC (name) or returns 1.
+web_pick_upstream(){
+  local title=$1 src out name image ports ch line port up flag
+  local -a items=() pitems=()
+  WEB_UP='' WEB_SVC=''
+  out=$(helper web-docker 2>>"$LOG") || out=nodocker
+  if [[ "$out" != nodocker ]] && grep -q '^C' <<< "$out"; then
+    src=$(tui_radiolist "$title" 'Откуда сервис:' docker 'Docker-контейнер' ON addr 'Адрес и порт (host:port)' OFF) || return 1
+  else
+    src=addr
+  fi
+  if [[ "$src" == docker ]]; then
+    while IFS=$'\t' read -r _ name image ports _; do
+      items+=("$name" "$name"$'\t'"{dim}$image · $ports{/}")
+    done < <(grep '^C' <<< "$out")
+    name=$(tui_menu "$title" 'Запущенные контейнеры:' "${items[@]}") || return 1
+    while IFS=$'\t' read -r _ _ port up flag; do
+      pitems+=("$port|$up|$flag" "$port"$'\t'"{dim}$up{/}  $(web_flag_text "$flag")")
+    done < <(awk -F'\t' -v n="$name" '$1=="P" && $2==n' <<< "$out")
+    if ((${#pitems[@]} == 0)); then
+      tui_msg "$title" "{red}✗ У $name нет портов, известных Docker.{/}
+Опубликуй порт приложения только для сервера — ports: \"127.0.0.1:ПОРТ:ПОРТ\" — и попробуй снова."
+      return 1
+    elif ((${#pitems[@]} == 2)); then
+      ch=${pitems[0]}
+    else
+      ch=$(tui_menu "$title" "Порт приложения в $name:" "${pitems[@]}") || return 1
+    fi
+    IFS='|' read -r port up flag <<< "$ch"
+    [[ -n "$up" && "$flag" != none ]] || { tui_msg "$title" "{red}✗ Caddy не сможет достучаться до $name:$port.{/}"; return 1; }
+    case "$flag" in
+      exposed) tui_yesno "$title" "{yellow}⚠ Порт ${up##*:} контейнера $name открыт на всех адресах сервера.{/}
+
+$(web_exposed_help "${up##*:}" "$port")
+
+Подключить через Caddy сейчас (порт закроешь позже)?" 'Подключить' 'Отмена' || return 1 ;;
+      ip) tui_yesno "$title" "{yellow}⚠ Порт $port контейнера $name не опубликован{/} — Caddy пойдёт на адрес контейнера $up.
+После пересоздания контейнера адрес может смениться, и сайт перестанет открываться.
+Надёжнее опубликовать порт только для сервера: ports: \"127.0.0.1:$port:$port\".
+
+Подключить по адресу контейнера сейчас?" 'Подключить' 'Отмена' || return 1 ;;
+    esac
+    WEB_UP=$up; WEB_SVC=$name
+    return 0
+  fi
+  line=$(tui_input "$title" "Адрес сервиса, например {accent}127.0.0.1:3000{/}
+{dim}Можно http://…, https://… или имя:порт другого сервера.{/}" '127.0.0.1:') || return 1
+  line=${line// /}
+  [[ "$line" =~ ^(https?://)?[A-Za-z0-9._-]+:[0-9]{1,5}$ || "$line" =~ ^https?://[A-Za-z0-9._-]+$ ]] ||
+    { tui_msg "$title" 'Нужен адрес вида host:port.'; return 1; }
+  WEB_UP=$line; WEB_SVC=''
+}
+web_header(){
+  local root='' svc='' up='' kind a b c d
+  while IFS=$'\t' read -r kind a b c d; do
+    [[ "$kind" == ROOT ]] && { root=$a; up=$b; svc=$c; }
+  done < <(helper web-sites "$(web_dir)" 2>>"$LOG")
+  if [[ "$root" == service ]]; then
+    printf 'Корень %s:  {green}%s{/} {dim}→ %s{/}\n' "$DOMAIN" "$( [[ -z $svc || $svc == custom ]] && echo сервис || echo "$svc")" "$up"
+  else
+    printf 'Корень %s:  {dim}сайт-заглушка{/}\n' "$DOMAIN"
+  fi
+  printf '{dim}Панель /%s/ и подписки обслуживает скрипт. Свои файлы: %s{/}' "$PANEL_PATH" "$(web_dir)"
+}
+web_root_screen(){
+  local ch snap cur
+  cur=$(helper web-sites "$(web_dir)" 2>>"$LOG" | awk -F'\t' '$1=="ROOT"{print $2}')
+  ch=$(tui_radiolist "Корень $DOMAIN" "Что открывается по адресу https://$DOMAIN/
+{dim}Пути панели и подписок не меняются — их обслуживает скрипт.
+Если сервис упадёт, вместо ошибки 502 откроется сайт-заглушка.{/}" \
+       stub 'Сайт-заглушка' "$([[ $cur != service ]] && echo ON || echo OFF)" \
+       service 'Сервис — Docker-контейнер или адрес' "$([[ $cur == service ]] && echo ON || echo OFF)") || return 0
+  if [[ "$ch" == stub ]]; then
+    [[ "$cur" == service ]] || return 0
+    snap=$(web_snapshot)
+    mv -f "$(web_dir)/root.caddy" "$(web_dir)/root.caddy.off"
+    web_change "Корень $DOMAIN" 'Возвращаем сайт-заглушку' "$snap" &&
+      note "✓ На $DOMAIN снова сайт-заглушка. Прежняя настройка сервиса: $(web_dir)/root.caddy.off"
+    return 0
+  fi
+  web_pick_upstream "Корень $DOMAIN" || return 0
+  snap=$(web_snapshot)
+  printf '%s service=%s upstream=%s date=%s\n# Directives for the root of %s (inside handle { … }); edit freely.\nreverse_proxy %s\n' \
+    "# 3x-ui_reverse:" "${WEB_SVC:-custom}" "$WEB_UP" "$(date +%F)" "$DOMAIN" "$WEB_UP" > "$(web_dir)/root.caddy"
+  chmod 644 "$(web_dir)/root.caddy"
+  web_change "Корень $DOMAIN" 'Подключаем сервис' "$snap" || return 0
+  note "{green}✓ https://$DOMAIN/ → ${WEB_SVC:+$WEB_SVC · }$WEB_UP{/}"
+  note "{dim}Если приложение спрашивает свой адрес (APP_URL, BASE_URL…), укажи https://$DOMAIN{/}"
+}
+web_dns_check(){
+  local DOMAIN=$1
+  DNS_GO_LABEL='Продолжить' dns_check_screen
+}
+web_add_screen(){
+  local d snap f
+  d=$(tui_input 'Подключить домен' "Домен для сервиса, например {accent}docs.example.com{/}
+{dim}A-запись домена должна указывать на этот сервер — сертификат Caddy выпустит сам.{/}" '') || return 0
+  d=${d,,}; d=${d%.}; d=${d#http://}; d=${d#https://}; d=${d%%/*}
+  valid_domain "$d" || { tui_msg 'Подключить домен' 'Неверное имя домена.'; return 0; }
+  [[ "$d" != "${DOMAIN,,}" ]] || { tui_msg 'Подключить домен' "Это основной домен — для него пункт «Корень $DOMAIN»."; return 0; }
+  if helper web-hosts "$(web_dir)" 2>>"$LOG" | cut -f1 | grep -Fxq "$d"; then
+    tui_msg 'Подключить домен' "$d уже подключён."; return 0
+  fi
+  web_dns_check "$d" || return 0
+  web_pick_upstream "$d" || return 0
+  snap=$(web_snapshot)
+  f="$(web_dir)/sites/$d.caddy"
+  cat > "$f" <<EOF
+# 3x-ui_reverse: service=${WEB_SVC:-custom} upstream=$WEB_UP date=$(date +%F)
+# Edit freely: the script does not rewrite this file.
+$d {
+    encode zstd gzip
+    header -Server
+    reverse_proxy $WEB_UP
+}
+EOF
+  chmod 644 "$f"
+  web_change "$d" 'Подключаем домен' "$snap" || return 0
+  ui_start "$d" 'Выпуск сертификата'; msg 'Выпуск сертификата'; step 50 'Выпуск сертификата'
+  if web_cert_ok "$d"; then
+    ui_stop; note "{green}✓ https://$d/ → ${WEB_SVC:+$WEB_SVC · }$WEB_UP{/}"
+  else
+    ui_stop failed
+    note "{yellow}⚠ $d подключён, но сертификат ещё не выпущен. Проверь A-запись домена; Caddy продолжит попытки сам (journalctl -u caddy).{/}"
+  fi
+}
+web_import_screen(){
+  local -a items=() mitems=()
+  local f path out snap moved maps ch up flag old new line skipped
+  while IFS=$'\t' read -r f line; do items+=("$f" "$f"$'\t'"{dim}$line{/}"); done < <(helper web-caddyfiles 2>>"$LOG")
+  items+=(manual 'Указать путь к файлу')
+  if ((${#items[@]} > 2)); then
+    path=$(tui_menu 'Перенести сайты' 'Caddyfile, из которого взять сайты (найдены у Caddy в Docker):' "${items[@]}") || return 0
+  else
+    path=manual
+  fi
+  if [[ "$path" == manual ]]; then
+    path=$(tui_input 'Перенести сайты' 'Полный путь к Caddyfile (например, /root/caddy/Caddyfile):' '') || return 0
+  fi
+  [[ -f "$path" ]] || { tui_msg 'Перенести сайты' "Файл не найден: $path"; return 0; }
+  [[ "$(readlink -f "$path")" != "$(readlink -f "$BASE/Caddyfile")" ]] ||
+    { tui_msg 'Перенести сайты' 'Это Caddyfile самого скрипта.'; return 0; }
+  snap=$(web_snapshot)
+  if ! out=$(helper caddy-split "$path" "$DOMAIN" "$(web_dir)/sites" --docker --source "$path" 2>&1); then
+    web_restore "$snap"; tui_msg 'Перенести сайты' "{red}✗ ${out#Ошибка: }{/}"; return 0
+  fi
+  web_keep_email "$out"
+  moved=$(awk -F'\t' '$1=="moved"{print "  • " $2 "  {dim}→ " $3 "{/}"}' <<< "$out")
+  maps=''
+  while IFS=$'\t' read -r _ old new flag; do
+    maps+="  $old → $new  $(web_flag_text "$flag")"$'\n'
+  done < <(grep '^map' <<< "$out")
+  skipped=$(awk -F'\t' '$1=="skipped"{print "  • " $2}' <<< "$out")
+  if [[ -n "$moved" ]]; then
+    tui_msg 'Перенести сайты' "Перенесено в $(web_dir)/sites:
+$moved${maps:+
+
+Адреса контейнеров и пути внутри контейнера Caddy заменены на доступные на сервере:
+$maps}${skipped:+
+Пропущено:
+$skipped}"
+  fi
+  # The main domain's block of the old file: offer its upstream for the root.
+  while IFS=$'\t' read -r _ old new flag; do
+    [[ "$new" == *":$PANEL_PORT" || "$new" == *":$SUB_PORT" ]] && continue
+    mitems+=("$new|$flag" "$old"$'\t'"{dim}→ $new{/}  $(web_flag_text "$flag")")
+  done < <(grep '^main' <<< "$out")
+  if ((${#mitems[@]})); then
+    ch=$(TUI_CANCEL='Не трогать корень' tui_menu "Корень $DOMAIN" "В файле у $DOMAIN был сервис. Поставить его на корень домена вместо сайта-заглушки?
+{dim}Панель и подписки остаются под управлением скрипта — их блоки из файла не переносятся.{/}" "${mitems[@]}") || ch=''
+    if [[ -n "$ch" ]]; then
+      IFS='|' read -r up flag <<< "$ch"
+      if [[ "$flag" == unknown ]]; then
+        tui_msg "Корень $DOMAIN" "{red}✗ Контейнер для $up не найден среди запущенных.{/} Запусти его и выбери «Корень $DOMAIN» ещё раз."
+      else
+        printf '%s service=imported upstream=%s date=%s\nreverse_proxy %s\n' "# 3x-ui_reverse:" "$up" "$(date +%F)" "$up" > "$(web_dir)/root.caddy"
+        chmod 644 "$(web_dir)/root.caddy"
+      fi
+    fi
+  elif [[ -z "$moved" ]]; then
+    tui_msg 'Перенести сайты' "В $path нет сайтов, которые можно перенести.${skipped:+
+
+Пропущено:
+$skipped}"
+    return 0
+  fi
+  if web_change 'Перенести сайты' 'Применяем конфигурацию Caddy' "$snap"; then
+    note '{green}✓ Готово. Сертификаты для новых доменов Caddy выпустит в течение минуты.{/}'
+    grep -q $'\tunknown$' <<< "$out" &&
+      note "{yellow}⚠ Для части адресов контейнер не найден — поправь их в файлах $(web_dir)/sites.{/}"
+  fi
+  return 0
+}
+web_site_screen(){
+  local f=$1 ch snap path
+  path="$(web_dir)/sites/$f"
+  ch=$(tui_menu "$f" "$(helper web-sites "$(web_dir)" 2>>"$LOG" | awk -F'\t' -v f="$f" '$1=="SITE" && $2==f {print $3 "\n{dim}→ " $4 "{/}"}')
+{dim}Файл: $path — его можно править, скрипт его не перезаписывает.
+После правки: «Применить изменения файлов».{/}" \
+       show 'Показать конфигурацию' del '{red}Отключить{/}') || return 0
+  case "$ch" in
+    show) tui_textfile "$f" "$path" ;;
+    del)
+      tui_yesno "$f" "Отключить $f? Файл переедет в $BASE/backups." 'Отключить' 'Отмена' || return 0
+      snap=$(web_snapshot)
+      mv -f "$path" "$BASE/backups/$f.$(date +%Y%m%d-%H%M%S)"
+      web_change "$f" 'Применяем конфигурацию Caddy' "$snap" && note "○ $f отключён."
+      ;;
+  esac
+}
+menu_web(){
+  if [[ "$PROXY" != caddy || "${PROXY_INSTALLED:-1}" != 1 ]]; then
+    tui_msg 'Сайты и сервисы' 'Подключение своих сайтов и сервисов пока работает только с Caddy.'
+    return 0
+  fi
+  install -d -m 755 "$(web_dir)" "$(web_dir)/sites"
+  local ch kind f doms ups svc snap
+  local -a sitems=()
+  while :; do
+    sitems=()
+    while IFS=$'\t' read -r kind f doms ups svc; do
+      [[ "$kind" == SITE ]] || continue
+      sitems+=("f:$f" "$doms"$'\t'"{dim}${svc:+$svc · }$ups{/}")
+    done < <(helper web-sites "$(web_dir)" 2>>"$LOG")
+    ((${#sitems[@]})) && sitems=('#Другие домены' '' "${sitems[@]}")
+    ch=$(tui_menu 'Сайты и сервисы' "$(web_header)" \
+         root $'Корень '"$DOMAIN"$'\t{dim}сайт-заглушка или свой сервис{/}' \
+         add $'Подключить домен\t{dim}Docker-контейнер или адрес на отдельном домене{/}' \
+         import $'Перенести сайты из Caddyfile\t{dim}например, от Caddy в Docker{/}' \
+         reload $'Применить изменения файлов\t{dim}после ручной правки в '"$(web_dir)"$'{/}' \
+         "${sitems[@]}") || return 0
+    case "$ch" in
+      root) web_root_screen ;;
+      add) web_add_screen ;;
+      import) web_import_screen ;;
+      reload) snap=$(web_snapshot); web_change 'Сайты и сервисы' 'Проверяем и применяем' "$snap" && note '{green}✓ Конфигурация применена.{/}' ;;
+      f:*) web_site_screen "${ch#f:}" ;;
+    esac
+    flush_notes
+  done
+}
+# CLI: sites [list] | sites root stub|ADDR | sites add DOMAIN ADDR | sites del FILE|DOMAIN | sites import FILE | sites apply
+cli_sites(){
+  local sub=${1:-list} snap f d out
+  [[ "$PROXY" == caddy ]] || die 'Сайты и сервисы работают только с Caddy.'
+  install -d -m 755 "$(web_dir)" "$(web_dir)/sites"
+  case "$sub" in
+    list) helper web-sites "$(web_dir)" | sed 's/\t/  /g' ;;
+    root)
+      [[ -n "${2:-}" ]] || die 'sites root stub|HOST:PORT'
+      snap=$(web_snapshot)
+      if [[ "$2" == stub ]]; then
+        [[ ! -f "$(web_dir)/root.caddy" ]] || mv -f "$(web_dir)/root.caddy" "$(web_dir)/root.caddy.off"
+      else
+        printf '%s service=custom upstream=%s date=%s\nreverse_proxy %s\n' "# 3x-ui_reverse:" "$2" "$(date +%F)" "$2" > "$(web_dir)/root.caddy"
+      fi
+      web_apply_now || { web_restore "$snap"; die "$WEB_ERR"; }; [[ -z "$WEB_WARN" ]] || warn "$WEB_WARN"
+      printf 'Корень %s: %s\n' "$DOMAIN" "$2" ;;
+    add)
+      d=${2:-}; [[ -n "$d" && -n "${3:-}" ]] || die 'sites add DOMAIN HOST:PORT'
+      valid_domain "$d" || die "Неверный домен: $d"
+      snap=$(web_snapshot)
+      printf '# 3x-ui_reverse: service=custom upstream=%s date=%s\n%s {\n    encode zstd gzip\n    header -Server\n    reverse_proxy %s\n}\n' \
+        "$3" "$(date +%F)" "$d" "$3" > "$(web_dir)/sites/$d.caddy"
+      web_apply_now || { web_restore "$snap"; die "$WEB_ERR"; }; [[ -z "$WEB_WARN" ]] || warn "$WEB_WARN"
+      printf 'Подключён %s → %s\n' "$d" "$3"
+      web_cert_ok "$d" || warn "Сертификат для $d ещё не выпущен — проверь A-запись."
+      ;;
+    del)
+      [[ -n "${2:-}" ]] || die 'sites del FILE|DOMAIN'
+      f="$(web_dir)/sites/${2%.caddy}.caddy"
+      [[ -f "$f" ]] || f="$(web_dir)/sites/$(helper web-hosts "$(web_dir)" | awk -F'\t' -v d="$2" '$1==d{print $2; exit}')"
+      [[ -f "$f" ]] || die "Не найдено: $2"
+      snap=$(web_snapshot)
+      mv -f "$f" "$BASE/backups/${f##*/}.$(date +%Y%m%d-%H%M%S)"
+      web_apply_now || { web_restore "$snap"; die "$WEB_ERR"; }; [[ -z "$WEB_WARN" ]] || warn "$WEB_WARN"
+      printf 'Отключён %s\n' "${f##*/}" ;;
+    import)
+      [[ -f "${2:-}" ]] || die 'sites import /path/to/Caddyfile'
+      snap=$(web_snapshot)
+      out=$(helper caddy-split "$2" "$DOMAIN" "$(web_dir)/sites" --docker --source "$2") || { web_restore "$snap"; exit 1; }
+      web_keep_email "$out"
+      sed 's/\t/  /g' <<< "$out"
+      web_apply_now || { web_restore "$snap"; die "$WEB_ERR"; }; [[ -z "$WEB_WARN" ]] || warn "$WEB_WARN"
+      printf 'Готово. Сервис на корне домена: sites root HOST:PORT\n' ;;
+    apply)
+      snap=$(web_snapshot)
+      web_apply_now || { web_restore "$snap"; die "$WEB_ERR"; }; [[ -z "$WEB_WARN" ]] || warn "$WEB_WARN"
+      printf 'Конфигурация применена.\n' ;;
+    *) die "Неизвестная подкоманда sites $sub" ;;
+  esac
 }
 
 write_helper(){
@@ -5174,6 +5998,93 @@ def inbound_names(ibs):
     return {ib['id']: short_name(ib.get('remark') or ib.get('tag') or str(ib['id'])) for ib in ibs}
 
 
+# ---------------------------------------------------------------- where an inbound lives
+def flag_code(text):
+    """'NL' for a remark/name starting with 🇳🇱; '' otherwise."""
+    m = re.match('^([\U0001F1E6-\U0001F1FF])([\U0001F1E6-\U0001F1FF])', text or '')
+    return ''.join(chr(ord(c) - 0x1F1E6 + ord('A')) for c in m.groups()) if m else ''
+
+
+def _remark_country(remark):
+    code = flag_code(remark)
+    if code:
+        return code
+    for c, name in sorted(COUNTRY_EN.items(), key=lambda kv: -len(kv[1])):
+        if (remark or '').startswith(name + ' '):
+            return c
+    return ''
+
+
+def _geo_country(address):
+    """ISO code of a node's address by geo-IP (cached in node-countries.json)."""
+    import socket
+    cache_f = os.path.join(STATE_DIR, 'node-countries.json')
+    try:
+        with open(cache_f) as f:
+            cache = json.load(f)
+    except (OSError, ValueError):
+        cache = {}
+    if address in cache:
+        return cache[address]
+    code = ''
+    try:
+        ip = socket.gethostbyname(address)
+        for url, parse in (('https://ipinfo.io/%s/country' % ip, lambda t: t.strip()),
+                           ('https://api.country.is/%s' % ip, lambda t: json.loads(t).get('country', ''))):
+            try:
+                v = (parse(_fetch(url, timeout=4)) or '').upper()
+            except Exception:
+                continue
+            if re.fullmatch(r'[A-Z]{2}', v):
+                code = v
+                break
+    except OSError:
+        pass
+    if code:
+        cache[address] = code
+        try:
+            with open(cache_f, 'w') as f:
+                json.dump(cache, f)
+        except OSError:
+            pass
+    return code
+
+
+def inbound_locations(ibs):
+    """{inbound id: (sort key, label)} when inbounds of other nodes are present, else {}.
+    Label: '🇩🇪 Germany · узел' — the flag from the node name, its inbound names or geo-IP."""
+    node_ids = {ib.get('nodeId') for ib in ibs if ib.get('nodeId')}
+    if not node_ids:
+        return {}
+    try:
+        nodes = {n['id']: n for n in (ok(call('/nodes/list'), 'список узлов') or [])}
+    except SystemExit:
+        nodes = {}
+    labels = {}
+    me = country_iso()
+    labels[0] = ('0', ('%s %s · этот сервер' % (flag_emoji(me), country_name() or '')).strip(' ·').strip())
+    for nid in sorted(node_ids):
+        n = nodes.get(nid) or {}
+        name = (n.get('name') or n.get('remark') or n.get('address') or 'узел %s' % nid).strip()
+        code = flag_code(name)
+        if not code:
+            votes = {}
+            for ib in ibs:
+                if ib.get('nodeId') == nid:
+                    c = _remark_country(ib.get('remark') or '')
+                    if c:
+                        votes[c] = votes.get(c, 0) + 1
+            code = max(votes, key=votes.get) if votes else ''
+        if not code and n.get('address'):
+            code = _geo_country(n['address'])
+        label = name if flag_code(name) else ('%s %s' % (flag_emoji(code), name)).strip()
+        cname = COUNTRY_EN.get(code, '')
+        if cname and cname.lower() not in label.lower():
+            label += ' · ' + cname
+        labels[nid] = ('1' + FLAG_RE.sub('', name).lower(), label)
+    return {ib['id']: labels.get(ib.get('nodeId') or 0, labels[0]) for ib in ibs}
+
+
 def parse_ids(text, ibs):
     known = {ib['id'] for ib in ibs}
     ids = []
@@ -5333,10 +6244,20 @@ def cmd_menu_inbounds(args):
         attached = set.intersection(*sets) if sets else set()
     elif target:
         attached = set(find_client(target, snap.clients).get('inboundIds') or [])
-    for ib in sorted(snap.ibs, key=lambda x: x['id']):
+    locs = inbound_locations(snap.ibs)
+    last = None
+    for ib in sorted(snap.ibs, key=lambda x: (locs[x['id']][0], x['id']) if locs else x['id']):
         extra = '' if ib.get('enable') else '  {red}выкл{/}'
+        name = snap.names[ib['id']]
+        if locs:
+            key, label = locs[ib['id']]
+            if key != last:
+                print('#%s\tOFF\t' % label)
+                last = key
+            flag = FLAG_RE.match(label)
+            name = (flag.group(0) if flag else '') + name
         print('%s\t%s\t%s\t%s :%s%s' % (ib['id'], 'ON' if ib['id'] in attached else 'OFF',
-                                       snap.names[ib['id']], ib.get('protocol'), ib.get('port'), extra))
+                                       name, ib.get('protocol'), ib.get('port'), extra))
 
 
 def cmd_user_card(args):
@@ -7386,8 +8307,21 @@ def cmd_panel_login(args):
         with opener.open(urllib.request.Request(base + '/login', data=body, headers=headers), timeout=15) as r:
             reply = json.loads(r.read() or b'{}')
     except Exception as e:
-        die('панель не ответила: %s' % e)
+        die('панель не ответила: %s' % (e or type(e).__name__), 3)   # 3: unknown, not "wrong password"
     sys.exit(0 if reply.get('success') else 1)
+
+
+def cmd_panel_user(args):
+    """panel-user DB — login name and 2FA flag stored in the panel database."""
+    import sqlite3
+    con = sqlite3.connect('file:%s?mode=ro' % args[0], uri=True, timeout=10)
+    try:
+        row = con.execute('SELECT username FROM users ORDER BY id LIMIT 1').fetchone()
+        tfa = con.execute("SELECT value FROM settings WHERE key = 'twoFactorEnable'").fetchone()
+    finally:
+        con.close()
+    print('user=%s' % (row[0] if row else ''))
+    print('2fa=%s' % ('1' if tfa and str(tfa[0]).lower() == 'true' else '0'))
 
 
 def cmd_tls_inbounds_for(args):
@@ -7403,6 +8337,486 @@ def cmd_tls_inbounds_for(args):
             continue
         if (t.get('serverName') or '').lower() == domain or domain in crt.lower():
             print(ib['id'])
+
+
+# ------------------------------------------------------------------ sites & services behind Caddy
+# The script owns only its own Caddyfile. Everything the user adds lives in
+# $BASE/caddy: root.caddy (what serves the domain root instead of the stub)
+# and sites/*.caddy (other domains). Those files are imported and never rewritten.
+WEB_MARK = '# 3x-ui_reverse:'
+
+
+def _caddy_tokens(text):
+    """Caddyfile tokens with (start, end, line): quotes, backticks, comments, heredocs."""
+    toks, i, n, line = [], 0, len(text), 1
+    while i < n:
+        ch = text[i]
+        if ch == '\n':
+            line += 1
+            i += 1
+            continue
+        if ch in ' \t\r':
+            i += 1
+            continue
+        if ch == '#':
+            while i < n and text[i] != '\n':
+                i += 1
+            continue
+        start = i
+        if text.startswith('<<', i) and re.match(r'<<[A-Za-z0-9_]+\s*\n', text[i:]):
+            m = re.match(r'<<([A-Za-z0-9_]+)', text[i:])
+            end_m = re.compile(r'^\s*%s\s*$' % re.escape(m.group(1)), re.M).search(text, i + m.end())
+            j = end_m.end() if end_m else n
+            line += text.count('\n', i, j)
+            toks.append((start, j, line, text[i:j]))
+            i = j
+            continue
+        while i < n and text[i] not in ' \t\r\n':
+            if text[i] == '"':
+                i += 1
+                while i < n and text[i] != '"':
+                    if text[i] == '\\':
+                        i += 1
+                    elif text[i] == '\n':
+                        line += 1
+                    i += 1
+                i += 1
+            elif text[i] == '`':
+                j = text.find('`', i + 1)
+                j = n if j < 0 else j
+                line += text.count('\n', i, j)
+                i = j + 1
+            else:
+                i += 1
+        toks.append((start, i, line, text[start:i]))
+    return toks
+
+
+def caddy_blocks(text):
+    """Top-level entries of a Caddyfile:
+    [{'kind': 'global'|'snippet'|'site'|'line', 'keys': [...], 'text': ..., 'body': ...}]"""
+    toks = _caddy_tokens(text)
+    out, k = [], 0
+    while k < len(toks):
+        line = toks[k][2]
+        head = []
+        while k < len(toks) and toks[k][2] == line and toks[k][3] != '{':
+            head.append(toks[k])
+            k += 1
+        if k < len(toks) and toks[k][3] == '{' and toks[k][2] == line:
+            depth, j = 0, k
+            while j < len(toks):
+                if toks[j][3] == '{':
+                    depth += 1
+                elif toks[j][3] == '}':
+                    depth -= 1
+                    if depth == 0:
+                        break
+                j += 1
+            start = head[0][0] if head else toks[k][0]
+            end = toks[j][1] if j < len(toks) else len(text)
+            keys = [t[3].rstrip(',') for t in head]
+            body = text[toks[k][1]:toks[j][0]] if j < len(toks) else text[toks[k][1]:]
+            kind = 'global' if not keys else ('snippet' if keys[0].startswith('(') or keys[0].startswith('&(') else 'site')
+            out.append({'kind': kind, 'keys': [x for x in keys if x], 'text': text[start:end], 'body': body})
+            k = j + 1
+        elif head:
+            out.append({'kind': 'line', 'keys': [t[3] for t in head], 'text': text[head[0][0]:head[-1][1]], 'body': ''})
+    # Single-site Caddyfile without braces: "domain\n directives…"
+    if out and all(b['kind'] == 'line' for b in out if b['kind'] != 'global'):
+        lines = [b for b in out if b['kind'] == 'line']
+        if lines and not lines[0]['keys'][0] in ('import',):
+            g = [b for b in out if b['kind'] == 'global']
+            body = '\n'.join('    ' + b['text'] for b in lines[1:])
+            site = {'kind': 'site', 'keys': [x.rstrip(',') for x in lines[0]['keys']],
+                    'text': '%s {\n%s\n}' % (' '.join(lines[0]['keys']), body), 'body': body}
+            return g + [site]
+    return out
+
+
+def _site_host(addr):
+    a = re.sub(r'^[a-z]+://', '', addr.lower())
+    return a.split('/')[0].rsplit(':', 1)[0] if not a.startswith('[') else a
+
+
+def _safe_name(addr):
+    return re.sub(r'[^a-z0-9.-]+', '_', _site_host(addr) or 'site').strip('._') or 'site'
+
+
+# --------------------------------------------------------------- docker
+def _docker_json(args):
+    import subprocess
+    try:
+        r = subprocess.run(['docker'] + args, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0:
+        return None
+    return r.stdout
+
+
+def docker_containers(all_=False):
+    """[{name, names(set), image, running, ports: {'3000/tcp': [(hostip, hostport)]}, ips, hostnet, mounts}]"""
+    ids = _docker_json(['ps', '-q'] + (['-a'] if all_ else []))
+    if not ids or not ids.split():
+        return []
+    raw = _docker_json(['inspect'] + ids.split())
+    try:
+        data = json.loads(raw or '[]')
+    except ValueError:
+        return []
+    out = []
+    for c in data:
+        cfg, ns, hc = c.get('Config') or {}, c.get('NetworkSettings') or {}, c.get('HostConfig') or {}
+        name = (c.get('Name') or '').lstrip('/')
+        names = {name, cfg.get('Hostname') or ''}
+        labels = cfg.get('Labels') or {}
+        if labels.get('com.docker.compose.service'):
+            names.add(labels['com.docker.compose.service'])
+        ips = []
+        for net in (ns.get('Networks') or {}).values():
+            names.update(net.get('Aliases') or [])
+            names.update(net.get('DNSNames') or [])
+            if net.get('IPAddress'):
+                ips.append(net['IPAddress'])
+        ports = {}
+        for p, binds in (ns.get('Ports') or {}).items():
+            ports[p] = [(b.get('HostIp') or '', b.get('HostPort') or '') for b in (binds or [])]
+        for p in (cfg.get('ExposedPorts') or {}):
+            ports.setdefault(p, [])
+        out.append({'name': name, 'names': {x for x in names if x}, 'image': cfg.get('Image') or '',
+                    'running': bool((c.get('State') or {}).get('Running')), 'ports': ports, 'ips': ips,
+                    'hostnet': hc.get('NetworkMode') == 'host', 'mounts': c.get('Mounts') or []})
+    return out
+
+
+def docker_upstream(c, port):
+    """Best address for Caddy on the host to reach container port PORT: (addr, flag).
+    flag: ok — published on 127.0.0.1; exposed — published on all interfaces (reachable
+    from the internet past Caddy and the firewall); ip — not published, container IP
+    (changes when the container is recreated)."""
+    if c['hostnet']:
+        return '127.0.0.1:%s' % port, 'ok'
+    binds = c['ports'].get('%s/tcp' % port) or []
+    for hip, hport in binds:
+        if hip in ('127.0.0.1', '::1') and hport:
+            return '127.0.0.1:%s' % hport, 'ok'
+    for hip, hport in binds:
+        if hport:
+            return '127.0.0.1:%s' % hport, 'exposed'
+    if c['ips']:
+        return '%s:%s' % (c['ips'][0], port), 'ip'
+    return '', 'none'
+
+
+def cmd_web_docker(args):
+    """Running containers for the TUI: NAME \\t IMAGE \\t PORTS-SUMMARY, then
+    PORT lines: '  NAME \\t CPORT \\t UPSTREAM \\t FLAG'."""
+    if _docker_json(['version', '--format', '{{.Server.Version}}']) is None:
+        print('nodocker')
+        return
+    for c in sorted(docker_containers(), key=lambda x: x['name']):
+        tcp = sorted({int(p.split('/')[0]) for p in c['ports'] if p.endswith('/tcp')})
+        if c['hostnet'] and not tcp:
+            tcp = []
+        summary = []
+        for p in tcp:
+            binds = c['ports'].get('%d/tcp' % p) or []
+            if binds:
+                summary.append(','.join('%s:%s→%d' % (h or '*', hp, p) for h, hp in binds))
+            else:
+                summary.append('%d (не опубликован)' % p)
+        print('C\t%s\t%s\t%s\t%s' % (c['name'], c['image'], '; '.join(summary) or ('сеть хоста' if c['hostnet'] else 'нет портов'),
+                                     'host' if c['hostnet'] else ''))
+        for p in tcp:
+            up, flag = docker_upstream(c, p)
+            print('P\t%s\t%d\t%s\t%s' % (c['name'], p, up, flag))
+
+
+def cmd_web_caddyfiles(args):
+    """Caddyfiles of Caddy containers (running or stopped): candidates to import."""
+    seen = set()
+    for c in docker_containers(all_=True):
+        if 'caddy' not in (c['image'] + ' ' + c['name']).lower():
+            continue
+        for m in c['mounts']:
+            src, dst = m.get('Source') or '', m.get('Destination') or ''
+            if not src:
+                continue
+            cand = []
+            if dst.endswith('/Caddyfile'):
+                cand.append(src)
+            elif dst.rstrip('/') in ('/etc/caddy', '/config', '/srv'):
+                cand.append(os.path.join(src, 'Caddyfile'))
+            for f in cand:
+                if os.path.isfile(f) and f not in seen:
+                    seen.add(f)
+                    print('%s\t%s%s' % (f, c['name'], '' if not c['running'] else ' (запущен)'))
+
+
+def _rewrite_upstreams(text, containers, report):
+    """Container names in reverse_proxy/to lines → addresses reachable from the host."""
+    def fix(tok):
+        if len(tok) > 2 and tok[0] == tok[-1] and tok[0] in '"`':
+            inner = fix(tok[1:-1])
+            return tok if inner == tok[1:-1] else tok[0] + inner + tok[-1]
+        m = re.match(r'^(https?://|h2c://)?([A-Za-z0-9_.-]+)(?::(\d+))?$', tok)
+        if not m:
+            return tok
+        scheme, host, port = m.group(1) or '', m.group(2), m.group(3)
+        if host in ('localhost', '127.0.0.1') or re.match(r'^\d+\.\d+\.\d+\.\d+$', host):
+            return tok
+        if host == 'host.docker.internal':
+            new = '%s127.0.0.1%s' % (scheme, ':' + port if port else '')
+            report.append((tok, new, 'ok'))
+            return new
+        port = port or ('443' if scheme == 'https://' else '80')
+        for c in containers:
+            if host in c['names']:
+                up, flag = docker_upstream(c, port)
+                if up:
+                    new = scheme + up
+                    report.append((tok, new, flag))
+                    return new
+        if '.' not in host:
+            report.append((tok, tok, 'unknown'))
+        return tok
+
+    out = []
+    for ln in text.split('\n'):
+        m = re.match(r'^(\s*)(reverse_proxy|to)(\s+)(.*)$', ln)
+        if m:
+            parts = m.group(4).split(' ')
+            new = []
+            for p in parts:
+                if p and p not in ('{',) and not p.startswith(('@', '/', '*', '{', '#')):
+                    p = fix(p)
+                new.append(p)
+            ln = m.group(1) + m.group(2) + m.group(3) + ' '.join(new)
+        out.append(ln)
+    return '\n'.join(out)
+
+
+CADDY_LOG_DIR = '/var/log/caddy'
+
+
+def _rewrite_paths(text, mounts, report):
+    """Paths inside the Caddy container → paths on the host.
+    Log files go to /var/log/caddy (writable by the caddy service user);
+    'root' directories follow the container's bind mounts."""
+    def host_path(p):
+        best = None
+        for m in mounts:
+            dst, src = (m.get('Destination') or '').rstrip('/'), m.get('Source') or ''
+            if dst and src and (p == dst or p.startswith(dst + '/')) and (best is None or len(dst) > len(best[0])):
+                best = (dst, src)
+        return best[1] + p[len(best[0]):] if best else None
+
+    out = []
+    for ln in text.split('\n'):
+        m = re.match(r'^(\s*output\s+file\s+)("?)(/[^\s"{]+)("?)(.*)$', ln)
+        if m and not m.group(3).startswith(CADDY_LOG_DIR + '/'):
+            new = '%s/%s' % (CADDY_LOG_DIR, os.path.basename(m.group(3)))
+            report.append((m.group(3), new, 'log'))
+            ln = m.group(1) + m.group(2) + new + m.group(4) + m.group(5)
+        m = re.match(r'^(\s*root\s+(?:\*\s+|@\S+\s+|/\S*\s+)?)(/[^\s{]+)(.*)$', ln)
+        if m and not os.path.isdir(m.group(2)):
+            hp = host_path(m.group(2))
+            if hp:
+                report.append((m.group(2), hp, 'path' if os.path.isdir(hp) else 'nopath'))
+                ln = m.group(1) + hp + m.group(3)
+        out.append(ln)
+    return '\n'.join(out)
+
+
+def _root_upstreams(body):
+    """Upstreams that serve 'everything else' in a site block: reverse_proxy outside
+    any handle/route with a matcher (the panel and subscription handles are skipped)."""
+    ups, stack = [], []
+    for raw in body.split('\n'):
+        ln = raw.split('#', 1)[0].strip()
+        if not ln:
+            continue
+        if ln == '}':
+            if stack:
+                stack.pop()
+            continue
+        words = ln.split()
+        matched = len(words) > 1 and words[1] not in ('{',) and (words[1].startswith(('@', '/', '*')))
+        if words[0] == 'reverse_proxy' and not any(stack) and not matched:
+            for p in words[1:]:
+                if p == '{' or p.startswith(('@', '/', '*', '{', '#')):
+                    continue
+                ups.append(p.strip('"`'))
+        if ln.endswith('{'):
+            stack.append(words[0] in ('handle', 'route', 'handle_path', 'redir') and matched
+                         or words[0] in ('handle_path', 'handle_errors') or words[0].startswith('@'))
+    return ups
+
+
+def _main_upstreams(body):
+    ups = []
+    for ln in body.split('\n'):
+        m = re.match(r'^\s*reverse_proxy\s+(.*)$', ln)
+        if m:
+            for p in m.group(1).split():
+                if p != '{' and not p.startswith(('@', '/', '*', '{', '#')):
+                    ups.append(p.strip('"`'))
+    return ups
+
+
+def cmd_caddy_split(args):
+    """caddy-split FILE DOMAIN OUTDIR [--docker] [--source NAME]
+    Moves site blocks of other domains (and snippets) from FILE into OUTDIR/*.caddy.
+    Blocks of DOMAIN and the script's own redirect are skipped; their upstreams are
+    reported as 'main' (candidates for the domain root)."""
+    path, domain, outdir = args[0], args[1].lower(), args[2]
+    docker = '--docker' in args
+    src_name = args[args.index('--source') + 1] if '--source' in args else path
+    try:
+        with open(path, encoding='utf-8', errors='replace') as fh:
+            text = fh.read()
+    except OSError as e:
+        die('не удалось прочитать %s: %s' % (path, e))
+    blocks = caddy_blocks(text)
+    containers = docker_containers(all_=True) if docker else []
+    mounts = []
+    if docker:
+        real = os.path.realpath(path)
+        for c in containers:
+            for m in c['mounts']:
+                src = m.get('Source') or ''
+                if src and (real == os.path.realpath(src) or real.startswith(os.path.realpath(src).rstrip('/') + '/')):
+                    mounts = c['mounts']
+        containers = [c for c in containers if c['running']] or containers
+    report, moved, mains, skipped = [], [], [], []
+    os.makedirs(outdir, mode=0o755, exist_ok=True)
+    existing = set()
+    for f in os.listdir(outdir):
+        if f.endswith('.caddy'):
+            try:
+                for b in caddy_blocks(open(os.path.join(outdir, f), encoding='utf-8', errors='replace').read()):
+                    if b['kind'] == 'site':
+                        existing.update(_site_host(k) for k in b['keys'])
+            except OSError:
+                pass
+    stamp = time.strftime('%Y-%m-%d %H:%M')
+    snippets = []
+    for b in blocks:
+        if b['kind'] == 'global':
+            rest = []
+            for ln in b['body'].split('\n'):
+                w = ln.split('#', 1)[0].split()
+                if len(w) == 2 and w[0] == 'email' and '@' in w[1]:
+                    print('email\t%s' % w[1])
+                elif w and w[0] != 'storage':
+                    rest.append(ln.strip())
+            if rest:
+                skipped.append('глобальные опции: %s' % '; '.join(rest)[:120])
+            continue
+        if b['kind'] == 'line' and b['keys'][:1] == ['import'] and len(b['keys']) > 1 and \
+                os.path.abspath(os.path.dirname(b['keys'][1].strip('"'))) == os.path.abspath(outdir):
+            continue                                    # the script's own import of OUTDIR
+        if b['kind'] in ('snippet', 'line'):
+            snippets.append(b['text'])
+            continue
+        hosts = [_site_host(k) for k in b['keys']]
+        if domain in hosts or any(h in ('', ) for h in hosts):
+            mains.extend(_root_upstreams(b['body']))
+            continue
+        if all(h in existing for h in hosts):
+            skipped.append('%s (уже есть)' % ' '.join(b['keys']))
+            continue
+        body = _rewrite_upstreams(b['text'], containers, report) if docker else b['text']
+        body = _rewrite_paths(body, mounts, report) if docker else body
+        name = _safe_name(b['keys'][0])
+        fn = os.path.join(outdir, name + '.caddy')
+        i = 2
+        while os.path.exists(fn):
+            fn = os.path.join(outdir, '%s-%d.caddy' % (name, i))
+            i += 1
+        with open(fn, 'w') as fh:
+            fh.write('%s imported from=%s date=%s\n%s\n' % (WEB_MARK, src_name, stamp, body.strip()))
+        os.chmod(fn, 0o644)
+        existing.update(hosts)
+        moved.append((' '.join(b['keys']), os.path.basename(fn)))
+    if snippets:
+        body = '\n\n'.join(snippets)
+        body = _rewrite_upstreams(body, containers, report) if docker else body
+        body = _rewrite_paths(body, mounts, report) if docker else body
+        fn = os.path.join(outdir, '00-snippets.caddy')
+        with open(fn, 'a') as fh:
+            fh.write('%s imported from=%s date=%s\n%s\n\n' % (WEB_MARK, src_name, stamp, body.strip()))
+        os.chmod(fn, 0o644)
+        moved.append(('сниппеты и import', os.path.basename(fn)))
+    for site, fn in moved:
+        print('moved\t%s\t%s' % (site, fn))
+    for up in mains:
+        if docker:
+            r = []
+            new = _rewrite_upstreams('reverse_proxy ' + up, containers, r).split(' ', 1)[1]
+            print('main\t%s\t%s\t%s' % (up, new, r[0][2] if r else 'ok'))
+        else:
+            print('main\t%s\t%s\tok' % (up, up))
+    for old, new, flag in report:
+        print('map\t%s\t%s\t%s' % (old, new, flag))
+    for s in skipped:
+        print('skipped\t%s' % s)
+
+
+def _web_meta(text):
+    m = re.search(r'^%s(.*)$' % re.escape(WEB_MARK), text, re.M)
+    meta = {}
+    if m:
+        for kv in m.group(1).split():
+            if '=' in kv:
+                k, v = kv.split('=', 1)
+                meta[k] = v
+    return meta
+
+
+def cmd_web_sites(args):
+    """web-sites DIR — ROOT/SITE lines for the menu:
+    ROOT \\t stub|service \\t upstream \\t service-name
+    SITE \\t file \\t domains \\t upstreams \\t service-name"""
+    d = args[0]
+    root = os.path.join(d, 'root.caddy')
+    if os.path.isfile(root):
+        text = open(root, encoding='utf-8', errors='replace').read()
+        meta = _web_meta(text)
+        print('ROOT\tservice\t%s\t%s' % (', '.join(_main_upstreams(text)) or 'свои директивы', meta.get('service', '')))
+    else:
+        print('ROOT\tstub\t\t')
+    sd = os.path.join(d, 'sites')
+    for f in sorted(os.listdir(sd)) if os.path.isdir(sd) else []:
+        if not f.endswith('.caddy'):
+            continue
+        try:
+            text = open(os.path.join(sd, f), encoding='utf-8', errors='replace').read()
+        except OSError:
+            continue
+        meta = _web_meta(text)
+        sites = [b for b in caddy_blocks(text) if b['kind'] == 'site']
+        doms = ' '.join(k for b in sites for k in b['keys']) or '—'
+        ups = ', '.join(u for b in sites for u in _main_upstreams(b['body']))
+        if not sites:
+            doms = 'сниппеты' if f.startswith('00-') else '—'
+        print('SITE\t%s\t%s\t%s\t%s' % (f, doms, ups or '—', meta.get('service', '')))
+
+
+def cmd_web_hosts(args):
+    """Domains served by the files in DIR/sites (one per line)."""
+    sd = os.path.join(args[0], 'sites')
+    for f in sorted(os.listdir(sd)) if os.path.isdir(sd) else []:
+        if f.endswith('.caddy'):
+            try:
+                text = open(os.path.join(sd, f), encoding='utf-8', errors='replace').read()
+            except OSError:
+                continue
+            for b in caddy_blocks(text):
+                if b['kind'] == 'site':
+                    for k in b['keys']:
+                        print('%s\t%s' % (_site_host(k), f))
 
 
 # ------------------------------------------------------------ self-update
@@ -7478,7 +8892,8 @@ COMMANDS = {
     'group-create': cmd_group_create, 'group-rename': cmd_group_rename, 'group-delete': cmd_group_delete,
     'group-add-users': cmd_group_add_users, 'group-inbounds': cmd_group_inbounds,
     'groups': cmd_groups, 'menu-members': cmd_menu_members, 'group-set-members': cmd_group_set_members,
-    'country': cmd_country, 'inbound-flags': cmd_inbound_flags, 'update-check': cmd_update_check, 'update-fetch': cmd_update_fetch,
+    'country': cmd_country, 'panel-user': cmd_panel_user, 'web-docker': cmd_web_docker, 'web-caddyfiles': cmd_web_caddyfiles,
+    'caddy-split': cmd_caddy_split, 'web-sites': cmd_web_sites, 'web-hosts': cmd_web_hosts, 'inbound-flags': cmd_inbound_flags, 'update-check': cmd_update_check, 'update-fetch': cmd_update_fetch,
     'dns-check': cmd_dns_check, 'public-ip': cmd_public_ip,
     'track-activity': cmd_track_activity, 'enable-access-log': cmd_enable_access_log,
     'node-token-create': cmd_node_token_create, 'node-token-check': cmd_node_token_check,
@@ -8826,6 +10241,7 @@ manager(){
   write_helper; write_helper_env
   pair_revoke                     # pairing files left by a killed session
   upgrade_panel_data
+  panel_creds_sync
   update_check_background
   flush_notes 'Обновление'
   local ch
@@ -8843,6 +10259,7 @@ manager(){
          groups $'Группы\t{dim}массовые действия{/}' \
          inbounds $'Inbound-ы\t{dim}VLESS, Trojan, Hysteria2, AmneziaWG, MTProto{/}' \
          routing $'Маршрутизация\t{dim}РФ напрямую, заблокированное через сервер{/}' \
+         web $'Сайты и сервисы\t{dim}корень домена, другие домены, Docker{/}' \
          nodes $'Подключить узел\t{dim}другие серверы 3x-ui под управлением этой панели{/}' \
          '#Диагностика' '' \
          diag $'Диагностика сервера\t{dim}iPerf3 до РФ, IP Region{/}' \
@@ -8853,12 +10270,13 @@ manager(){
          remove $'{red}Удаление{/}\t{dim}прокси, 3x-ui, всё{/}' \
          "${quit_item[@]}") || return 0
     case "$ch" in
-      info) tui_show 'Параметры и ссылки' show_info_color ;;
+      info) panel_creds_sync; flush_notes 'Параметры'; tui_show 'Параметры и ссылки' show_info_color ;;
       pdf) pdf_screen ;;
       status) tui_show 'Состояние служб' show_status_color ;;
       users) menu_users ;;
       groups) menu_groups ;;
       inbounds) menu_inbounds ;;
+      web) menu_web ;;
       routing) menu_routing ;;
       nodes) menu_nodes ;;
       diag) menu_diag ;;
@@ -8928,6 +10346,9 @@ usage(){
   inbounds add KIND[,KIND…] [--tls CERT:KEY:SNI] [--port N] [--sni HOST] [--name NAME]
   inbounds edit ID [--port N] [--name NAME] [--sni HOST] [--tls domain|CERT:KEY:SNI] [--enable 0|1]
   inbounds del ID
+  sites [list]                          сайты и сервисы за Caddy (корень домена, другие домены)
+  sites root stub|HOST:PORT             что открывается на корне домена
+  sites add ДОМЕН HOST:PORT | sites del ДОМЕН | sites import CADDYFILE | sites apply
   routing [list]                        маршрутизация на устройствах клиентов (через подписку)
   routing mode off|ru-direct|blocked-proxy   РФ напрямую / только заблокированное через сервер
   routing add ДОМЕНЫ… [--direct|--proxy]  свои домены/IP;  routing add-url URL [--direct|--proxy]
@@ -8988,7 +10409,9 @@ cli_opt(){
 cli_cmd(){
   local cmd=$1 sub=${2:-list}
   case "$cmd" in
-    info) [[ $EUID -eq 0 ]] || die 'Запусти через sudo.'; load_state; write_helper; show_info_color ;;
+    info) [[ $EUID -eq 0 ]] || die 'Запусти через sudo.'; load_state; write_helper; panel_creds_sync
+          ((${#NOTES[@]})) && printf '%s\n' "${NOTES[@]}" | sed 's/{[a-z/]*}//g' >&2
+          NOTES=(); show_info_color ;;
     status) [[ $EUID -eq 0 ]] || die 'Запусти через sudo.'; load_state; write_helper; show_status_color ;;
     pdf)
       [[ $EUID -eq 0 ]] || die 'Запусти через sudo.'; load_state; write_helper
@@ -9059,6 +10482,9 @@ cli_cmd(){
         del) [[ -n "${3:-}" ]] || die 'inbounds del ID'; helper del-inbound "$3"; printf 'Удалён inbound %s\n' "$3" ;;
         *) die "Неизвестная подкоманда inbounds $sub" ;;
       esac ;;
+    sites)
+      cli_need_panel
+      cli_sites "${@:2}" ;;
     routing)
       cli_need_panel
       local r act
@@ -9208,6 +10634,7 @@ main_interactive(){
 }
 
 if [[ "${XUI_REVERSE_LIB_ONLY:-0}" != 1 ]]; then
+  xui_resolve_db
   case "${1:-}" in
     --cli) UI_WANT=cli; main_interactive ;;
     --tui) UI_WANT=tui; main_interactive ;;
@@ -9222,7 +10649,7 @@ if [[ "${XUI_REVERSE_LIB_ONLY:-0}" != 1 ]]; then
     --remove-command) remove_manager_command || : ;;
     --restore-command) restore_manager_command ;;
     --help|-h|help) usage ;;
-    info|status|pdf|bbr|diag|routing|users|groups|inbounds|node|nodes|version|update) cli_cmd "$@" ;;
+    info|status|pdf|bbr|diag|routing|sites|users|groups|inbounds|node|nodes|version|update) cli_cmd "$@" ;;
     '') main_interactive ;;
     *) die "Неизвестный параметр: $1 (см. --help)" ;;
   esac
