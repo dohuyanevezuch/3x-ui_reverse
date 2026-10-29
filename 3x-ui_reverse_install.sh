@@ -6,7 +6,7 @@ set -Eeuo pipefail
 umask 077
 
 # Release version = the git tag of the commit this file comes from.
-VERSION=v2.8.6
+VERSION=v2.9.0
 # GitHub repository (owner/name) that publishes tagged releases of this script.
 # Can also be set from the "Версия" screen or with XR_REPO=owner/name.
 DEFAULT_REPO='dohuyanevezuch/3x-ui_reverse'
@@ -2435,10 +2435,13 @@ choose_tls(){
   TLS_SPEC="$crt|$key|$sni"
 }
 # Inbound selection list → INB_KINDS / INB_TLS. $1=fresh: no panel yet.
+INB_NODE=0
 select_inbounds(){
   local sel k
-  local -a picked=()
-  read_check menu-kinds ${1:+--fresh}
+  local -a picked=() kopt=()
+  [[ -n "${1:-}" ]] && kopt=(--fresh)
+  ((INB_NODE)) && kopt+=(--node "$INB_NODE")
+  read_check menu-kinds "${kopt[@]}"
   if ((${#TSV_ITEMS[@]} == 0)); then tui_msg 'Inbound-ы' 'Не удалось получить список inbound-ов.'; return 1; fi
   sel=$(tui_checklist 'Какие inbound-ы создать?' \
         'Порты подбираются свободные, SNI — доступные из России сайты. Отмечены рекомендуемые.' \
@@ -2502,6 +2505,7 @@ setup_inbounds(){
   done
   [[ -n "$kinds" ]] || return 1
   printf 'Creating inbounds: %s\n' "$kinds" >>"$LOG"
+  ((INB_NODE)) && args+=(--node "$INB_NODE")
   if ! out=$(helper create-inbounds "$kinds" --sniff "$XR_SNIFF" "${args[@]}" 2>&1); then
     printf '%s\n' "$out" >>"$LOG"
     warn "Не удалось создать inbound-ы: ${out#Ошибка: }"
@@ -2511,7 +2515,7 @@ setup_inbounds(){
   helper enable-access-log >>"$LOG" 2>&1 || warn 'Не удалось включить журнал активности Xray.'
   setup_activity_timer || warn 'Не удалось включить учёт активности.'
   # shellcheck disable=SC2086  # ids are numbers separated by spaces
-  open_firewall_ports $CREATED_IDS || :
+  ((INB_NODE)) || open_firewall_ports $CREATED_IDS || :
   return 0
 }
 
@@ -2566,13 +2570,29 @@ dns_check_screen(){
 
 # ---------------------------------------------------------------- inbound screens
 inbound_add(){
+  local where=''
+  INB_NODE=0
+  read_menu menu-servers
+  if ((${#TSV_ITEMS[@]} > 2)); then
+    INB_NODE=$(tui_menu 'Добавить inbound-ы' "Где создать inbound-ы?
+{dim}На узле они создаются через эту панель, как у скрипта: свободные порты, SNI, название
+с флагом страны узла. Inbound-ы с сертификатом домена (XHTTP TLS, Hysteria2) — только
+на самом узле.{/}" "${TSV_ITEMS[@]}") || return 0
+    ((INB_NODE)) && where=" на узле $(printf '%s\n' "${TSV_ITEMS[@]}" | awk -v n="$INB_NODE" 'f{print; exit} $0==n{f=1}' | cut -f1)"
+  fi
   select_inbounds || return 0
-  if with_progress 'Создание inbound-ов' "Создаём: $(selected_labels)" setup_inbounds; then
-    note "{green}✓ Создано: $(selected_labels).{/}"
-    # shellcheck disable=SC2086
-    note "Открой во внешнем файрволе провайдера: $(helper ports $CREATED_IDS 2>/dev/null || echo '?')."
+  if with_progress 'Создание inbound-ов' "Создаём$where: $(selected_labels)" setup_inbounds; then
+    note "{green}✓ Создано$where: $(selected_labels).{/}"
+    if ((INB_NODE)); then
+      # shellcheck disable=SC2086
+      note "Открой на узле (ufw и файрвол провайдера): $(helper ports $CREATED_IDS 2>/dev/null || echo '?')."
+    else
+      # shellcheck disable=SC2086
+      note "Открой во внешнем файрволе провайдера: $(helper ports $CREATED_IDS 2>/dev/null || echo '?')."
+    fi
     note 'Подключи пользователей к новым inbound-ам: Пользователи или Группы → Inbound-ы.'
   fi
+  INB_NODE=0
 }
 pick_inbound(){
   read_menu menu-all-inbounds
@@ -2967,6 +2987,57 @@ firewall_ports_text(){
   done < <(helper ports-all 2>/dev/null)
   return 0
 }
+country_style_text(){
+  if [[ "$(helper country-style 2>/dev/null)" == code ]]; then printf 'сокращение: 🇳🇱 NL'; else printf 'полностью: 🇳🇱 Netherlands'; fi
+}
+country_style_screen(){
+  local cur ch n
+  cur=$(helper country-style 2>>"$LOG") || cur=full
+  ch=$(tui_radiolist 'Подпись страны' "Как писать страну в названиях inbound-ов, которые создаёт скрипт
+(и при «Массовые действия → Названия как у скрипта»):" \
+       full 'Полностью — 🇳🇱 Netherlands VLESS TCP Reality' "$([[ $cur == full ]] && echo ON || echo OFF)" \
+       code 'Сокращение — 🇳🇱 NL VLESS TCP Reality' "$([[ $cur == code ]] && echo ON || echo OFF)") || return 0
+  [[ "$ch" == "$cur" ]] && return 0
+  helper country-style "$ch" >/dev/null 2>>"$LOG" || return 0
+  if tui_yesno 'Подпись страны' "Переписать страну в названиях существующих inbound-ов?
+{dim}Затронет только названия вида «🇳🇱 Netherlands …» / «🇳🇱 NL …», остальные не меняются.{/}" 'Переписать' 'Только для новых' yes; then
+    n=$(helper inbounds-restyle 2>>"$LOG") || n=0
+    note "✓ Переименовано inbound-ов: ${n:-0}."
+  fi
+}
+# Several inbounds at once, on this server and on every node.
+inbounds_bulk(){
+  local ids act n plan changes
+  ids=$(inbound_checklist 'Массовые действия' 'Отметь inbound-ы — со всех серверов (заголовки — сервер и страна):' '') || return 0
+  [[ -n "$ids" ]] || return 0
+  act=$(tui_menu 'Массовые действия' "Выбрано: $(tr ',' '\n' <<< "$ids" | grep -c .)" \
+        rename $'Названия как у скрипта\t{dim}флаг, страна сервера, тип — 🇩🇪 Germany VLESS TCP Reality{/}' \
+        enable 'Включить' \
+        disable 'Выключить' \
+        delete '{red}Удалить{/}') || return 0
+  case "$act" in
+    rename)
+      plan=$(helper inbounds-rename-plan "$ids" 2>&1) || { tui_msg 'Ошибка' "${plan#Ошибка: }"; return 0; }
+      changes=$(sed -n 's/^CHANGES=//p' <<< "$plan")
+      if [[ "${changes:-0}" == 0 ]]; then tui_msg 'Названия' 'Все выбранные inbound-ы уже названы как у скрипта.'; return 0; fi
+      tui_show "Новые названия ($changes)" grep -v '^CHANGES=' <<< "$plan"
+      tui_yesno 'Названия' "Переименовать $changes inbound-ов?
+{dim}Порты, ключи и пользователи не меняются. В приложениях клиентов новые названия
+появятся после обновления подписки.{/}" 'Переименовать' 'Отмена' yes || return 0
+      n=$(helper inbounds-rename "$ids" 2>&1) || { tui_msg 'Ошибка' "${n#Ошибка: }"; return 0; }
+      note "{green}✓ Переименовано: $n.{/}" ;;
+    enable|disable)
+      n=$(helper inbounds-bulk "$act" "$ids" 2>&1) || { tui_msg 'Ошибка' "${n#Ошибка: }"; return 0; }
+      note "✓ $([[ $act == enable ]] && echo Включено || echo Выключено): $n." ;;
+    delete)
+      tui_confirm_word 'Удалить inbound-ы' "Будут удалены inbound-ы: $(ids_names "$ids")
+
+{red}Клиенты потеряют эти подключения.{/} Сами пользователи останутся в панели,
+их можно подключить к другим inbound-ам: «Пользователи» или «Группы → Inbound-ы»." 'УДАЛИТЬ' || return 0
+      n=$(helper inbounds-bulk delete "$ids" 2>&1) || { tui_msg 'Ошибка' "${n#Ошибка: }"; return 0; }
+      note "✓ Удалено inbound-ов: $n." ;;
+  esac
+}
 menu_inbounds(){
   need_panel_api || return 0
   local ch list id
@@ -2974,11 +3045,15 @@ menu_inbounds(){
     ch=$(tui_menu 'Inbound-ы' "$(inbounds_screen_text)" \
          add $'Добавить inbound-ы\t{dim}10 типов: VLESS, Trojan, Hysteria2, AmneziaWG, MTProto{/}' \
          edit $'Изменить inbound\t{dim}порт, название, SNI, TLS, вкл/выкл, удалить{/}' \
+         bulk $'Массовые действия\t{dim}названия как у скрипта, вкл/выкл, удаление — со всех узлов{/}' \
          list 'Подробный список' \
-         ports 'Порты для внешнего файрвола') || return 0
+         ports 'Порты для внешнего файрвола' \
+         style "Подпись страны в названиях"$'\t{dim}'"$(country_style_text){/}") || return 0
     case "$ch" in
       add) inbound_add ;;
       edit) if id=$(pick_inbound 'Изменить inbound'); then inbound_screen "$id"; fi ;;
+      bulk) inbounds_bulk ;;
+      style) country_style_screen ;;
       list) tui_show 'Inbound-ы панели' helper inbounds "$(ui_width)" ;;
       ports)
         list=$(firewall_ports_text)
@@ -5282,18 +5357,42 @@ def country_iso():
     return country_code()
 
 
-def country_prefix():
-    """'🇳🇱 Netherlands' — the start of auto inbound names ('' with XR_COUNTRY=none)."""
-    name = country_name()
-    if not name:
-        return ''
-    flag = flag_emoji(country_iso())
-    return ('%s %s' % (flag, name)).strip()
+def country_style():
+    """'full' (Netherlands) or 'code' (NL) — how the country is written in inbound names."""
+    try:
+        with open(os.path.join(STATE_DIR, 'country-style')) as f:
+            v = f.read().strip()
+    except OSError:
+        v = ''
+    return 'code' if v == 'code' else 'full'
+
+
+def country_label(code, name=''):
+    if not code:
+        return name
+    return code if country_style() == 'code' else COUNTRY_EN.get(code, name or code)
+
+
+def country_prefix(code=None):
+    """'🇳🇱 Netherlands' or '🇳🇱 NL' — the start of auto inbound names ('' with XR_COUNTRY=none).
+    CODE: another server's country (a node); default — this server."""
+    if code is None:
+        name = country_name()
+        if not name:
+            return ''
+        code = country_iso()
+        label = country_label(code, name) if code else name
+    else:
+        label = country_label(code)
+    return ('%s %s' % (flag_emoji(code), label)).strip()
 
 
 def short_name(remark):
     """Inbound name without the flag and country prefix (for compact tables)."""
+    flagged = bool(FLAG_RE.match(remark or ''))
     remark = FLAG_RE.sub('', remark or '', count=1)
+    if flagged and re.match(r'^[A-Z]{2} \S', remark) and remark[:2] in COUNTRY_EN:
+        return remark[3:]
     for prefix in list(COUNTRY_EN.values()) + list(LEGACY_COUNTRY_RU):
         if remark.startswith(prefix + ' ') and len(remark) > len(prefix) + 1:
             return remark[len(prefix) + 1:]
@@ -5415,6 +5514,14 @@ def inbound_sni(ib):
     return ''
 
 
+def first_sni(ib):
+    """One SNI for lists: 'a.com +12' when Reality has many serverNames."""
+    names = [x for x in inbound_sni(ib).split(',') if x]
+    if not names:
+        return ''
+    return names[0] + (' +%d' % (len(names) - 1) if len(names) > 1 else '')
+
+
 def inbound_transport(ib):
     """tcp | udp — which firewall port the inbound needs."""
     if ib.get('protocol') in UDP_PROTOCOLS or stream(ib).get('network') in ('kcp', 'quic'):
@@ -5481,24 +5588,26 @@ def listening(transport):
     return ports
 
 
-def port_problem(port, transport, ibs, ignore_id=None):
-    """'' if PORT/TRANSPORT is free for an inbound, else why it is not."""
+def port_problem(port, transport, ibs, ignore_id=None, node=None):
+    """'' if PORT/TRANSPORT is free for an inbound, else why it is not.
+    NODE: the inbound lives on that node — only its inbounds matter, local sockets do not."""
     if not 1 <= port <= 65535:
         return 'порт должен быть от 1 до 65535'
+    ibs = [ib for ib in ibs if (ib.get('nodeId') or None) == (node or None)]
     for ib in ibs:
         if ib['id'] != ignore_id and ib.get('port') == port and inbound_transport(ib) == transport:
             return 'занят inbound-ом «%s»' % (ib.get('remark') or ib['id'])
     own = next((ib for ib in ibs if ib['id'] == ignore_id), None)
-    if port in listening(transport) and not (own and own.get('port') == port):
+    if not node and port in listening(transport) and not (own and own.get('port') == port):
         return 'занят другой программой на этом сервере (%s)' % transport.upper()
     return ''
 
 
-def pick_port(transport, ibs, taken):
+def pick_port(transport, ibs, taken, node=None):
     import random
     candidates = PREFERRED_PORTS[transport] + random.sample(range(20000, 60000), 200)
     for p in candidates:
-        if (p, transport) not in taken and not port_problem(p, transport, ibs):
+        if (p, transport) not in taken and not port_problem(p, transport, ibs, node=node):
             return p
     die('не нашлось свободного порта (%s)' % transport)
 
@@ -5509,8 +5618,10 @@ def cmd_check_port(args):
         port = int(args[0])
     except (ValueError, IndexError):
         die('порт — число')
-    reason = port_problem(port, args[1] if len(args) > 1 else 'tcp', inbounds(),
-                          int(args[2]) if len(args) > 2 and args[2] else None)
+    ibs = inbounds()
+    ignore = int(args[2]) if len(args) > 2 and args[2] else None
+    node = next((ib.get('nodeId') for ib in ibs if ib['id'] == ignore), None)
+    reason = port_problem(port, args[1] if len(args) > 1 else 'tcp', ibs, ignore, node=node)
     if reason:
         print(reason)
         sys.exit(1)
@@ -5685,6 +5796,11 @@ def cmd_create_inbounds(args):
     tls_opts = {k: v.split('|') for k, v in per('tls').items()}
     ports, snis, names = per('port'), per('sni'), per('name')
     sniff = (opts.get('sniff') or ['route'])[0]
+    node = int((opts.get('node') or ['0'])[0] or 0) or None
+    if node:
+        for k in kinds:
+            if k in TLS_KINDS:
+                die('%s на узле не создаётся: сертификат домена лежит на самом узле' % KIND[k]['label'])
     for k in kinds:
         if k in TLS_KINDS and (k not in tls_opts or len(tls_opts[k]) != 3):
             die('для %s нужен сертификат: --tls "%s|CERT|KEY|SNI"' % (KIND[k]['label'], k))
@@ -5705,11 +5821,11 @@ def cmd_create_inbounds(args):
         transport = KIND[k]['transport']
         if k in ports:
             port = int(ports[k])
-            reason = port_problem(port, transport, ibs)
+            reason = port_problem(port, transport, ibs, node=node)
             if reason:
                 die('порт %d: %s' % (port, reason))
         else:
-            port = pick_port(transport, ibs, taken)
+            port = pick_port(transport, ibs, taken, node=node)
         taken.add((port, transport))
         cert = key = ''
         if k in TLS_KINDS:
@@ -5718,11 +5834,13 @@ def cmd_create_inbounds(args):
             sni = snis.get(k) or (auto_snis.pop(0) if k in REALITY_KINDS or k == 'mtproto' else '')
         plan.append((k, port, sni, cert, key))
     created = []
-    country = country_prefix()
+    country = country_prefix(node_country(node, ibs) if node else None)
     for k, port, sni, cert, key in plan:
         base = names.get(k) or ('%s %s' % (country, KIND[k]['label'])).strip()
         payload = build(k, port, sni, cert, key, sniff)
         payload.update(enable=True, remark=unique_name(base, ibs), listen='', expiryTime=0, total=0)
+        if node:
+            payload['nodeId'] = node
         ok(call('/inbounds/add', payload), 'создание %s' % KIND[k]['label'])
         ibs = inbounds()
         new = max((ib for ib in ibs if ib.get('remark') == payload['remark']), key=lambda x: x['id'])
@@ -5799,10 +5917,15 @@ def cmd_menu_kinds(args):
     """Checklist rows: kind <TAB> ON|OFF <TAB> label <TAB> note (+ how many exist).
     --fresh: before the panel is installed (no API)."""
     counts = {}
+    node = int(args[args.index('--node') + 1]) if '--node' in args else 0
     for ib in ([] if '--fresh' in args else inbounds()):
+        if (ib.get('nodeId') or 0) != node:
+            continue
         counts[classify(ib)] = counts.get(classify(ib), 0) + 1
     fresh = not any(counts.values())
     for k, label, _, note in KINDS:
+        if node and k in TLS_KINDS:
+            continue                    # the certificate lives on the node itself
         have = counts.get(k, 0)
         mark = 'ON' if fresh and k in DEFAULT_KINDS else 'OFF'
         extra = ('{green}✓ есть%s{/}' % (' ×%d' % have if have > 1 else '')) if have else ' '
@@ -5823,7 +5946,7 @@ def cmd_kind_info(args):
 def cmd_set_port(args):
     ib = get_inbound(int_arg(args, 0, 'ID'))
     port = int_arg(args, 1, 'порт')
-    reason = port_problem(port, inbound_transport(ib), inbounds(), ib['id'])
+    reason = port_problem(port, inbound_transport(ib), inbounds(), ib['id'], node=ib.get('nodeId'))
     if reason:
         die('порт %d %s' % (port, reason))
     ib['port'] = port
@@ -5915,13 +6038,17 @@ def cmd_inbounds(args):
         return
     if '--compact' in args:
         w = min(max(len(ib.get('remark') or '') for ib in ibs), 36)
-        for ib in ibs:
+        locs = inbound_locations(ibs)
+        last = None
+        for ib in sorted(ibs, key=lambda x: (locs[x['id']][0], x['id']) if locs else x['id']):
+            if locs and locs[ib['id']][0] != last:
+                last = locs[ib['id']][0]
+                out('{accent}%s{/}' % locs[ib['id']][1])
             dot = '{green}●{/}' if ib.get('enable') else '{red}○{/}'
-            sni = inbound_sni(ib)
             name = ib.get('remark') or ib.get('tag') or ''
             name = name if len(name) <= w else name[:w - 1] + '…'
             out('%s %s  %-10s {dim}%s{/}' % (dot, name.ljust(w),
-                                          '%s/%s' % (ib.get('port'), inbound_transport(ib)), sni))
+                                          '%s/%s' % (ib.get('port'), inbound_transport(ib)), first_sni(ib)))
         out('{dim}%d inbound-ов · изменить порт, название, SNI или TLS — «Изменить inbound»{/}' % len(ibs))
         return
     max_w = int(args[0]) if args and args[0].isdigit() else 200
@@ -5932,7 +6059,7 @@ def cmd_inbounds(args):
         total = ib.get('total') or 0
         rows.append((ib, str(ib['id']), ib.get('remark') or ib.get('tag') or '—', inbound_kind(ib),
                      '%s/%s' % (ib.get('port'), inbound_transport(ib)), str(clients),
-                     '%s / %s' % (human(used), human(total) if total else '∞'), inbound_sni(ib) or '—'))
+                     '%s / %s' % (human(used), human(total) if total else '∞'), first_sni(ib) or '—'))
     head = ('', 'ID', 'НАЗВАНИЕ', 'ПРОТОКОЛ', 'ПОРТ', 'КЛ.', 'ТРАФИК', 'SNI')
     caps = [2, 4, 34, 24, 10, 4, 20, 28]
     widths = [2] + [min(caps[i], max([len(head[i])] + [len(r[i]) for r in rows])) for i in range(1, 8)]
@@ -6050,35 +6177,55 @@ def _geo_country(address):
     return code
 
 
+_NODES = None
+
+
+def nodes_by_id():
+    global _NODES
+    if _NODES is None:
+        try:
+            _NODES = {n['id']: n for n in (ok(call('/nodes/list'), 'список узлов') or [])}
+        except SystemExit:
+            _NODES = {}
+    return _NODES
+
+
+def node_country(nid, ibs):
+    """ISO code of node NID: flag in its name, its inbound names, then geo-IP of its address."""
+    n = nodes_by_id().get(nid) or {}
+    code = flag_code(n.get('name') or '') or flag_code(n.get('remark') or '')
+    if not code:
+        votes = {}
+        for ib in ibs:
+            if ib.get('nodeId') == nid:
+                c = _remark_country(ib.get('remark') or '')
+                if c:
+                    votes[c] = votes.get(c, 0) + 1
+        code = max(votes, key=votes.get) if votes else ''
+    if not code and n.get('address'):
+        code = _geo_country(n['address'])
+    return code
+
+
+def node_title(nid):
+    n = nodes_by_id().get(nid) or {}
+    return (n.get('name') or n.get('remark') or n.get('address') or 'узел %s' % nid).strip()
+
+
 def inbound_locations(ibs):
     """{inbound id: (sort key, label)} when inbounds of other nodes are present, else {}.
-    Label: '🇩🇪 Germany · узел' — the flag from the node name, its inbound names or geo-IP."""
+    Label: '🇩🇪 de-1 · Germany' — the flag from the node name, its inbound names or geo-IP."""
     node_ids = {ib.get('nodeId') for ib in ibs if ib.get('nodeId')}
     if not node_ids:
         return {}
-    try:
-        nodes = {n['id']: n for n in (ok(call('/nodes/list'), 'список узлов') or [])}
-    except SystemExit:
-        nodes = {}
     labels = {}
     me = country_iso()
-    labels[0] = ('0', ('%s %s · этот сервер' % (flag_emoji(me), country_name() or '')).strip(' ·').strip())
+    labels[0] = ('0', ('%s %s · этот сервер' % (flag_emoji(me), COUNTRY_EN.get(me) or country_name())).strip())
     for nid in sorted(node_ids):
-        n = nodes.get(nid) or {}
-        name = (n.get('name') or n.get('remark') or n.get('address') or 'узел %s' % nid).strip()
-        code = flag_code(name)
-        if not code:
-            votes = {}
-            for ib in ibs:
-                if ib.get('nodeId') == nid:
-                    c = _remark_country(ib.get('remark') or '')
-                    if c:
-                        votes[c] = votes.get(c, 0) + 1
-            code = max(votes, key=votes.get) if votes else ''
-        if not code and n.get('address'):
-            code = _geo_country(n['address'])
+        name = node_title(nid)
+        code = node_country(nid, ibs)
         label = name if flag_code(name) else ('%s %s' % (flag_emoji(code), name)).strip()
-        cname = COUNTRY_EN.get(code, '')
+        cname = COUNTRY_EN.get(code, '')        # headers: always the full name (Windows shows flags as letters)
         if cname and cname.lower() not in label.lower():
             label += ' · ' + cname
         labels[nid] = ('1' + FLAG_RE.sub('', name).lower(), label)
@@ -8819,6 +8966,170 @@ def cmd_web_hosts(args):
                         print('%s\t%s' % (_site_host(k), f))
 
 
+# ------------------------------------------------------------------ bulk inbound actions
+# Names "like the script makes them": {flag} {country} {type}. The country is the
+# country of the server the inbound runs on (this server or a node).
+PROTO_LABEL = {'vless': 'VLESS', 'vmess': 'VMess', 'trojan': 'Trojan', 'shadowsocks': 'Shadowsocks',
+               'hysteria': 'Hysteria2', 'hysteria2': 'Hysteria2', 'tuic': 'TUIC', 'amneziawg': 'AmneziaWG',
+               'wireguard': 'WireGuard', 'mtproto': 'MTProto', 'http': 'HTTP', 'socks': 'SOCKS',
+               'mixed': 'SOCKS', 'masque': 'MASQUE', 'tunnel': 'Tunnel', 'dokodemo-door': 'Tunnel'}
+NO_NET_PROTOCOLS = UDP_PROTOCOLS | {'mtproto', 'http', 'socks', 'mixed', 'tunnel', 'dokodemo-door'}
+
+
+def type_label(ib):
+    """'VLESS TCP Reality' — the catalog label, or one built the same way."""
+    k = classify(ib)
+    if k:
+        return KIND[k]['label']
+    proto = ib.get('protocol') or '?'
+    parts = [PROTO_LABEL.get(proto, proto.upper())]
+    ss = stream(ib)
+    net = ss.get('network') or ''
+    if net and proto not in NO_NET_PROTOCOLS:
+        parts.append(NET_NAMES.get(net, net.upper()))
+    sec = ss.get('security') or ''
+    if sec in ('reality', 'tls'):
+        parts.append({'reality': 'Reality', 'tls': 'TLS'}[sec])
+    return ' '.join(parts)
+
+
+def server_codes(ibs):
+    """{inbound id: ISO code of the server it runs on}."""
+    me = country_iso()
+    cache = {}
+    out = {}
+    for ib in ibs:
+        nid = ib.get('nodeId')
+        if not nid:
+            out[ib['id']] = me
+            continue
+        if nid not in cache:
+            cache[nid] = node_country(nid, ibs)
+        out[ib['id']] = cache[nid]
+    return out
+
+
+def rename_plan(ibs, ids):
+    """[(inbound, new name)] for IDS; names stay unique panel-wide."""
+    codes = server_codes(ibs)
+    chosen = [ib for ib in sorted(ibs, key=lambda x: x['id']) if ib['id'] in ids]
+    used = {(ib.get('remark') or '').strip().lower() for ib in ibs if ib['id'] not in ids}
+    plan = []
+    for ib in chosen:
+        base = ('%s %s' % (country_prefix(codes[ib['id']]) if codes[ib['id']] else '', type_label(ib))).strip()
+        name, n = base, 2
+        while name.lower() in used:
+            name = '%s %d' % (base, n)
+            n += 1
+        used.add(name.lower())
+        plan.append((ib, name))
+    return plan
+
+
+def _ids_arg(args, ibs):
+    if not args or not args[0]:
+        die('не выбраны inbound-ы')
+    return set(parse_ids(args[0], ibs))
+
+
+def cmd_inbounds_rename_plan(args):
+    """inbounds-rename-plan IDS — 'old → new' lines for the preview."""
+    ibs = inbounds()
+    locs = inbound_locations(ibs)
+    plan = rename_plan(ibs, _ids_arg(args, ibs))
+    same = 0
+    for ib, new in plan:
+        old = ib.get('remark') or ''
+        if old == new:
+            same += 1
+            continue
+        where = (' {dim}· %s{/}' % locs[ib['id']][1]) if locs else ''
+        out('  %s{dim} → {/}{bold}%s{/}%s' % (old or '—', new, where))
+    if same:
+        out('{dim}  Уже в нужном виде: %d{/}' % same)
+    print('CHANGES=%d' % (len(plan) - same))
+
+
+def cmd_inbounds_rename(args):
+    """inbounds-rename IDS — rename to '{flag} {country} {type}'; prints the count."""
+    ibs = inbounds()
+    n = 0
+    for ib, new in rename_plan(ibs, _ids_arg(args, ibs)):
+        if (ib.get('remark') or '') != new:
+            ib['remark'] = new
+            save_inbound(ib)
+            n += 1
+    print(n)
+
+
+def cmd_inbounds_bulk(args):
+    """inbounds-bulk delete|enable|disable IDS — prints the count."""
+    action = args[0] if args else ''
+    if action not in ('delete', 'enable', 'disable'):
+        die('действие: delete | enable | disable')
+    ibs = inbounds()
+    ids = _ids_arg(args[1:], ibs)
+    n = 0
+    for ib in sorted(ibs, key=lambda x: x['id']):
+        if ib['id'] not in ids:
+            continue
+        if action == 'delete':
+            ok(call('/inbounds/del/%d' % ib['id'], {}), 'удаление «%s»' % (ib.get('remark') or ib['id']))
+            register([ib['id']], remove=True)
+        else:
+            want = action == 'enable'
+            if bool(ib.get('enable')) == want:
+                continue
+            ok(call('/inbounds/setEnable/%d' % ib['id'], {'enable': want}), 'включение «%s»' % ib.get('remark'))
+        n += 1
+    print(n)
+
+
+def cmd_country_style(args):
+    """country-style [full|code] — print or set how countries are written in names."""
+    if args:
+        if args[0] not in ('full', 'code'):
+            die('country-style full | code')
+        path = os.path.join(STATE_DIR, 'country-style')
+        with open(path, 'w') as f:
+            f.write(args[0] + '\n')
+    print(country_style())
+
+
+def cmd_inbounds_restyle(_args):
+    """Rewrite the country of names that start with '{flag} {country} ' in the current style."""
+    ibs = inbounds()
+    n = 0
+    for ib in ibs:
+        remark = ib.get('remark') or ''
+        code = flag_code(remark)
+        if not code:
+            continue
+        rest = FLAG_RE.sub('', remark, count=1)
+        for cur in (COUNTRY_EN.get(code, ''), code):
+            if cur and rest.startswith(cur + ' '):
+                new = '%s %s' % (country_prefix(code), rest[len(cur) + 1:])
+                if new != remark and not name_taken(new, ibs, ib['id']):
+                    ib['remark'] = new
+                    save_inbound(ib)
+                    n += 1
+                break
+    print(n)
+
+
+def cmd_menu_servers(_args):
+    """Where new inbounds can go: '0 <TAB> this server' and one line per node."""
+    ibs = inbounds()
+    me = country_iso()
+    print('0\t%s\t{dim}этот сервер{/}' % ('%s %s' % (flag_emoji(me), country_label(me, country_name()))).strip())
+    for nid, n in sorted(nodes_by_id().items()):
+        code = node_country(nid, ibs)
+        name = node_title(nid)
+        label = name if flag_code(name) else ('%s %s' % (flag_emoji(code), name)).strip()
+        state = '' if n.get('enable') else '  {red}выключен{/}'
+        print('%s\t%s\t{dim}узел · %s%s{/}' % (nid, label, n.get('address') or '', state))
+
+
 # ------------------------------------------------------------ self-update
 REPO_RE = re.compile(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+')
 TAG_VER_RE = re.compile(r'v?\d+(\.\d+){0,3}')
@@ -8892,7 +9203,7 @@ COMMANDS = {
     'group-create': cmd_group_create, 'group-rename': cmd_group_rename, 'group-delete': cmd_group_delete,
     'group-add-users': cmd_group_add_users, 'group-inbounds': cmd_group_inbounds,
     'groups': cmd_groups, 'menu-members': cmd_menu_members, 'group-set-members': cmd_group_set_members,
-    'country': cmd_country, 'panel-user': cmd_panel_user, 'web-docker': cmd_web_docker, 'web-caddyfiles': cmd_web_caddyfiles,
+    'country': cmd_country, 'inbounds-rename-plan': cmd_inbounds_rename_plan, 'inbounds-rename': cmd_inbounds_rename, 'inbounds-bulk': cmd_inbounds_bulk, 'country-style': cmd_country_style, 'inbounds-restyle': cmd_inbounds_restyle, 'menu-servers': cmd_menu_servers, 'panel-user': cmd_panel_user, 'web-docker': cmd_web_docker, 'web-caddyfiles': cmd_web_caddyfiles,
     'caddy-split': cmd_caddy_split, 'web-sites': cmd_web_sites, 'web-hosts': cmd_web_hosts, 'inbound-flags': cmd_inbound_flags, 'update-check': cmd_update_check, 'update-fetch': cmd_update_fetch,
     'dns-check': cmd_dns_check, 'public-ip': cmd_public_ip,
     'track-activity': cmd_track_activity, 'enable-access-log': cmd_enable_access_log,
@@ -10346,6 +10657,11 @@ usage(){
   inbounds add KIND[,KIND…] [--tls CERT:KEY:SNI] [--port N] [--sni HOST] [--name NAME]
   inbounds edit ID [--port N] [--name NAME] [--sni HOST] [--tls domain|CERT:KEY:SNI] [--enable 0|1]
   inbounds del ID
+  inbounds servers                      этот сервер и узлы (номер — для --node)
+  inbounds add KIND,… --node N          создать на узле (без XHTTP TLS и Hysteria2)
+  inbounds rename IDS [--yes]           названия как у скрипта: 🇩🇪 Germany VLESS TCP Reality
+  inbounds enable|disable IDS | delete IDS --yes   массово, inbound-ы с любых узлов
+  inbounds country-style full|code [--rename]      Netherlands или NL в названиях
   sites [list]                          сайты и сервисы за Caddy (корень домена, другие домены)
   sites root stub|HOST:PORT             что открывается на корне домена
   sites add ДОМЕН HOST:PORT | sites del ДОМЕН | sites import CADDYFILE | sites apply
@@ -10480,6 +10796,20 @@ cli_cmd(){
         add|create) cli_inbounds_add "${@:3}" ;;
         edit) cli_inbounds_edit "${@:3}" ;;
         del) [[ -n "${3:-}" ]] || die 'inbounds del ID'; helper del-inbound "$3"; printf 'Удалён inbound %s\n' "$3" ;;
+        servers) helper menu-servers | sed 's/{[a-z/]*}//g; s/\t/  /g' ;;
+        rename)
+          [[ -n "${3:-}" ]] || die 'inbounds rename IDS [--yes]'
+          helper inbounds-rename-plan "$3" | grep -v '^CHANGES=' | sed 's/{[a-z/]*}//g'
+          [[ " $* " == *' --yes '* ]] || { printf '\nПрименить: inbounds rename %s --yes\n' "$3"; return 0; }
+          printf 'Переименовано: %s\n' "$(helper inbounds-rename "$3")" ;;
+        enable|disable) [[ -n "${3:-}" ]] || die "inbounds $sub IDS"
+          printf 'Готово: %s\n' "$(helper inbounds-bulk "$sub" "$3")" ;;
+        delete) [[ -n "${3:-}" && " $* " == *' --yes '* ]] || die 'inbounds delete IDS --yes'
+          printf 'Удалено: %s\n' "$(helper inbounds-bulk delete "$3")" ;;
+        country-style)
+          if [[ -n "${3:-}" ]]; then helper country-style "$3" >/dev/null
+            [[ " $* " == *' --rename '* ]] && printf 'Переименовано: %s\n' "$(helper inbounds-restyle)"; fi
+          helper country-style ;;
         *) die "Неизвестная подкоманда inbounds $sub" ;;
       esac ;;
     sites)
@@ -10578,6 +10908,8 @@ cli_inbounds_add(){
   local kinds=${1:-} k tls port sni name crt key host err
   [[ -n "$kinds" ]] || die 'inbounds add KIND[,KIND…] (список: 3x-ui_reverse inbounds kinds)'
   tls=$(cli_opt tls "$@"); port=$(cli_opt port "$@"); sni=$(cli_opt sni "$@"); name=$(cli_opt name "$@")
+  INB_NODE=$(cli_opt node "$@"); INB_NODE=${INB_NODE:-0}
+  [[ "$INB_NODE" =~ ^[0-9]+$ ]] || die '--node N (номер из: inbounds servers)'
   INB_KINDS=(); INB_TLS=()
   IFS=, read -ra INB_KINDS <<< "$kinds"
   for k in "${INB_KINDS[@]}"; do
@@ -10604,7 +10936,7 @@ setup_inbounds_cli(){
     setup_inbounds || return 1
     [[ -z "$port" ]] || helper set-port "$CREATED_IDS" "$port" || return 1
     [[ -z "$name" ]] || helper set-name "$CREATED_IDS" "$name" || return 1
-    open_firewall_ports "$CREATED_IDS" || :
+    ((INB_NODE)) || open_firewall_ports "$CREATED_IDS" || :
     printf 'Создан %s (id %s)\n' "${KIND_LABEL[$k]}" "$CREATED_IDS"
     return 0
   fi
