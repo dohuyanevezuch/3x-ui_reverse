@@ -6,7 +6,7 @@ set -Eeuo pipefail
 umask 077
 
 # Release version = the git tag of the commit this file comes from.
-VERSION=v2.9.2
+VERSION=v2.9.3
 # GitHub repository (owner/name) that publishes tagged releases of this script.
 # Can also be set from the "Версия" screen or with XR_REPO=owner/name.
 DEFAULT_REPO='dohuyanevezuch/3x-ui_reverse'
@@ -1586,7 +1586,7 @@ show_status_color(){
       status_line 'Режим HTTPS' "● панель на 443; подписки :$SUB_PORT"
     fi
     local rows port proto remark flag
-    if rows=$( { ensure_api_token 1 && helper ports-all; } 2>>"$LOG") && [[ -n "$rows" ]]; then
+    if rows=$( { ensure_api_token 1 && helper ports-all --local; } 2>>"$LOG") && [[ -n "$rows" ]]; then
       while read -r port proto remark; do
         [[ -n "$port" ]] || continue
         flag=-ltn; [[ "$proto" == udp ]] && flag=-lun
@@ -1617,6 +1617,18 @@ show_status_color(){
   if [[ "${PROXY_INSTALLED:-1}" == 1 || "${TLS_MODE:-none}" == direct ]]; then
     if verify_remote; then status_line 'Домен' "✓ https://$DOMAIN отвечает"
     else status_line 'Домен' "⚠ https://$DOMAIN не отвечает"; fi
+  fi
+  # Nodes of this master: their inbounds are checked on the nodes themselves.
+  if [[ "${PANEL_INSTALLED:-1}" == 1 ]]; then
+    local sym name addr detail
+    while IFS=$'\t' read -r sym name addr detail; do
+      [[ -n "$sym" ]] || continue
+      case "$sym" in
+        ●) status_line 'Узел' "● $name  $addr  ($detail)" ;;
+        ✗) status_line 'Узел' "✗ $name  $addr  $detail" ;;
+        *) status_line 'Узел' "$sym $name  $addr  ($detail)" ;;
+      esac
+    done < <(helper nodes-status 2>>"$LOG" || :)
   fi
 }
 
@@ -5239,8 +5251,8 @@ def pad(s, w):
 
 # Output may carry markup ({green}…{/}): kept for the script's dialogs
 # (XR_MARKUP=1), turned into ANSI on a terminal, stripped otherwise.
-MARK_RE = re.compile(r'\{(/|green|red|yellow|accent|cyan|blue|magenta|dim|bold|white|track)\}')
-ANSI_CODES = {'green': '32', 'red': '31', 'yellow': '33', 'accent': '36;1', 'cyan': '36', 'blue': '34',
+MARK_RE = re.compile(r'\{(/|green|red|yellow|orange|accent|cyan|blue|magenta|dim|bold|white|track)\}')
+ANSI_CODES = {'green': '32', 'red': '31', 'yellow': '33', 'orange': '38;5;208', 'accent': '36;1', 'cyan': '36', 'blue': '34',
               'magenta': '35', 'dim': '90', 'bold': '1', 'white': '97;1', 'track': '38;5;238', '/': '0'}
 
 
@@ -6086,10 +6098,12 @@ def cmd_inbounds(args):
     out('{dim}Всего %d%s · {/}{accent}◆{/}{dim} создан скриптом{/}' % (len(ibs), (' · выключено %d' % off) if off else ''))
 
 
-def cmd_ports_all(_args):
-    """PORT TRANSPORT REMARK for every enabled inbound (what the firewall must allow)."""
+def cmd_ports_all(args):
+    """PORT TRANSPORT REMARK for every enabled inbound (what the firewall must allow).
+    --local: only inbounds of this server (not of its nodes)."""
+    local = '--local' in args
     for ib in sorted(inbounds(), key=lambda x: x['id']):
-        if ib.get('enable'):
+        if ib.get('enable') and not (local and ib.get('nodeId')):
             print('%s %s %s' % (ib.get('port'), inbound_transport(ib), ib.get('remark') or ib.get('tag') or ''))
 
 
@@ -6313,8 +6327,13 @@ class Snapshot:
         return '{dim}○ ' + ago(ts) + (' · ' + where if where and ts else '') + '{/}'
 
     def traffic(self, cl):
-        total = cl.get('totalGB') or 0
-        return '%s / %s' % (human(self.used(cl)), human(total) if total else '∞')
+        """'65.00 ГБ / 100.00 ГБ' — the used part coloured by how much of the limit is gone."""
+        total, used = cl.get('totalGB') or 0, self.used(cl)
+        if not total:
+            return '%s / ∞' % human(used)
+        pct = used * 100.0 / total
+        color = 'green' if pct < 50 else 'yellow' if pct < 75 else 'orange' if pct < 90 else 'red'
+        return '{%s}%s{/} / %s' % (color, human(used), human(total))
 
     def inb(self, cl):
         ids = cl.get('inboundIds') or []
@@ -6344,10 +6363,11 @@ def cmd_users(args):
         out('Пользователей пока нет.')
         return
     max_w = int(args[0]) if args and args[0].isdigit() else 200
-    rows = [(cl.get('email', ''), cl.get('group') or '—', snap.inb(cl), snap.traffic(cl), snap.state(cl))
+    rows = [(cl.get('email', ''), cl.get('group') or '—', str(len(cl.get('inboundIds') or [])),
+             snap.traffic(cl), snap.state(cl))
             for cl in sorted(snap.clients, key=lambda x: ((x.get('group') or '\uffff'), x.get('email', '')))]
     head = ('ИМЯ', 'ГРУППА', 'INBOUND-Ы', 'ТРАФИК', 'СОСТОЯНИЕ')
-    caps = [18, 14, 22, 22, 40]
+    caps = [18, 14, 9, 24, 40]
     widths = [min(caps[i], max(len(head[i]), *(plain_len(r[i]) for r in rows))) for i in range(5)]
     # Shrink the last column first so the table fits the given width.
     widths[4] = max(10, min(widths[4], max_w - sum(widths[:4]) - 8))
@@ -7260,6 +7280,23 @@ def cmd_node_enable(args):
 def cmd_node_probe(args):
     v = ok(call('/nodes/probe/%d' % int(args[0]), {}, timeout=40), 'проверка узла') or {}
     print('status=%s\nerror=%s\nlatency=%s' % (v.get('status', ''), v.get('error', ''), v.get('latencyMs', '')))
+
+
+def cmd_nodes_status(_args):
+    """For the services screen: SYMBOL <TAB> name <TAB> address <TAB> detail."""
+    for n in _nodes():
+        port = int(n.get('port') or 0)
+        addr = (n.get('address') or '') + ('' if port in (443, 0) else ':%d' % port)
+        if not n.get('enable', True):
+            sym, detail = '○', 'выключен'
+        elif n.get('status') == 'online':
+            sym, detail = '●', 'в сети · %s мс' % n.get('latencyMs', '?')
+        elif n.get('status') == 'offline':
+            sym, detail = '✗', 'недоступен' + (' — ' + (n.get('lastError') or '').strip()[:60]
+                                               if (n.get('lastError') or '').strip() else '')
+        else:
+            sym, detail = '◌', 'проверяется'
+        print('%s\t%s\t%s\t%s' % (sym, n.get('name') or addr, addr, detail))
 
 
 # ------------------------------------------------------------------ PDF
@@ -9266,7 +9303,7 @@ COMMANDS = {
     'group-create': cmd_group_create, 'group-rename': cmd_group_rename, 'group-delete': cmd_group_delete,
     'group-add-users': cmd_group_add_users, 'group-inbounds': cmd_group_inbounds,
     'groups': cmd_groups, 'menu-members': cmd_menu_members, 'group-set-members': cmd_group_set_members,
-    'country': cmd_country, 'access-log-ok': cmd_access_log_ok, 'inbounds-rename-plan': cmd_inbounds_rename_plan, 'inbounds-rename': cmd_inbounds_rename, 'inbounds-bulk': cmd_inbounds_bulk, 'country-style': cmd_country_style, 'inbounds-restyle': cmd_inbounds_restyle, 'menu-servers': cmd_menu_servers, 'panel-user': cmd_panel_user, 'web-docker': cmd_web_docker, 'web-caddyfiles': cmd_web_caddyfiles,
+    'country': cmd_country, 'nodes-status': cmd_nodes_status, 'access-log-ok': cmd_access_log_ok, 'inbounds-rename-plan': cmd_inbounds_rename_plan, 'inbounds-rename': cmd_inbounds_rename, 'inbounds-bulk': cmd_inbounds_bulk, 'country-style': cmd_country_style, 'inbounds-restyle': cmd_inbounds_restyle, 'menu-servers': cmd_menu_servers, 'panel-user': cmd_panel_user, 'web-docker': cmd_web_docker, 'web-caddyfiles': cmd_web_caddyfiles,
     'caddy-split': cmd_caddy_split, 'web-sites': cmd_web_sites, 'web-hosts': cmd_web_hosts, 'inbound-flags': cmd_inbound_flags, 'update-check': cmd_update_check, 'update-fetch': cmd_update_fetch,
     'dns-check': cmd_dns_check, 'public-ip': cmd_public_ip,
     'track-activity': cmd_track_activity, 'enable-access-log': cmd_enable_access_log,
@@ -9315,7 +9352,7 @@ except locale.Error:
     pass
 
 APP = '3x-ui_reverse'
-TAG_RE = re.compile(r'\{(/|green|red|yellow|accent|cyan|blue|magenta|dim|bold|white|track)\}')
+TAG_RE = re.compile(r'\{(/|green|red|yellow|orange|accent|cyan|blue|magenta|dim|bold|white|track)\}')
 ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
 GLYPHS = {'●': 'green', '✓': 'green', '✗': 'red', '⚠': 'yellow', '○': 'dim', '➜': 'accent'}
 SPIN = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
@@ -9487,7 +9524,7 @@ class TUI:
         c = self.c
         self.st = {}
         if not c.has_colors():
-            for k in ('text', 'accent', 'green', 'red', 'yellow', 'cyan', 'blue', 'magenta',
+            for k in ('text', 'accent', 'green', 'red', 'yellow', 'orange', 'cyan', 'blue', 'magenta',
                       'white', 'dim', 'border', 'title', 'sel', 'bar', 'barhi', 'key', 'field', 'track'):
                 self.st[k] = c.A_NORMAL
             for i in range(len(LOGO)):
@@ -9519,6 +9556,7 @@ class TUI:
         self.st = {
             'text': c.A_NORMAL, 'bold': B,
             'accent': pair(acc) | B, 'green': pair(grn), 'red': pair(red), 'yellow': pair(yel),
+            'orange': pair(208 if rich else 3) | (0 if rich else B),
             'cyan': pair(cyn), 'blue': pair(blu), 'magenta': pair(mag), 'white': pair(white) | B,
             'dim': pair(dim) if rich else pair(dim) | c.A_DIM, 'border': pair(brd),
             'title': pair(acc) | B, 'sel': pair(selfg, selbg) | B,
@@ -10271,7 +10309,7 @@ def serve(path):
 
 
 # =================================================================== CLI
-ANSI = {'green': '32', 'red': '31', 'yellow': '33', 'accent': '36;1', 'cyan': '36', 'blue': '34',
+ANSI = {'green': '32', 'red': '31', 'yellow': '33', 'orange': '38;5;208', 'accent': '36;1', 'cyan': '36', 'blue': '34',
         'magenta': '35', 'dim': '90', 'bold': '1', 'white': '97;1', 'track': '38;5;238'}
 
 
