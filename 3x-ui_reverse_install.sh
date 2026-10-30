@@ -6,7 +6,7 @@ set -Eeuo pipefail
 umask 077
 
 # Release version = the git tag of the commit this file comes from.
-VERSION=v2.10.0
+VERSION=v2.10.1
 # GitHub repository (owner/name) that publishes tagged releases of this script.
 # Can also be set from the "Версия" screen or with XR_REPO=owner/name.
 DEFAULT_REPO='dohuyanevezuch/3x-ui_reverse'
@@ -24,7 +24,7 @@ XUI_INSTALL_URL=https://raw.githubusercontent.com/MHSanaei/3x-ui/main/install.sh
 # API helper, its token and the short-lived Xray access log used for "last inbound".
 HELPER=$BASE/xr_helper.py
 SUPPORTED_OS='Debian 12/13 и Ubuntu 22.04/24.04/26.04'
-OLD_SUB_PORT='' OLD_SUB_SCHEME=''   # subscription port of a migrated panel (redirected)
+OLD_SUB_PORT='' OLD_SUB_SCHEME='' OLD_DOMAINS=''   # subscription port of a migrated panel (redirected)
 HELPER_STATE=''   # overrides XR_STATE_DIR before $BASE exists
 PDF_FILE=$BASE/panel.pdf         # the same parameters as a styled PDF
 NODE_TOKEN=$BASE/node.token     # node-sync API token handed to a master panel
@@ -542,6 +542,7 @@ save_state(){
     printf 'UPDATE_REPO=%q\n' "${UPDATE_REPO:-}"
     printf 'OLD_SUB_PORT=%q\n' "${OLD_SUB_PORT:-}"
     printf 'OLD_SUB_SCHEME=%q\n' "${OLD_SUB_SCHEME:-}"
+    printf 'OLD_DOMAINS=%q\n' "${OLD_DOMAINS:-}"
   } > "$tmp"
   chmod 600 "$tmp"; mv -f "$tmp" "$STATE"
   # Panel port/path may have changed: keep the activity timer's API address current.
@@ -567,6 +568,9 @@ load_state(){
   done
   OLD_SUB_PORT=${OLD_SUB_PORT:-}; OLD_SUB_SCHEME=${OLD_SUB_SCHEME:-}
   [[ -z "$OLD_SUB_PORT" || ( "$OLD_SUB_PORT" =~ ^[0-9]{1,5}$ && "$OLD_SUB_SCHEME" =~ ^https?$ ) ]] || OLD_SUB_PORT=''
+  OLD_DOMAINS=${OLD_DOMAINS:-}
+  local od
+  for od in $OLD_DOMAINS; do valid_domain "$od" || { OLD_DOMAINS=''; break; }; done
   UPDATE_REPO=${UPDATE_REPO:-}
   [[ -z "$UPDATE_REPO" || "$UPDATE_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || UPDATE_REPO=''
 }
@@ -727,6 +731,12 @@ $addr {
 }
 EOF
   fi
+  # Former main domains: their links keep working through a redirect.
+  local od
+  for od in ${OLD_DOMAINS:-}; do
+    [[ "$od" != "$DOMAIN" ]] || continue
+    printf '\n# Former main domain (3x-ui_reverse: «Основной домен»)\n%s {\n    redir https://%s{uri} 308\n}\n' "$od" "$DOMAIN" >> "$target"
+  done
   if compgen -G "$wd/sites/*.caddy" >/dev/null; then
     printf '\n# Other sites and services: %s/sites (not rewritten by the script)\nimport %s/sites/*.caddy\n' "$wd" "$wd" >> "$target"
   fi
@@ -3160,9 +3170,10 @@ menu_settings(){
          2 'Изменить путь панели' \
          3 'Изменить логин и пароль' \
          6 "Сохранить пароль из панели"$'\t{dim}если его сменили в самой 3x-ui{/}' \
-         7 "Страница подписки"$'\t{dim}оформление ссылки подписки в браузере{/}' \
          4 'Изменить порт подписок' \
-         5 'Изменить путь подписок') || return 0
+         5 'Изменить путь подписок' \
+         7 "Страница подписки"$'\t{dim}оформление ссылки подписки в браузере{/}' \
+         8 "Сменить основной домен"$'\t{dim}'"$DOMAIN"$'{/}') || return 0
     if [[ "${PANEL_INSTALLED:-1}" != 1 ]]; then
       tui_msg 'Панель удалена' 'Восстанови её: Обслуживание → Переустановить 3x-ui.'; continue
     fi
@@ -3208,6 +3219,7 @@ menu_settings(){
         load_state ;;
       6) panel_creds_remember ;;
       7) subpage_screen ;;
+      8) domain_screen; load_state ;;
       4)
         v=$(tui_input 'Порт подписок' 'Новый порт подписок (пусто — случайный):' '') || continue
         v=${v:-$(newport)}
@@ -4732,6 +4744,9 @@ caddy_fix_logs(){
   id caddy >/dev/null 2>&1 || return 0
   install -d -m 755 -o caddy -g caddy /var/log/caddy 2>>"$LOG" || :
   chown -R caddy:caddy /var/log/caddy 2>>"$LOG" || :
+  # validate (as root) may also create files in Caddy's storage
+  [[ -n "${DOMAIN:-}" && -d "$(certdir)" ]] && chown -R caddy:caddy "$(certdir)" 2>>"$LOG"
+  return 0
 }
 # Last error of the caddy service (why it did not start or reload).
 caddy_last_error(){
@@ -5129,6 +5144,7 @@ cli_sites(){
         [[ ! -f "$(web_dir)/root.caddy" ]] || mv -f "$(web_dir)/root.caddy" "$(web_dir)/root.caddy.off"
       else
         printf '%s service=custom upstream=%s date=%s\nreverse_proxy %s\n' "# 3x-ui_reverse:" "$2" "$(date +%F)" "$2" > "$(web_dir)/root.caddy"
+        chmod 644 "$(web_dir)/root.caddy"
       fi
       web_apply_now || { web_restore "$snap"; die "$WEB_ERR"; }; [[ -z "$WEB_WARN" ]] || warn "$WEB_WARN"
       printf 'Корень %s: %s\n' "$DOMAIN" "$2" ;;
@@ -5138,6 +5154,7 @@ cli_sites(){
       snap=$(web_snapshot)
       printf '# 3x-ui_reverse: service=custom upstream=%s date=%s\n%s {\n    encode zstd gzip\n    header -Server\n    reverse_proxy %s\n}\n' \
         "$3" "$(date +%F)" "$d" "$3" > "$(web_dir)/sites/$d.caddy"
+      chmod 644 "$(web_dir)/sites/$d.caddy"
       web_apply_now || { web_restore "$snap"; die "$WEB_ERR"; }; [[ -z "$WEB_WARN" ]] || warn "$WEB_WARN"
       printf 'Подключён %s → %s\n' "$d" "$3"
       web_cert_ok "$d" || warn "Сертификат для $d ещё не выпущен — проверь A-запись."
@@ -5164,6 +5181,174 @@ cli_sites(){
       web_apply_now || { web_restore "$snap"; die "$WEB_ERR"; }; [[ -z "$WEB_WARN" ]] || warn "$WEB_WARN"
       printf 'Конфигурация применена.\n' ;;
     *) die "Неизвестная подкоманда sites $sub" ;;
+  esac
+}
+
+# ---- Change of the main domain (proxy mode: Caddy or Nginx in front of 3x-ui).
+# Panel and subscription paths, ports and inbounds stay; the proxy, the panel's
+# subscription address and the TLS inbounds on the domain certificate move to the
+# new name. With Caddy the old name can stay as a 308 redirect, so subscription
+# links already in the apps keep updating.
+DOMAIN_ERR=''
+domain_list_without(){ local d out=''; for d in $1; do [[ "$d" == "$2" ]] || out+="${out:+ }$d"; done; printf '%s' "$out"; }
+domain_change_apply(){
+  local old=$DOMAIN new=$1 keep=$2 stamp prev_state prev_proxy dbbackup olddir newdir prev_old ids id paths crt key
+  DOMAIN_ERR=''
+  stamp=$(date +%Y%m%d-%H%M%S-%N)
+  prev_state="$BASE/backup-state.$stamp.env"; prev_proxy="$BASE/backup-config.$stamp.conf"
+  dbbackup="$BASE/backups/domain-change-$stamp.db"
+  cp -a "$STATE" "$prev_state"; cp -a "$(proxy_conf)" "$prev_proxy"
+  prev_old=${OLD_DOMAINS:-}
+  olddir=$(certdir); newdir="$BASE/sertificates/$new"
+  # Caddy: copy the storage (ACME account, certificate of the old name for the redirect).
+  if [[ ! -d "$newdir" ]]; then
+    if [[ "$PROXY" == caddy && -d "$olddir" ]]; then cp -a "$olddir" "$newdir"; else install -d -m 750 "$newdir"; fi
+  fi
+  [[ "$PROXY" == caddy ]] && chown -R caddy:caddy "$newdir" 2>>"$LOG"
+  run systemctl stop x-ui
+  backup_db "$dbbackup" || { run systemctl start x-ui || :; DOMAIN_ERR='не удалось сохранить базу 3x-ui'; return 1; }
+  DOMAIN=$new
+  OLD_DOMAINS=$(domain_list_without "$prev_old" "$new")
+  if ((keep)); then OLD_DOMAINS=$(domain_list_without "$OLD_DOMAINS" "$old"); OLD_DOMAINS+="${OLD_DOMAINS:+ }$old"; fi
+  domain_change_undo(){
+    run systemctl stop x-ui || :
+    restore_db "$dbbackup" || :
+    cp -a "$prev_proxy" "$(proxy_conf)"; [[ "$PROXY" == caddy ]] && caddy_mark
+    cp -a "$prev_state" "$STATE"; load_state
+    [[ "$PROXY" == nginx ]] && setup_renew_timer >>"$LOG" 2>&1
+    reload_proxy || :
+    run systemctl start x-ui || :
+    write_helper_env
+  }
+  if [[ "$PROXY" == nginx ]]; then
+    install -d -m 755 "$SITE/.well-known/acme-challenge"
+    write_nginx bootstrap
+    if ! validate_proxy || ! reload_proxy; then DOMAIN_ERR='Nginx не принял конфигурацию для нового домена'; domain_change_undo; return 1; fi
+    if ! run certbot certonly --non-interactive --agree-tos --register-unsafely-without-email \
+         --webroot -w "$SITE" -d "$new" --cert-name "$new" \
+         --config-dir "$newdir" --work-dir "$BASE/certbot-work" --logs-dir "$BASE/certbot-logs"; then
+      DOMAIN_ERR="Certbot не получил сертификат для $new — проверь A-запись и порт 80"; domain_change_undo; return 1
+    fi
+    write_nginx full
+    if ! validate_proxy || ! reload_proxy; then DOMAIN_ERR='Nginx не принял HTTPS-конфигурацию'; domain_change_undo; return 1; fi
+    setup_renew_timer >>"$LOG" 2>&1 || :
+  else
+    if ! update_proxy_safe; then DOMAIN_ERR='Caddy не принял конфигурацию с новым доменом'; domain_change_undo; return 1; fi
+  fi
+  if ! set_subscriptions >>"$LOG" 2>&1; then DOMAIN_ERR='не удалось записать адрес подписок в 3x-ui'; domain_change_undo; return 1; fi
+  if ! run systemctl start x-ui || ! wait_local_stack; then DOMAIN_ERR='3x-ui не запустилась после смены адреса подписок'; domain_change_undo; return 1; fi
+  save_state; write_helper_env; write_info
+  # TLS inbounds on the domain certificate: new certificate and SNI.
+  if wait_domain_cert >/dev/null && paths=$(domain_cert_paths); then
+    crt=$(sed -n 1p <<< "$paths"); key=$(sed -n 2p <<< "$paths")
+    ids=$(helper tls-inbounds-for "$old" "$(certdir)" 2>>"$LOG") || ids=''
+    for id in $ids; do
+      if helper set-tls "$id" "$crt" "$key" "$new" >>"$LOG" 2>&1; then DOMAIN_TLS_MOVED+=("$id")
+      else DOMAIN_TLS_FAILED+=("$id"); fi
+    done
+  else
+    DOMAIN_CERT_PENDING=1
+  fi
+  verify_remote || DOMAIN_REMOTE_FAIL=1
+  write_pdf quiet >/dev/null 2>&1 || :
+  return 0
+}
+DOMAIN_TLS_MOVED=() DOMAIN_TLS_FAILED=() DOMAIN_CERT_PENDING=0 DOMAIN_REMOTE_FAIL=0
+domain_change_report(){
+  local old=$1
+  note "{green}✓ Основной домен: $DOMAIN.{/} Панель: https://$DOMAIN/$PANEL_PATH/"
+  if [[ " ${OLD_DOMAINS:-} " == *" $old "* ]]; then
+    note "Старый адрес https://$old/… перенаправляется на новый — подписки в приложениях продолжат обновляться и получат новый домен."
+  else
+    note "{yellow}Ссылки подписок со старым доменом $old больше не работают — пользователям нужно добавить подписку заново.{/}"
+  fi
+  ((${#DOMAIN_TLS_MOVED[@]})) && note "TLS-inbound-ы переведены на сертификат $DOMAIN: ${DOMAIN_TLS_MOVED[*]}."
+  ((${#DOMAIN_TLS_FAILED[@]})) && note "{yellow}⚠ Не удалось перевести inbound-ы ${DOMAIN_TLS_FAILED[*]} — «Inbound-ы → Изменить inbound → TLS».{/}"
+  ((DOMAIN_CERT_PENDING)) && note "{yellow}⚠ Сертификат для $DOMAIN ещё выпускается. TLS-inbound-ы (XHTTP TLS, Hysteria2) переведи позже: «Inbound-ы → Изменить inbound → TLS → сертификат домена».{/}"
+  ((DOMAIN_REMOTE_FAIL)) && note "{yellow}⚠ https://$DOMAIN пока не отвечает — проверь A-запись; Caddy продолжит попытки получить сертификат сам.{/}"
+  note "{dim}Если этот сервер подключён узлом к другой панели, поменяй его адрес там. Клиенты получат новый домен в ссылках при обновлении подписки.{/}"
+}
+domain_screen(){
+  local ch new keep=0 head old
+  if [[ "${PROXY_INSTALLED:-1}" != 1 || "${TLS_MODE:-proxy}" != proxy ]]; then
+    tui_msg 'Основной домен' 'Смена домена работает, когда HTTPS обслуживает прокси (Caddy или Nginx), а не сама 3x-ui.'
+    return 0
+  fi
+  head="Сейчас: {bold}$DOMAIN{/}"
+  [[ -n "${OLD_DOMAINS:-}" ]] && head+=$'\n'"{dim}Перенаправляются на него: $OLD_DOMAINS{/}"
+  local -a items=(change 'Сменить основной домен')
+  [[ -n "${OLD_DOMAINS:-}" ]] && items+=(dropold 'Убрать перенаправления со старых доменов')
+  ch=$(tui_menu 'Основной домен' "$head
+{dim}На нём панель, подписки и сайт-заглушка (или сервис в корне). Пути, порты, inbound-ы
+и пользователи не меняются.{/}" "${items[@]}") || return 0
+  if [[ "$ch" == dropold ]]; then
+    tui_yesno 'Перенаправления' "Убрать перенаправления с $OLD_DOMAINS?
+{dim}Подписки, добавленные по старым адресам, перестанут обновляться.{/}" 'Убрать' 'Отмена' no || return 0
+    old=$OLD_DOMAINS; OLD_DOMAINS=''
+    if update_proxy_safe; then save_state; note "○ Перенаправления убраны: $old."
+    else OLD_DOMAINS=$old; warn 'Конфигурация прокси не применилась, всё оставлено как было.'; fi
+    return 0
+  fi
+  while :; do
+    new=$(tui_input 'Новый основной домен' "Домен, A-запись которого уже указывает на этот сервер, например {accent}vpn.example.com{/}" '') || return 0
+    new=${new,,}; new=${new%.}; new=${new#http://}; new=${new#https://}; new=${new%%/*}
+    if ! valid_domain "$new"; then tui_msg 'Неверный домен' 'Нужно DNS-имя: не IP-адрес, не URL и без порта.'; continue; fi
+    if [[ "$new" == "$DOMAIN" ]]; then tui_msg 'Основной домен' 'Это и есть текущий домен.'; return 0; fi
+    if [[ "$PROXY" == caddy ]] && helper web-hosts "$(web_dir)" 2>>"$LOG" | cut -f1 | grep -Fxq "$new"; then
+      tui_msg 'Основной домен' "$new уже подключён как отдельный сайт («Сайты и сервисы»). Сначала отключи его там."; return 0
+    fi
+    break
+  done
+  web_dns_check "$new" || return 0
+  if [[ "$PROXY" == caddy ]]; then
+    tui_yesno 'Старый домен' "Оставить {bold}$DOMAIN{/} перенаправлением на {bold}$new{/}?
+
+{dim}Тогда подписки, добавленные по старому адресу, продолжат обновляться и сами
+получат новый домен. Для этого A-запись $DOMAIN должна и дальше указывать на этот сервер.{/}" \
+      'Оставить перенаправление' 'Не нужно' yes && keep=1
+  fi
+  tui_yesno 'Подтверждение' "Домен:   $DOMAIN → {bold}$new{/}
+Панель:  https://$new/$PANEL_PATH/
+Подписки: https://$new/$SUB_PATH/…
+Старый:  $([[ $keep == 1 ]] && echo "перенаправление на $new" || echo 'перестанет работать')
+
+{dim}Будут обновлены: конфигурация $PROXY и сертификат, адрес подписок в 3x-ui,
+TLS-inbound-ы на сертификате домена, параметры и PDF. При ошибке всё вернётся.{/}" 'Сменить домен' 'Отмена' yes || return 0
+  old=$DOMAIN
+  DOMAIN_TLS_MOVED=() DOMAIN_TLS_FAILED=() DOMAIN_CERT_PENDING=0 DOMAIN_REMOTE_FAIL=0
+  if with_progress 'Основной домен' "Переводим $old → $new" domain_change_apply "$new" "$keep"; then
+    domain_change_report "$old"
+  else
+    tui_msg 'Основной домен' "{red}✗ Домен не изменён:{/} $DOMAIN_ERR
+
+Всё возвращено как было: $DOMAIN."
+  fi
+}
+# CLI: domain | domain set NEW [--keep-old] [--force] | domain drop-old
+cli_domain(){
+  local sub=${1:-show} new old keep=0 v
+  case "$sub" in
+    show|list) printf 'Основной домен: %s\n' "$DOMAIN"; [[ -n "${OLD_DOMAINS:-}" ]] && printf 'Перенаправления: %s\n' "$OLD_DOMAINS"; return 0 ;;
+    drop-old)
+      old=${OLD_DOMAINS:-}; [[ -n "$old" ]] || { printf 'Перенаправлений нет.\n'; return 0; }
+      OLD_DOMAINS=''; update_proxy_safe || { OLD_DOMAINS=$old; die 'Конфигурация прокси не применилась.'; }
+      save_state; printf 'Убраны перенаправления: %s\n' "$old" ;;
+    set)
+      [[ "${PROXY_INSTALLED:-1}" == 1 && "${TLS_MODE:-proxy}" == proxy ]] || die 'Смена домена работает только с прокси (Caddy или Nginx).'
+      new=${2:-}; new=${new,,}; new=${new%.}
+      valid_domain "$new" || die 'domain set НОВЫЙ.ДОМЕН [--keep-old] [--force]'
+      [[ "$new" != "$DOMAIN" ]] || die "$new уже основной домен."
+      [[ " $* " == *' --keep-old '* ]] && { [[ "$PROXY" == caddy ]] || die '--keep-old работает только с Caddy.'; keep=1; }
+      if [[ " $* " != *' --force '* ]]; then
+        v=$(helper dns-check "$new" 2>/dev/null | sed -n 's/^VERDICT \([a-z]*\).*/\1/p')
+        [[ "$v" == ok ]] || die "A-запись $new не указывает на этот сервер (проверка DNS: ${v:-нет ответа}). Повтори с --force, если уверен."
+      fi
+      old=$DOMAIN
+      DOMAIN_TLS_MOVED=() DOMAIN_TLS_FAILED=() DOMAIN_CERT_PENDING=0 DOMAIN_REMOTE_FAIL=0
+      domain_change_apply "$new" "$keep" || die "Домен не изменён: $DOMAIN_ERR. Всё возвращено как было."
+      domain_change_report "$old"
+      printf '%s\n' "${NOTES[@]}" | sed 's/{[a-z/]*}//g'; NOTES=() ;;
+    *) die "Неизвестная подкоманда domain $sub" ;;
   esac
 }
 
@@ -11022,6 +11207,7 @@ usage(){
   inbounds add KIND[,KIND…] [--tls CERT:KEY:SNI] [--port N] [--sni HOST] [--name NAME]
   inbounds edit ID [--port N] [--name NAME] [--sni HOST] [--tls domain|CERT:KEY:SNI] [--enable 0|1]
   inbounds del ID
+  domain | domain set НОВЫЙ [--keep-old] | domain drop-old   основной домен (перенаправление со старого — Caddy)
   subpage list | sync | set NAME|default    страница подписки (шаблоны dohuyanevezuch/3x-ui_subpages)
   inbounds servers                      этот сервер и узлы (номер — для --node)
   inbounds add KIND,… --node N          создать на узле (без XHTTP TLS и Hysteria2)
@@ -11194,6 +11380,9 @@ cli_cmd(){
     sites)
       cli_need_panel
       cli_sites "${@:2}" ;;
+    domain)
+      cli_need_panel
+      cli_domain "${@:2}" ;;
     subpage)
       cli_need_panel
       case "$sub" in
@@ -11370,7 +11559,7 @@ if [[ "${XUI_REVERSE_LIB_ONLY:-0}" != 1 ]]; then
     --remove-command) remove_manager_command || : ;;
     --restore-command) restore_manager_command ;;
     --help|-h|help) usage ;;
-    info|status|pdf|bbr|diag|routing|sites|users|groups|inbounds|node|nodes|version|update|subpage) cli_cmd "$@" ;;
+    info|status|pdf|bbr|diag|routing|sites|users|groups|inbounds|node|nodes|version|update|subpage|domain) cli_cmd "$@" ;;
     '') main_interactive ;;
     *) die "Неизвестный параметр: $1 (см. --help)" ;;
   esac
